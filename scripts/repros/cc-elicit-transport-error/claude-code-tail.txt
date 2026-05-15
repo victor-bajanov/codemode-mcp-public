@@ -1,0 +1,25 @@
+GmailMCP.setName - Ok @ 10/05/2026, 11:19:27 pm
+GmailMCP.getInitializeRequest - Ok @ 10/05/2026, 11:19:28 pm
+POST https://gmail.your-subdomain.workers.dev/mcp - Ok @ 10/05/2026, 11:19:27 pm
+  (warn) waitUntil() tasks did not complete within the allowed time after invocation end and have been cancelled.
+Unknown Event - Ok @ 10/05/2026, 11:20:28 pm
+GET https://gmail.your-subdomain.workers.dev/mcp - Canceled @ 10/05/2026, 11:19:28 pm
+
+# DEBUG-AGENTS + DEBUG-ELICIT + AUDIT logs (chronological)
+
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:19:28.282Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"id":0},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"elicit-response-handled","ts":"2026-05-10T13:19:28.288Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","requestId":4,"isResult":false,"isError":false,"pendingCount":0}
+DEBUG-ELICIT {"stage":"wrap-pre","ts":"2026-05-10T13:19:28.305Z","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","agentSet":false}
+DEBUG-ELICIT {"stage":"wrap-post","ts":"2026-05-10T13:19:28.305Z","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","agentSet":true}
+DEBUG-ELICIT {"stage":"request-entry","ts":"2026-05-10T13:19:28.305Z","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","hasBody":false}
+DEBUG-ELICIT {"stage":"elicit-branch","ts":"2026-05-10T13:19:28.305Z","operationId":"gmail.users.threads.delete","decision":"elicit","category":"irreversible","hasInspector":false}
+DEBUG-ELICIT {"stage":"elicit-caps","ts":"2026-05-10T13:19:28.305Z","operationId":"gmail.users.threads.delete","supportsElicit":true,"capsRaw":{"elicitation":{"form":{}},"roots":{}}}
+DEBUG-ELICIT {"stage":"elicit-pre-send","ts":"2026-05-10T13:19:28.305Z","operationId":"gmail.users.threads.delete","outerCtor":"McpServer","innerCtor":"Server","typeofElicitInput":"function","hasTransport":true,"fieldNames":["confirm"],"messagePreview":"Confirm Gmail irreversible op (gmail.users.threads.delete)"}
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:19:28.305Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"method":"elicitation/create","id":0},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"send-no-standalone","ts":"2026-05-10T13:19:28.305Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"method":"elicitation/create","id":0},"connectionCount":1,"connectionsFlagged":0}
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:20:28.305Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"method":"notifications/cancelled"},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"send-no-standalone","ts":"2026-05-10T13:20:28.305Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"method":"notifications/cancelled"},"connectionCount":1,"connectionsFlagged":0}
+DEBUG-ELICIT {"stage":"elicit-catch","ts":"2026-05-10T13:20:28.305Z","operationId":"gmail.users.threads.delete","isTimeout":false,"errorName":"McpError","errorMessage":"MCP error -32001: Request timed out","errorStack":"McpError: MCP error -32001: Request timed out\n    at McpError.fromError (index.js:44777:12)\n    at timeoutHandler (index.js:46913:75)","errorJson":"{\"code\":-32001,\"data\":{\"timeout\":60000},\"name\":\"McpError\"}"}
+AUDIT {"deployment":"gmail","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","operationId":"gmail.users.threads.delete","decision":"elicit","elicitationOutcome":"transport-error","category":"irreversible","elicitFields":{"confirm":true},"ts":"2026-05-10T13:20:28.305Z","principalId":"117813926851584410547"}
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:20:28.305Z","sessionId":"a7edcb0f507fc1119866efef686f6efd72b34ea47d7d92f92c42e0588bf07340","jsonrpc":{"id":4},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"send-pre-write","ts":"2026-05-10T13:20:28.305Z","channelKind":"per-request-sse","connectionId":"mm3lnV38ZO-qw3NR7OCPR","requestId":4,"shouldClose":true,"relatedIdsCount":1}
