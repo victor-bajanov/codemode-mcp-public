@@ -1,0 +1,56 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gmail",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "GmailMCP", "name": "MCP_OBJECT" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GmailMCP"] }
+  ],
+  "vars": {
+    "GMAIL_API_BASE": "https://gmail.googleapis.com",
+    "DEPLOYMENT_NAME": "gmail",
+    "ALLOW_PII_IN_LOGS": "false",
+    "DEBUG_ELICIT": "false"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "env": {
+    "dev": {
+      "name": "gmail-dev",
+      "kv_namespaces": [
+        { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+      ],
+      "worker_loaders": [
+        { "binding": "LOADER" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "GmailMCP", "name": "MCP_OBJECT" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["GmailMCP"] }
+      ],
+      "vars": {
+        "GMAIL_API_BASE": "https://gmail.googleapis.com",
+        "DEPLOYMENT_NAME": "gmail-dev",
+        "ALLOW_PII_IN_LOGS": "false",
+        "DEBUG_ELICIT": "false"
+      }
+    }
+  }
+}

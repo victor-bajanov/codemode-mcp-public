@@ -1,0 +1,75 @@
+[wrangler:stdout] 
+ ⛅️ wrangler 4.90.0
+───────────────────
+[wrangler:stdout] Your Worker has access to the following bindings:
+[wrangler:stdout] Binding                          Resource                  Mode
+[wrangler:stdout] env.MCP_OBJECT (ReproMCP)        Durable Object            local
+env.WRAP ("(hidden)")            Environment Variable      local
+[wrangler:stdout] env.VALIDATOR ("(hidden)")       Environment Variable      local
+[wrangler:stdout] env.LOADER                       Worker Loader             local
+[wrangler:stdout] 
+[wrangler:stdout] ⎔ Starting local server...
+[wrangler:stdout] [wrangler:info] Ready on http://localhost:39545
+[verify] wrangler ready at http://localhost:39545
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (53ms)
+[verify] MCP client connected
+[wrangler:stdout] [wrangler:info] POST /mcp 202 Accepted (7ms)
+[wrangler:stdout] [wrangler:info] GET /mcp 200 OK (8ms)
+[verify] elicit request received: {"mode":"form","message":"Confirm delete_thing?","requestedSchema":{"type":"object","properties":{"confirm":{"type":"string","enum":["yes","no"]}},"required":["confirm"]}}
+[wrangler:stdout] BEFORE-LOADER op=delete_thing ALS=unset
+INSIDE-CALLBACK op=delete_thing ALS=set
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (18ms)
+[verify] tool result: {"content":[{"type":"text","text":"ERROR Error: McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context"}],"isError":true}
+[wrangler:stderr] [31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mError compiling schema, function code: const schema0 = scope.schema[0];return function validate0(data, {instancePath="", parentData, parentDataProperty, rootData=data}={}){let vErrors = null;let errors = 0;if(data && typeof data == "object" && !Array.isArray(data)){if(data.confirm === undefined){const err0 = {instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: "confirm"},message:"must have required property '"+"confirm"+"'"};if(vErrors === null){vErrors = [err0];}else {vErrors.push(err0);}errors++;}if(data.confirm !== undefined){let data0 = data.confirm;if(typeof data0 !== "string"){const err1 = {instancePath:instancePath+"/confirm",schemaPath:"#/properties/confirm/type",keyword:"type",params:{type: "string"},message:"must be string"};if(vErrors === null){vErrors = [err1];}else {vErrors.push(err1);}errors++;}if(!((data0 === "yes") || (data0 === "no"))){const err2 = {instancePath:instancePath+"/confirm",schemaPath:"#/properties/confirm/enum",keyword:"enum",params:{allowedValues: schema0.properties.confirm.enum},message:"must be equal to one of the allowed values"};if(vErrors === null){vErrors = [err2];}else {vErrors.push(err2);}errors++;}}}else {const err3 = {instancePath,schemaPath:"#/type",keyword:"type",params:{type: "object"},message:"must be object"};if(vErrors === null){vErrors = [err3];}else {vErrors.push(err3);}errors++;}validate0.errors = vErrors;return errors === 0;}[0m
+
+
+[wrangler:stderr] [31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mUncaught McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context Error[0m
+
+      at elicitInput (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/server/index.ts:594:31)
+
+
+[wrangler:stdout] SCAFFOLD-ERROR delete_thing Error: McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context
+[wrangler:stdout] [wrangler:info] POST /mcp 202 Accepted (19ms)
+
+=== VERIFY SUMMARY ===
+WRAP=1
+TRIGGER_VALIDATION=1
+VALIDATOR=
+observed=tool-error
+detail=ERROR Error: McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context
+
+--- wrangler stdout (tail) ---
+
+ ⛅️ wrangler 4.90.0
+───────────────────
+Your Worker has access to the following bindings:
+Binding                          Resource                  Mode
+env.MCP_OBJECT (ReproMCP)        Durable Object            local
+env.WRAP ("(hidden)")            Environment Variable      local
+env.VALIDATOR ("(hidden)")       Environment Variable      local
+env.LOADER                       Worker Loader             local
+
+⎔ Starting local server...
+[wrangler:info] Ready on http://localhost:39545
+[wrangler:info] POST /mcp 200 OK (53ms)
+[wrangler:info] POST /mcp 202 Accepted (7ms)
+[wrangler:info] GET /mcp 200 OK (8ms)
+BEFORE-LOADER op=delete_thing ALS=unset
+INSIDE-CALLBACK op=delete_thing ALS=set
+[wrangler:info] POST /mcp 200 OK (18ms)
+SCAFFOLD-ERROR delete_thing Error: McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context
+[wrangler:info] POST /mcp 202 Accepted (19ms)
+
+
+--- wrangler stderr (tail) ---
+[31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mError compiling schema, function code: const schema0 = scope.schema[0];return function validate0(data, {instancePath="", parentData, parentDataProperty, rootData=data}={}){let vErrors = null;let errors = 0;if(data && typeof data == "object" && !Array.isArray(data)){if(data.confirm === undefined){const err0 = {instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: "confirm"},message:"must have required property '"+"confirm"+"'"};if(vErrors === null){vErrors = [err0];}else {vErrors.push(err0);}errors++;}if(data.confirm !== undefined){let data0 = data.confirm;if(typeof data0 !== "string"){const err1 = {instancePath:instancePath+"/confirm",schemaPath:"#/properties/confirm/type",keyword:"type",params:{type: "string"},message:"must be string"};if(vErrors === null){vErrors = [err1];}else {vErrors.push(err1);}errors++;}if(!((data0 === "yes") || (data0 === "no"))){const err2 = {instancePath:instancePath+"/confirm",schemaPath:"#/properties/confirm/enum",keyword:"enum",params:{allowedValues: schema0.properties.confirm.enum},message:"must be equal to one of the allowed values"};if(vErrors === null){vErrors = [err2];}else {vErrors.push(err2);}errors++;}}}else {const err3 = {instancePath,schemaPath:"#/type",keyword:"type",params:{type: "object"},message:"must be object"};if(vErrors === null){vErrors = [err3];}else {vErrors.push(err3);}errors++;}validate0.errors = vErrors;return errors === 0;}[0m
+
+
+[31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mUncaught McpError: MCP error -32603: Error validating elicitation response: Code generation from strings disallowed for this context Error[0m
+
+      at elicitInput (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/server/index.ts:594:31)
+
+
+
+
+PASS: observed expected behavior (AJV codegen error).
