@@ -1,0 +1,30 @@
+{
+  "name": "@local/scaffold",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@cloudflare/codemode": "0.3.5",
+    "@cloudflare/workers-oauth-provider": "^0.4.0",
+    "@local/shared": "workspace:*",
+    "@local/spec-loaders-google-discovery": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "agents": "0.12.4",
+    "hono": "^4.5.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260504.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.0"
+  }
+}

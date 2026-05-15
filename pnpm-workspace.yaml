@@ -1,0 +1,5 @@
+packages:
+  - "packages/*"
+  - "packages/providers/*"
+  - "packages/spec-loaders/*"
+  - "apps/*"

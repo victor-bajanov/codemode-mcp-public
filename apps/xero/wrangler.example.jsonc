@@ -1,0 +1,54 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xero",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "XeroMCP", "name": "MCP_OBJECT" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["XeroMCP"] }
+  ],
+  "vars": {
+    "DEPLOYMENT_NAME": "xero",
+    "ALLOW_PII_IN_LOGS": "false",
+    "DEBUG_ELICIT": "false"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "env": {
+    "dev": {
+      "name": "xero-dev",
+      "kv_namespaces": [
+        { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+      ],
+      "worker_loaders": [
+        { "binding": "LOADER" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "XeroMCP", "name": "MCP_OBJECT" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["XeroMCP"] }
+      ],
+      "vars": {
+        "DEPLOYMENT_NAME": "xero-dev",
+        "ALLOW_PII_IN_LOGS": "false",
+        "DEBUG_ELICIT": "false"
+      }
+    }
+  }
+}
