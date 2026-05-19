@@ -1,0 +1,22 @@
+{
+  "name": "elicit-als-codemode-pattern-repro",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reproduces the agentContext ALS gap and the AJV-validator-default gap in the openApiMcpServer({executor, request}) codemode-pattern shape used by production DO-MCP scaffolds.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "verify": "node verify.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "agents": "0.12.4",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260504.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.87.0"
+  }
+}
