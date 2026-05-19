@@ -1,0 +1,82 @@
+[wrangler:stdout] 
+ ⛅️ wrangler 4.90.0
+───────────────────
+[wrangler:stdout] Your Worker has access to the following bindings:
+[wrangler:stdout] Binding                          Resource                  Mode
+env.MCP_OBJECT (ReproMCP)        Durable Object            local
+env.WRAP ("(hidden)")            Environment Variable      local
+[wrangler:stdout] env.VALIDATOR ("(hidden)")       Environment Variable      local
+[wrangler:stdout] env.LOADER                       Worker Loader             local
+[wrangler:stdout] 
+[wrangler:stdout] ⎔ Starting local server...
+[wrangler:stdout] [wrangler:info] Ready on http://localhost:41711
+[verify] wrangler ready at http://localhost:41711
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (79ms)
+[verify] MCP client connected
+[wrangler:stdout] [wrangler:info] POST /mcp 202 Accepted (7ms)
+[wrangler:stdout] [wrangler:info] GET /mcp 200 OK (5ms)
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (18ms)
+[verify] tool result: {"content":[{"type":"text","text":"ERROR Error: Agent was not found in send"}],"isError":true}
+[wrangler:stdout] BEFORE-LOADER op=delete_thing ALS=unset
+[wrangler:stdout] INSIDE-CALLBACK op=delete_thing ALS=unset
+[wrangler:stdout] SCAFFOLD-ERROR delete_thing Error: Agent was not found in send
+[wrangler:stderr] [31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mUncaught Error: Agent was not found in send Error[0m
+
+      at send (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/agents@0.12.3_@babel+core@7.29.0_@babel+runtime@7.29.2_@cloudflare+workers-types@4.2026_8336d5785d99b8dab92951cba302a2e8/node_modules/agents/src/mcp/transport.ts:308:23)
+      at null.<anonymous> (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/shared/protocol.ts:1248:33)
+      at request (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/shared/protocol.ts:1102:16)
+      at elicitInput (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/server/index.ts:577:43)
+      at onRequest (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/elicit-gate.ts:22:40)
+      at null.<anonymous> (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:64:27)
+      at wrap (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:47:43)
+      at request (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:64:16)
+      at call (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/scaffold-mini.ts:52:23)
+
+
+
+=== VERIFY SUMMARY ===
+WRAP=
+TRIGGER_VALIDATION=
+VALIDATOR=
+observed=tool-error
+detail=ERROR Error: Agent was not found in send
+
+--- wrangler stdout (tail) ---
+
+ ⛅️ wrangler 4.90.0
+───────────────────
+Your Worker has access to the following bindings:
+Binding                          Resource                  Mode
+env.MCP_OBJECT (ReproMCP)        Durable Object            local
+env.WRAP ("(hidden)")            Environment Variable      local
+env.VALIDATOR ("(hidden)")       Environment Variable      local
+env.LOADER                       Worker Loader             local
+
+⎔ Starting local server...
+[wrangler:info] Ready on http://localhost:41711
+[wrangler:info] POST /mcp 200 OK (79ms)
+[wrangler:info] POST /mcp 202 Accepted (7ms)
+[wrangler:info] GET /mcp 200 OK (5ms)
+[wrangler:info] POST /mcp 200 OK (18ms)
+BEFORE-LOADER op=delete_thing ALS=unset
+INSIDE-CALLBACK op=delete_thing ALS=unset
+SCAFFOLD-ERROR delete_thing Error: Agent was not found in send
+
+
+--- wrangler stderr (tail) ---
+[31m✘ [41;31m[[41;97mERROR[41;31m][0m [1mUncaught Error: Agent was not found in send Error[0m
+
+      at send (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/agents@0.12.3_@babel+core@7.29.0_@babel+runtime@7.29.2_@cloudflare+workers-types@4.2026_8336d5785d99b8dab92951cba302a2e8/node_modules/agents/src/mcp/transport.ts:308:23)
+      at null.<anonymous> (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/shared/protocol.ts:1248:33)
+      at request (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/shared/protocol.ts:1102:16)
+      at elicitInput (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/node_modules/.pnpm/@modelcontextprotocol+sdk@1.29.0_@cfworker+json-schema@4.1.1_zod@4.4.3/node_modules/@modelcontextprotocol/sdk/src/server/index.ts:577:43)
+      at onRequest (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/elicit-gate.ts:22:40)
+      at null.<anonymous> (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:64:27)
+      at wrap (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:47:43)
+      at request (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/host.ts:64:16)
+      at call (file:///home/user/gmail-mcp/scripts/repros/elicit-als-context/codemode-pattern/src/scaffold-mini.ts:52:23)
+
+
+
+
+PASS: observed expected behavior (ALS error).
