@@ -189,6 +189,9 @@ importers:
       hono:
         specifier: ^4.5.0
         version: 4.12.16
+      zod:
+        specifier: ^4.0.0
+        version: 4.4.3
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20260504.0

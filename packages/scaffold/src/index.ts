@@ -19,5 +19,12 @@ export { type TokenRotation, type UpstreamTokenResponse, type CompleteAuthHookAr
 export { createOAuthHandler } from "./oauth-handler.js";
 export { createProviderMcpAgent, type ProviderEnv } from "./mcp-agent-factory.js";
 export { setupProvider } from "./setup-provider.js";
+export {
+  createTokenBrokerDO,
+  type TokenBrokerStub,
+  type TokenBrokerArgs,
+} from "./token-broker.js";
 export { runElicitation, type RunElicitationArgs, ToolError } from "./elicit.js";
 export { allowPiiInLogs, debugElicit, debugLog, assertSecrets, type ScaffoldSecrets } from "./config.js";
+export * as staging from "./staging/index.js";
+export { readStagingConfig } from "./config.js";

@@ -6,6 +6,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
+import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
+import { registerFileHandleTool } from "../staging";
 
 // TypeScript-only canary — see "agents@0.12.4: __DO_NOT_USE_WILL_BREAK__agentContext
 // export and store shape are stable (#1490 canary)" test below.
@@ -179,5 +181,20 @@ describe("openApiMcpServer (codemode 0.3.5 contract)", () => {
     expect(
       (server.server as unknown as { _jsonSchemaValidator: unknown })._jsonSchemaValidator,
     ).toBe(validator);
+  });
+});
+
+describe("register_file_handle tool wiring", () => {
+  it("issues a working token when bindings are present", async () => {
+    const d1 = new FakeD1();
+    const tool = registerFileHandleTool({
+      STAGING_D1: d1 as unknown as D1Database,
+      config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 },
+      uploadOrigin: "https://x.test",
+      now: () => 1,
+    });
+    const result = await tool.handler({});
+    expect(result.upload_url).toBe("https://x.test/staging/upload");
+    expect(result.token.startsWith("stg_")).toBe(true);
   });
 });

@@ -1,6 +1,26 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { handleUpstreamRequest } from "@local/scaffold";
+import { handleUpstreamRequest, getOrRefreshAccessToken } from "@local/scaffold";
 import { spec, surfaceReview } from "@local/providers-gmail";
+
+function makeFakeBroker() {
+  const data = new Map<string, unknown>();
+  const storage = {
+    get: async <T>(k: string) => data.get(k) as T | undefined,
+    put: async <T>(k: string, v: T) => { data.set(k, v); },
+  };
+  return {
+    async getOrRefreshAccessToken(args: { userId: string; refreshToken: string }) {
+      return getOrRefreshAccessToken({
+        storage,
+        rotation: "static",
+        refreshToken: args.refreshToken,
+        clientId: "CID",
+        clientSecret: "CSEC",
+        tokenUrl: "https://oauth2.googleapis.com/token",
+      });
+    },
+  };
+}
 
 const baseProps = {
   refreshToken: "RT-fake",
@@ -19,15 +39,8 @@ const baseScaffoldArgs = {
   server: {} as never,
   oauth: {
     refreshTokenAccessor: (p: typeof baseProps) => p.refreshToken,
-    clientId: "CID",
-    clientSecret: "CSEC",
-    tokenUrl: "https://oauth2.googleapis.com/token",
-    storage: {
-      data: new Map<string, unknown>(),
-      async get<T>(_k: string): Promise<T | undefined> { return undefined; },
-      async put<T>(_k: string, _v: T): Promise<void> { /* noop */ },
-    },
-    rotation: "static" as const,
+    userIdAccessor: (p: typeof baseProps) => p.userId,
+    broker: makeFakeBroker(),
   },
   audit: {},
   env: {} as { ALLOW_PII_IN_LOGS?: string },

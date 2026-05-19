@@ -76,6 +76,25 @@ export interface ApiProvider<
    *  when no renderer resolves. */
   elicitRenderers?: Partial<Record<string, ElicitRenderer>>;
 
+  /** Provider-specific Step-3 guidance for the staging/attachment workflow.
+   *
+   *  Spliced verbatim into TWO LLM-facing description sites when this server has
+   *  staging bindings configured (STAGING_D1 + STAGING_R2 + STAGING_UPLOAD_ORIGIN):
+   *
+   *    1. the `register_file_handle` tool description (after Steps 1 + 2, which
+   *       are provider-agnostic and explain minting + reading the bytes), and
+   *    2. the `execute` tool's description (codemode's executeAddendum).
+   *
+   *  Should show, in concrete code, exactly how to forward `f.bytesBase64` from
+   *  `__stagingHost.getFile(file_handle, token)` to THIS provider's upstream API.
+   *  Strongly recommended when staging is enabled — without it, the LLM tends to
+   *  miss that the workflow applies to non-Xero providers.
+   *
+   *  Format: a leading "Step 3 — …" heading or short imperative, followed by a
+   *  fenced code-style snippet that uses `await codemode.request({...})` to call
+   *  an upstream operationId allowed by `surfaceReview`. */
+  attachmentHint?: string;
+
   /** Optional accessors that pull audit-log identifiers out of the request props.
    *  - principalId: the authenticated subject (OAuth sub).
    *  - context: provider-specific identifier blob (e.g. { tenantId } for Xero). */
