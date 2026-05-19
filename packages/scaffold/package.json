@@ -20,7 +20,8 @@
     "@local/spec-loaders-google-discovery": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "0.12.4",
-    "hono": "^4.5.0"
+    "hono": "^4.5.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260504.0",

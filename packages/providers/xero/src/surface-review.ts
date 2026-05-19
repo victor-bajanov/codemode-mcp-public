@@ -1,7 +1,6 @@
 import type { SurfaceReview } from "@local/shared";
 import { inspectInvoiceDraft } from "./inspectors/drafts.js";
 import { inspectBankTxCreate } from "./inspectors/bank-transactions.js";
-import { inspectAttachmentUpload } from "./inspectors/attachments.js";
 
 import specJson from "./spec.json" with { type: "json" };
 
@@ -41,9 +40,12 @@ const TIER_1_ALLOW_INSPECT_OR_BARE: SurfaceReview = {
   "xero.accounting.updateOrCreateRepeatingInvoices": { decision: "allow", category: "standard_write" },
   "xero.accounting.createBankTransactions":      { decision: "allow", inspect: inspectBankTxCreate },
   "xero.accounting.updateBankTransaction":       { decision: "allow", inspect: inspectBankTxCreate },
-  "xero.accounting.createInvoiceAttachmentByFileName":      { decision: "allow", inspect: inspectAttachmentUpload },
-  "xero.accounting.updateInvoiceAttachmentByFileName":      { decision: "allow", inspect: inspectAttachmentUpload },
-  "xero.files.uploadFile":                       { decision: "allow", inspect: inspectAttachmentUpload },
+  // Attachment uploads are bare allows: the inspector relied on contentType/rawBody,
+  // which the request-handler does not currently surface to inspectors (only body+query
+  // are passed). Re-wire the inspector once the handler forwards request bytes.
+  "xero.accounting.createInvoiceAttachmentByFileName":      { decision: "allow", category: "standard_write" },
+  "xero.accounting.updateInvoiceAttachmentByFileName":      { decision: "allow", category: "standard_write" },
+  "xero.files.uploadFile":                       { decision: "allow", category: "standard_write" },
   "xero.files.createFolder":                     { decision: "allow", category: "standard_write" },
 };
 
