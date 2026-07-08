@@ -7,7 +7,7 @@
 //   - HandleArgs.oauth.broker + userIdAccessor: missing userId throws ToolError; otherwise the broker stub mints the access token used in the outbound Authorization header.
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { handleUpstreamRequest } from "../request-handler";
+import { handleUpstreamRequest, type UpstreamCtx } from "../request-handler";
 import { getOrRefreshAccessToken } from "../refresh";
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { SurfaceReview } from "@local/shared";
@@ -150,7 +150,10 @@ describe("request-handler slice-2 extensions", () => {
     const init = upstreamCall[1] as RequestInit;
     const headers = init.headers as Record<string, string>;
     expect(headers["content-type"]).toBe("application/xml");
-    expect(init.body).toBe("<xml/>");
+    // rawBody strings are now normalized to UTF-8 bytes by resolveEffective so the
+    // inspected and sent payloads are identical; the wire content is unchanged.
+    expect(init.body).toBeInstanceOf(Uint8Array);
+    expect(new TextDecoder().decode(init.body as Uint8Array)).toBe("<xml/>");
   });
 
   it("bodyBase64 decodes to raw bytes; high-byte values are preserved", async () => {
@@ -402,6 +405,45 @@ describe("handleUpstreamRequest — elicit integration", () => {
     expect(acceptedIdx).toBeGreaterThanOrEqual(0);
     expect(allowIdx).toBeGreaterThanOrEqual(0);
     expect(acceptedIdx).toBeLessThan(allowIdx);
+  });
+
+  it("forwards relatedRequestId to elicitInput as the second arg", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) => {
+      const u = typeof url === "string" ? url : url.toString();
+      if (u.includes("/token")) {
+        return new Response(JSON.stringify({ access_token: "AT-x", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }));
+    captureAudit();
+
+    let seenOptions: unknown = "UNCALLED";
+    const elicitInput = vi.fn(async (_params: unknown, options?: unknown) => {
+      seenOptions = options;
+      return { action: "accept", content: { to: "x@y.com" } };
+    });
+
+    await handleUpstreamRequest({
+      ctx: { method: "POST", path: "/send", body: { to: "x@y.com" } },
+      spec: SPEC_E,
+      surfaceReview: SR_E,
+      apiBaseUrl: "https://x",
+      deploymentName: "test",
+      props: { refreshToken: "r", userId: "test-user" },
+      relatedRequestId: "req-42",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      server: makeMcpStub(elicitInput as (p: unknown) => Promise<unknown>) as any,
+      oauth: {
+        refreshTokenAccessor: (p) => (p as { refreshToken: string }).refreshToken,
+        userIdAccessor: (p) => (p as { userId?: string }).userId,
+        broker: makeFakeBroker(),
+      },
+      audit: {},
+      env: {},
+    });
+
+    expect(elicitInput).toHaveBeenCalledTimes(1);
+    expect(seenOptions).toEqual({ relatedRequestId: "req-42" });
   });
 
   it("decline -> ToolError; no upstream fetch", async () => {
@@ -840,5 +882,204 @@ describe("handleUpstreamRequest — bypassTruncate", () => {
     expect((result.result.data as string).length).toBeLessThan(200_000);
     expect((result.result.data as string)).toContain(" ... [TRUNCATED");
     expect(result.result.__truncated__).toBe(true);
+  });
+});
+
+describe("handleUpstreamRequest — inspector deny surfaces a clear message", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  const SPEC_W: OpenApiSpec = {
+    openapi: "3.0.0", info: { title: "T", version: "1" }, servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/things": {
+        put: {
+          operationId: "createThings",
+          requestBody: { content: { "application/json": { schema: { type: "object" } } } },
+          responses: { "200": { description: "OK" } },
+        },
+      },
+    },
+    components: { schemas: {} },
+  };
+
+  const denyArgs = {
+    spec: SPEC_W,
+    apiBaseUrl: "https://api.example.com",
+    deploymentName: "test",
+    server: {} as never,
+    oauth: {
+      refreshTokenAccessor: (p: Record<string, unknown>) => p.refreshToken as string,
+      userIdAccessor: (p: Record<string, unknown>) => p.userId as string | undefined,
+      broker: makeFakeBroker(),
+    },
+    audit: {},
+    env: {} as { ALLOW_PII_IN_LOGS?: string },
+    props: { refreshToken: "RT-1", userId: "test-user" },
+    ctx: { method: "PUT" as const, path: "/things", body: { Status: "AUTHORISED" } },
+  };
+
+  it("throws the inspector's human-readable message, not the opaque generic", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+    const SR_W: SurfaceReview = {
+      createThings: {
+        decision: "allow",
+        inspect: () => ({
+          decision: "deny",
+          category: "irreversible",
+          reason: "thing-not-draft",
+          message: "Only DRAFT or SUBMITTED things can be modified; this thing has Status \"AUTHORISED\".",
+        }),
+      },
+    };
+
+    await expect(handleUpstreamRequest({ ...denyArgs, surfaceReview: SR_W }))
+      .rejects.toThrow(/Only DRAFT or SUBMITTED things.*AUTHORISED/);
+  });
+
+  it("records the terse reason code in the audit log even when a message is thrown", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    const audit = captureAudit();
+    const SR_W: SurfaceReview = {
+      createThings: {
+        decision: "allow",
+        inspect: () => ({
+          decision: "deny",
+          category: "irreversible",
+          reason: "thing-not-draft",
+          message: "Only DRAFT or SUBMITTED things can be modified.",
+        }),
+      },
+    };
+
+    await expect(handleUpstreamRequest({ ...denyArgs, surfaceReview: SR_W })).rejects.toThrow();
+
+    const denyLine = audit.read().find((l) => l.decision === "deny" && l.operationId === "createThings");
+    expect(denyLine).toBeDefined();
+    expect(denyLine!.reason).toBe("thing-not-draft");
+  });
+
+  it("falls back to the generic message when the inspector supplies no message", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+    const SR_W: SurfaceReview = {
+      createThings: {
+        decision: "allow",
+        inspect: () => ({ decision: "deny", category: "irreversible", reason: "thing-not-draft" }),
+      },
+    };
+
+    await expect(handleUpstreamRequest({ ...denyArgs, surfaceReview: SR_W }))
+      .rejects.toThrow(/denied by surface review/);
+  });
+});
+
+describe("inspection operates on the effective payload", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  const POST_SPEC: OpenApiSpec = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    servers: [{ url: "https://api.example.com" }],
+    paths: { "/send": { post: { operationId: "send", responses: { "200": { description: "OK" } } } } },
+    components: { schemas: {} },
+  };
+  // Inspector: deny unless body.to === "ok@allow".
+  const SR_INSPECT: SurfaceReview = {
+    send: {
+      decision: "allow",
+      inspect: (req) => {
+        const to = (req.body as { to?: string } | undefined)?.to;
+        return to === "ok@allow"
+          ? { decision: "allow" }
+          : { decision: "deny", category: "external_data_flow", reason: "off-allow" };
+      },
+    },
+  };
+
+  function baseInspectArgs(ctx: UpstreamCtx) {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+    return {
+      ctx,
+      spec: POST_SPEC,
+      surfaceReview: SR_INSPECT,
+      apiBaseUrl: "https://api.example.com",
+      deploymentName: "test",
+      props: { refreshToken: "RT-1", userId: "test-user" },
+      server: {} as never,
+      env: {} as { ALLOW_PII_IN_LOGS?: string },
+      audit: {},
+      oauth: {
+        refreshTokenAccessor: (p: Record<string, unknown>) => p.refreshToken as string,
+        userIdAccessor: (p: Record<string, unknown>) => p.userId as string | undefined,
+        broker: makeFakeBroker(),
+      },
+    };
+  }
+
+  it("denies a body+bodyBase64 decoy (the PoC) as malformed", async () => {
+    const evil = Buffer.from(JSON.stringify({ to: "evil@attacker" }), "utf8").toString("base64");
+    await expect(
+      handleUpstreamRequest(
+        baseInspectArgs({ method: "POST", path: "/send", body: { to: "ok@allow" }, bodyBase64: evil, contentType: "application/json" }),
+      ),
+    ).rejects.toThrow(/surface review|malformed|multiple/i);
+  });
+
+  it("inspects the decoded bodyBase64 payload when it is the only channel", async () => {
+    const evil = Buffer.from(JSON.stringify({ to: "evil@attacker" }), "utf8").toString("base64");
+    await expect(
+      handleUpstreamRequest(
+        baseInspectArgs({ method: "POST", path: "/send", bodyBase64: evil, contentType: "application/json" }),
+      ),
+    ).rejects.toThrow(/surface review/i);
+  });
+
+  it("allows a legitimate single-channel body that the inspector approves", async () => {
+    await expect(
+      handleUpstreamRequest(baseInspectArgs({ method: "POST", path: "/send", body: { to: "ok@allow" } })),
+    ).resolves.toBeDefined();
+  });
+
+  // Regression: a non-JSON bodyBase64 payload surfaces to the inspector as
+  // `req.rawBody: Uint8Array`. deepFreeze must not throw on that typed array,
+  // and the inspector must actually see the decoded bytes.
+  describe("raw (non-JSON) payload reaches the inspector without crashing deepFreeze", () => {
+    // Inspector reads the raw bytes and denies when they contain "evil".
+    const SR_RAW: SurfaceReview = {
+      send: {
+        decision: "allow",
+        inspect: (req) => {
+          const bytes = req.rawBody as Uint8Array | undefined;
+          const text = bytes ? new TextDecoder().decode(bytes) : "";
+          return text.includes("evil")
+            ? { decision: "deny", category: "external_data_flow", reason: "raw-evil" }
+            : { decision: "allow" };
+        },
+      },
+    };
+
+    function rawArgs(ctx: UpstreamCtx) {
+      return { ...baseInspectArgs(ctx), surfaceReview: SR_RAW };
+    }
+
+    it("denies when the decoded rawBody bytes contain the marker (no TypeError)", async () => {
+      const evil = Buffer.from("From: evil@attacker\r\n\r\nhi", "utf8").toString("base64");
+      await expect(
+        handleUpstreamRequest(
+          rawArgs({ method: "POST", path: "/send", bodyBase64: evil, contentType: "message/rfc822" }),
+        ),
+      ).rejects.toThrow(/surface review/i);
+    });
+
+    it("allows when the decoded rawBody bytes are clean; inspector saw the bytes", async () => {
+      const clean = Buffer.from("From: ok@allow\r\n\r\nhi", "utf8").toString("base64");
+      await expect(
+        handleUpstreamRequest(
+          rawArgs({ method: "POST", path: "/send", bodyBase64: clean, contentType: "message/rfc822" }),
+        ),
+      ).resolves.toBeDefined();
+    });
   });
 });

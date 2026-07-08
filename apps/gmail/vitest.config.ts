@@ -3,9 +3,14 @@ import { defineConfig } from "vitest/config";
 // Comprehensive stub for cloudflare: built-in protocols.
 // `agents`, `@cloudflare/codemode`, and `partyserver` transitively import
 // these at module evaluation time; none of our test cases exercise them.
+// WorkerEntrypoint must be a defined class — codemode 0.4.x's CodemodeConnector
+// extends it, so its absence throws at module load.
 const STUBS: Record<string, string> = {
   "cloudflare:workers": `
     export class DurableObject {}
+    export class WorkerEntrypoint {
+      constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+    }
     export class RpcTarget {}
     export class WorkflowEntrypoint {}
     export const env = {};

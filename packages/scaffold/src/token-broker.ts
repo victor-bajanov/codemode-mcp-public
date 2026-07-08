@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { ApiProvider } from "./api-provider";
+import { resolveEndpoints } from "./config";
 import { getOrRefreshAccessToken, type GrantSlot, type RefreshTokenStorage } from "./refresh";
 import { encryptSlot, decryptSlot, type SealedSlot } from "./encrypt-slot";
 
@@ -67,7 +68,7 @@ export function createTokenBrokerDO<
         refreshToken: args.refreshToken,
         clientId: this.env[provider.oauth.clientIdSecretName] as unknown as string,
         clientSecret: this.env[provider.oauth.clientSecretSecretName] as unknown as string,
-        tokenUrl: provider.oauth.tokenUrl,
+        tokenUrl: resolveEndpoints(provider, this.env as unknown as Record<string, unknown>).tokenUrl,
       });
 
       // Persist when the slot has gained or rotated its refresh token.

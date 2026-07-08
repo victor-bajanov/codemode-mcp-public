@@ -2,24 +2,37 @@
 
 Provisions Cloudflare resources for slice 1: the OAuth KV namespace and the Cloudflare Access policy on `/authorize`.
 
-Auth uses your Cloudflare **Global API Key** via env vars resolved by 1Password CLI (`op run --env-file=.env`).
+Auth uses a **scoped Cloudflare API token** (one token per project; the same token also drives `wrangler deploy` and `wrangler secret put`). Mint it once with [`create-api-token.sh`](./create-api-token.sh); the env var (`CLOUDFLARE_API_TOKEN`) is resolved from 1Password by `op run --env-file=.env`.
 
 ## Prerequisites
 
 - OpenTofu 1.6+ (`brew install opentofu`)
 - 1Password CLI (`op`) signed in to the relevant account
-- A "Cloudflare Global API Key" item in your `Private` vault, with fields:
-  - `username` — the account email
-  - `credential` — the API key
+- A "Codemode MCP Cloudflare Token" item in your `Private` vault, with fields:
+  - `credential` — the API token value
   - `account id` — your Cloudflare account ID
 - The workers.dev subdomain reserved for your account (visible in the Cloudflare dashboard under Workers & Pages)
+
+## Mint the API token (one-time)
+
+```bash
+# Mint a *single-use* creation token in the Cloudflare dashboard:
+#   My Profile → API Tokens → Create Token → Custom token → "User > API Tokens > Edit"
+# Use it once, then delete it.
+export CF_CREATE_TOKEN='<single-use token>'
+./infra/create-api-token.sh
+```
+
+The script either creates a `codemode-mcp-deploy` token or updates the existing one in place. Stash the printed value in 1Password (item `Codemode MCP Cloudflare Token`, fields `credential` and `account id`).
+
+The deploy token has no user-scoped permissions; instead `infra/.env` sets `CLOUDFLARE_ACCOUNT_ID`, which makes wrangler skip its `/memberships` preflight and go straight to the account-scoped endpoints.
 
 ## Setup
 
 ```bash
 cd infra
 cp .env.example .env
-# Edit .env: set TF_VAR_cloudflare_workers_subdomain and TF_VAR_allowed_email.
+# Edit .env: set TF_VAR_cloudflare_workers_subdomain and TF_VAR_allowed_emails.
 # Adjust the op:// paths if your vault layout differs.
 op run --env-file=.env -- tofu init
 op run --env-file=.env -- tofu plan

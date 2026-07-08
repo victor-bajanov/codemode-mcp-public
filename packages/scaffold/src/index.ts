@@ -1,4 +1,5 @@
 export type { ApiProvider } from "./api-provider.js";
+export { hintFromSpecInfo } from "./api-provider.js";
 export { resolveOperation } from "./path-matcher.js";
 export { truncateForReturn, stringifyForMcpResult } from "./truncate.js";
 export { auditLog, type AuditEntry } from "./audit.js";
@@ -27,4 +28,15 @@ export {
 export { runElicitation, type RunElicitationArgs, ToolError } from "./elicit.js";
 export { allowPiiInLogs, debugElicit, debugLog, assertSecrets, type ScaffoldSecrets } from "./config.js";
 export * as staging from "./staging/index.js";
-export { readStagingConfig } from "./config.js";
+export { readStagingConfig, resolveEndpoints, type ResolvedEndpoints } from "./config.js";
+export {
+  readOAuthRateLimitConfig,
+  type OAuthRateLimitConfig,
+} from "./config.js";
+export {
+  enforceOAuthHardening,
+  checkRateLimit,
+  withNoStore,
+  type RateLimitStore,
+  type RateLimitConfig,
+} from "./oauth-hardening.js";

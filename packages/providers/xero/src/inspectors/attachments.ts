@@ -27,6 +27,7 @@ export function inspectAttachmentUpload(req: InspectRequest): InspectResult {
 
   let size: number | undefined;
   if (req.rawBody instanceof ArrayBuffer) size = req.rawBody.byteLength;
+  else if (req.rawBody instanceof Uint8Array) size = req.rawBody.byteLength;
   else if (typeof req.rawBody === "string") size = req.rawBody.length;
 
   if (size !== undefined && size > ATTACHMENT_MAX_SIZE) {

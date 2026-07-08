@@ -1,5 +1,5 @@
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
-import type { Decision, ElicitRenderer, InspectResult, SurfaceReview } from "@local/shared";
+import type { Decision, ElicitRenderer, InspectRequest, InspectResult, SurfaceReview } from "@local/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { resolveOperation } from "./path-matcher";
 import { truncateForReturn } from "./truncate";
@@ -33,9 +33,9 @@ export interface UpstreamCtx {
    *  present, defaults to `application/json`. */
   contentType?: string;
   /** Send `body` to the upstream verbatim (no `JSON.stringify`). Use for
-   *  text/XML/form payloads. Binary uploads should use `bodyBase64` instead
-   *  because the sandbox→host RPC encodes args via `JSON.stringify`, which
-   *  mangles high-byte values in strings. */
+   *  text/XML/form payloads. For binary uploads prefer `bodyBase64` (or
+   *  `multipart`) — they are the explicit, lossless binary paths handled
+   *  server-side. */
   rawBody?: boolean;
   /** Base64-encoded raw bytes for binary upstream bodies. Decoded server-side
    *  and used as the outbound body. Takes precedence over `body` when set. */
@@ -70,6 +70,128 @@ function bytesToBase64(bytes: Uint8Array): string {
   let bin = "";
   for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]!);
   return btoa(bin);
+}
+
+/** JSON inspection parse cap — mirrors DEFAULT_MAX_BYTES in config.ts (50 MiB).
+ *  Effective JSON payloads larger than this are denied on inspected ops rather
+ *  than parsed, so the inspector never blocks on decoding an oversized body.
+ *  This is a hard ceiling on inspected JSON sends; there is no larger-payload
+ *  bypass channel wired today (see Task 5). */
+export const INSPECT_JSON_MAX_BYTES = 50 * 1024 * 1024;
+
+const JSON_CONTENT_TYPE_RE = /^application\/(?:[\w.+-]+\+)?json\b/i;
+
+/** True when the content-type denotes JSON (application/json, application/*+json). */
+export function isJsonContentType(contentType: string | undefined): boolean {
+  return contentType !== undefined && JSON_CONTENT_TYPE_RE.test(contentType);
+}
+
+/** The single effective outbound payload, resolved from the legacy channel
+ *  precedence (multipart > bodyBase64 > rawBody+body > body JSON). */
+export type EffectiveBody =
+  | { kind: "none" }
+  | { kind: "json"; body: unknown; contentType: string }
+  | { kind: "raw"; bytes: Uint8Array; contentType: string }
+  | { kind: "multipart"; parts: MultipartPart[] };
+
+/** Count of distinct body channels supplied. A legitimate request uses one. */
+export function bodyChannelCount(ctx: UpstreamCtx): number {
+  let n = 0;
+  if (ctx.body !== undefined && ctx.body !== null) n++;
+  if (typeof ctx.bodyBase64 === "string") n++;
+  if (Array.isArray(ctx.multipart)) n++;
+  return n;
+}
+
+/** Resolve the effective outbound payload (wire form). */
+export function resolveEffective(ctx: UpstreamCtx): EffectiveBody {
+  if (Array.isArray(ctx.multipart)) {
+    return { kind: "multipart", parts: ctx.multipart };
+  }
+  if (typeof ctx.bodyBase64 === "string") {
+    return {
+      kind: "raw",
+      bytes: base64ToBytes(ctx.bodyBase64),
+      contentType: ctx.contentType ?? "application/octet-stream",
+    };
+  }
+  if (ctx.rawBody && ctx.body !== undefined && ctx.body !== null) {
+    // The sandbox→host RPC rejects typed-array views (`Cannot freeze array buffer
+    // views with elements`, see mcp-agent-factory.ts), so a `rawBody` body is
+    // always a string here. Guard the invariant rather than silently marshalling
+    // an EMPTY body — the old code sent `ctx.body as BodyInit` verbatim, so a
+    // non-string here must fail loudly, not vanish.
+    if (typeof ctx.body !== "string") {
+      throw new ToolError("rawBody requires a string body; send binary via bodyBase64 or multipart");
+    }
+    return {
+      kind: "raw",
+      bytes: new TextEncoder().encode(ctx.body),
+      contentType: ctx.contentType ?? "application/octet-stream",
+    };
+  }
+  if (ctx.body !== undefined && ctx.body !== null) {
+    return { kind: "json", body: ctx.body, contentType: ctx.contentType ?? "application/json" };
+  }
+  return { kind: "none" };
+}
+
+/** Marshal the effective payload to the outbound fetch body + content-type.
+ *  Reused verbatim for the upstream request so inspected == sent. */
+export function marshalBody(
+  ctx: UpstreamCtx,
+  eff: EffectiveBody,
+): { bodyToSend: BodyInit | undefined; contentType: string | undefined } {
+  switch (eff.kind) {
+    case "multipart": {
+      const { body, boundary } = buildMultipartBody(eff.parts);
+      return { bodyToSend: body, contentType: `multipart/form-data; boundary=${boundary}` };
+    }
+    case "raw":
+      return { bodyToSend: eff.bytes, contentType: eff.contentType };
+    case "json":
+      return { bodyToSend: JSON.stringify(eff.body), contentType: eff.contentType };
+    case "none":
+      // No body; honour an explicit caller content-type if present (rare).
+      return { bodyToSend: undefined, contentType: ctx.contentType };
+  }
+}
+
+export interface DerivedInspect {
+  req: InspectRequest;
+  /** True when the effective payload is JSON over the parse cap (→ deny). */
+  oversize?: boolean;
+}
+
+/** Build the canonical InspectRequest from the effective payload. */
+export function deriveInspectRequest(
+  ctx: UpstreamCtx,
+  eff: EffectiveBody,
+  maxBytes: number,
+): DerivedInspect {
+  const base: InspectRequest = ctx.query !== undefined ? { query: ctx.query } : {};
+  switch (eff.kind) {
+    case "none":
+      return { req: base };
+    case "json":
+      return { req: { ...base, body: eff.body, contentType: eff.contentType } };
+    case "multipart":
+      return { req: { ...base, multipart: eff.parts, contentType: "multipart/form-data" } };
+    case "raw": {
+      if (isJsonContentType(eff.contentType)) {
+        if (eff.bytes.byteLength > maxBytes) {
+          return { req: base, oversize: true };
+        }
+        try {
+          const parsed = JSON.parse(new TextDecoder().decode(eff.bytes));
+          return { req: { ...base, body: parsed, contentType: eff.contentType } };
+        } catch {
+          /* not valid JSON despite the content-type → expose as raw bytes */
+        }
+      }
+      return { req: { ...base, rawBody: eff.bytes, contentType: eff.contentType } };
+    }
+  }
 }
 
 function filenameFromContentDisposition(header: string | null): string | null {
@@ -128,6 +250,15 @@ export interface HandleArgs<P extends Record<string, unknown>> {
   deploymentName: string;
   props: P;
   server: McpServer;
+
+  /** MCP request id of the tool call that triggered this upstream request.
+   *  Threaded from codemode's `(options, context)` request callback and passed
+   *  to `elicitInput` as `relatedRequestId`, so server-initiated elicit
+   *  messages route back through the originating POST response stream
+   *  (codemode#1793 / agents#1510). Optional: undefined in non-MCP callers
+   *  (e.g. the stageFromUpstreamJson capability) falls back to the prior
+   *  best-effort routing. */
+  relatedRequestId?: string | number;
 
   // OAuth — broker stub mints fresh access tokens; rotation lives in the broker.
   oauth: {
@@ -246,16 +377,54 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   let decision: Decision = review.decision;
   let category: string | undefined = review.category;
   let reason: string | undefined;
+  // Human-readable explanation from the inspector, surfaced to the caller on deny.
+  // `reason` stays the terse audit code; `denyMessage` is the caller-facing prose.
+  let denyMessage: string | undefined;
+
+  // Resolve the single effective outbound payload ONCE, before inspection, and
+  // reuse it for marshalling below — so the bytes inspected and the bytes sent
+  // are one and the same. Can throw ToolError (rawBody + non-string body); that
+  // propagation is correct, mirroring the other deny paths.
+  const eff = resolveEffective(ctx);
 
   let inspectResult: InspectResult | undefined;
   if (review.inspect) {
-    inspectResult = review.inspect({
-      ...(ctx.body !== undefined ? { body: ctx.body } : {}),
-      ...(ctx.query !== undefined ? { query: ctx.query } : {}),
-    });
+    // One-channel guard: a legitimate caller uses exactly one body channel.
+    // Supplying two is the decoy-bypass primitive (inspect one, send another) → deny.
+    if (bodyChannelCount(ctx) > 1) {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "deny",
+        category: "malformed",
+        reason: "multiple-body-channels",
+        ts: new Date().toISOString(),
+      });
+      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+    }
+    const derived = deriveInspectRequest(ctx, eff, INSPECT_JSON_MAX_BYTES);
+    if (derived.oversize) {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "deny",
+        category: "malformed",
+        reason: "oversize-json-body",
+        ts: new Date().toISOString(),
+      });
+      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+    }
+    // Freeze the derived request so inspectors cannot mutate what will be sent,
+    // matching the deepFreeze protection previously applied to ctx.body.
+    inspectResult = review.inspect(deepFreeze(derived.req));
     decision = mostRestrictive(decision, inspectResult.decision);
     if (inspectResult.category) category = inspectResult.category;
     if (inspectResult.reason) reason = inspectResult.reason;
+    if (inspectResult.message) denyMessage = inspectResult.message;
   }
 
   if (decision === "deny") {
@@ -269,7 +438,9 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       ...(reason ? { reason } : {}),
       ts: new Date().toISOString(),
     });
-    throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+    // Prefer the inspector's specific explanation (e.g. "only DRAFT or SUBMITTED
+    // credit notes can be modified; this one is AUTHORISED") over the opaque generic.
+    throw new ToolError(denyMessage ?? `Operation ${op.operationId} is denied by surface review`);
   }
 
   if (decision === "elicit") {
@@ -292,6 +463,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       path: ctx.path,
       body: ctx.body,
       env: args.env,
+      ...(args.relatedRequestId !== undefined ? { relatedRequestId: args.relatedRequestId } : {}),
       ...(ctx.query !== undefined ? { query: ctx.query } : {}),
       ...(category ? { category } : {}),
       ...(reason ? { reason } : {}),
@@ -349,38 +521,11 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
 
   const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
 
-  // Body marshalling. Four modes, mutually exclusive (priority top-down):
-  //   multipart  → server-side multipart/form-data assembly (content-type set with boundary)
-  //   bodyBase64 → decode to bytes, send raw (default content-type octet-stream)
-  //   rawBody    → pass body through verbatim (string/ArrayBuffer/Uint8Array)
-  //   default    → JSON.stringify body, content-type application/json
-  // ctx.contentType, when set, always wins over the mode-default content-type
-  // — except for `multipart`, where the boundary parameter must match the body.
-  let bodyToSend: BodyInit | undefined;
-  let defaultCt: string | undefined;
-  let lockedCt: string | undefined;
-  if (Array.isArray(ctx.multipart)) {
-    const { body, boundary } = buildMultipartBody(ctx.multipart);
-    bodyToSend = body;
-    lockedCt = `multipart/form-data; boundary=${boundary}`;
-  } else if (typeof ctx.bodyBase64 === "string") {
-    bodyToSend = base64ToBytes(ctx.bodyBase64);
-    defaultCt = "application/octet-stream";
-  } else if (ctx.rawBody && ctx.body !== undefined && ctx.body !== null) {
-    bodyToSend = ctx.body as BodyInit;
-    defaultCt = "application/octet-stream";
-  } else if (ctx.body !== undefined && ctx.body !== null) {
-    bodyToSend = JSON.stringify(ctx.body);
-    defaultCt = "application/json";
-  }
-
-  if (lockedCt) {
-    headers["content-type"] = lockedCt;
-  } else if (bodyToSend !== undefined) {
-    headers["content-type"] = ctx.contentType ?? defaultCt ?? "application/json";
-  } else if (ctx.contentType) {
-    // No body but caller set a content-type — honour it (rare, but cheap).
-    headers["content-type"] = ctx.contentType;
+  // Marshal the SAME effective payload resolved before inspection, so the bytes
+  // inspected and the bytes sent are one and the same.
+  const { bodyToSend, contentType: outboundContentType } = marshalBody(ctx, eff);
+  if (outboundContentType) {
+    headers["content-type"] = outboundContentType;
   }
 
   if (args.requestHeaders) Object.assign(headers, args.requestHeaders(args.props));

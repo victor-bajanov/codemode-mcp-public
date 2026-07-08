@@ -6,7 +6,7 @@ import { describe, it, expect } from "vitest";
 import { providerSurfaceReviewTests } from "@local/scaffold/testing";
 import { xeroProvider } from "../index";
 import { surfaceReview } from "../surface-review";
-import { inspectInvoiceDraft } from "../inspectors/drafts";
+import { inspectInvoiceDraft, inspectCreditNoteDraft } from "../inspectors/drafts";
 
 providerSurfaceReviewTests(xeroProvider);
 
@@ -38,5 +38,31 @@ describe("xero-specific surface-review entries", () => {
     expect(entry).toBeDefined();
     expect(entry?.decision).toBe("allow");
     expect(entry?.inspect).toBe(inspectInvoiceDraft);
+  });
+
+  it("credit-note create/update endpoints are wired to the credit-note draft inspector", () => {
+    for (const id of [
+      "xero.accounting.createCreditNotes",
+      "xero.accounting.updateOrCreateCreditNotes",
+      "xero.accounting.updateCreditNote",
+    ]) {
+      const entry = surfaceReview[id];
+      expect(entry, `expected ${id} in surface review`).toBeDefined();
+      expect(entry?.decision).toBe("allow");
+      expect(entry?.inspect, `${id} should use inspectCreditNoteDraft`).toBe(inspectCreditNoteDraft);
+    }
+  });
+
+  it("credit-note attachment uploads are bare standard_write allows (mirroring invoice attachments)", () => {
+    for (const id of [
+      "xero.accounting.createCreditNoteAttachmentByFileName",
+      "xero.accounting.updateCreditNoteAttachmentByFileName",
+    ]) {
+      const entry = surfaceReview[id];
+      expect(entry, `expected ${id} in surface review`).toBeDefined();
+      expect(entry?.decision).toBe("allow");
+      expect(entry?.category).toBe("standard_write");
+      expect(entry?.inspect).toBeUndefined();
+    }
   });
 });

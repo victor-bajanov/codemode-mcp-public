@@ -13,7 +13,7 @@ describe("inspectSendAsCreate", () => {
 
   it("denies when sendAsEmail is off the allowlist", () => {
     const result = inspectSendAsCreate({
-      body: { sendAsEmail: "someone@unrelated.com" },
+      body: { sendAsEmail: "eve@unrelated.com" },
     });
     expect(result).toMatchObject({
       decision: "deny",

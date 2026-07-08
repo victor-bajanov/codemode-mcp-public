@@ -1,7 +1,15 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import type { ApiProvider } from "./api-provider";
-import { assertSecrets, readStagingConfig, type ScaffoldSecrets } from "./config";
+import {
+  assertSecrets,
+  readOAuthClientTtlSeconds,
+  readOAuthRateLimitConfig,
+  readStagingConfig,
+  type ScaffoldSecrets,
+} from "./config";
 import { createOAuthHandler } from "./oauth-handler";
+import { enforceOAuthHardening } from "./oauth-hardening";
+import { runClientSweep, type ClientSweepKv } from "./oauth-client-sweep";
 import { createProviderMcpAgent, type ProviderEnv } from "./mcp-agent-factory";
 import { createTokenBrokerDO } from "./token-broker";
 import { handleUpload, handleFetch, runSweep } from "./staging/index.js";
@@ -77,8 +85,18 @@ export function setupProvider<
           config,
         });
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (oauth as any).fetch(request, env, ctx);
+      // Rate-limit + no-store hardening for the library-owned OAuth endpoints
+      // (POST /register, POST /token); all other paths pass straight through.
+      const rateLimitCfg = readOAuthRateLimitConfig(env as unknown as Record<string, unknown>);
+      const oauthKv = (env as unknown as { OAUTH_KV: KVNamespace }).OAUTH_KV;
+      return enforceOAuthHardening(
+        request,
+        oauthKv,
+        rateLimitCfg,
+        Date.now(),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (req) => (oauth as any).fetch(req, env, ctx),
+      );
     },
     async scheduled(
       _controller: ScheduledController,
@@ -89,6 +107,28 @@ export function setupProvider<
         STAGING_D1?: D1Database;
         STAGING_R2?: R2Bucket;
       } & Record<string, unknown>;
+      // OAuth inactive-client sweep — bounds unbounded `client:*` growth by
+      // reaping ungranted, aged dynamically-registered clients. Independent of
+      // staging, so it runs whenever OAUTH_KV is bound.
+      const oauthKv = (env as unknown as { OAUTH_KV?: KVNamespace }).OAUTH_KV;
+      if (oauthKv) {
+        const clientTtlSeconds = readOAuthClientTtlSeconds(
+          env as unknown as Record<string, unknown>,
+        );
+        ctx.waitUntil(
+          runClientSweep(oauthKv as unknown as ClientSweepKv, {
+            clientTtlSeconds,
+            nowMs: Date.now(),
+          })
+            .then((r) => {
+              console.log(`oauth-client-sweep ${JSON.stringify(r)}`);
+            })
+            .catch((err) => {
+              console.error(`oauth-client-sweep failed: ${String(err)}`);
+            }),
+        );
+      }
+
       if (!stagingEnv.STAGING_D1 || !stagingEnv.STAGING_R2) return;
       ctx.waitUntil(
         runSweep({

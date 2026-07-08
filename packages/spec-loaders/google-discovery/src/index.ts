@@ -2,6 +2,8 @@ export interface DiscoveryDoc {
   baseUrl: string;
   rootUrl?: string;
   servicePath?: string;
+  title?: string;
+  version?: string;
   schemas: Record<string, unknown>;
   resources?: Record<string, DiscoveryResource>;
   methods?: Record<string, DiscoveryMethod>;
@@ -33,7 +35,7 @@ export interface DiscoveryParam {
 
 export interface OpenApiSpec {
   openapi: "3.0.0";
-  info: { title: string; version: string };
+  info: { title: string; version: string; description?: string };
   servers: Array<{ url: string }>;
   paths: Record<string, Record<string, OpenApiOperation>>;
   components: { schemas: Record<string, unknown> };
@@ -66,7 +68,18 @@ function* walkMethods(
 }
 
 export function discoveryToOpenApi(doc: DiscoveryDoc): OpenApiSpec {
-  const baseUrl = doc.baseUrl.replace(/\/$/, "");
+  // Host-root-relative paths + host-only server, so multiple Google APIs can be
+  // merged under one apiBaseUrl (the shared www.googleapis.com origin) without
+  // tripping the request-handler's origin-invariance guard. The service-path
+  // portion of baseUrl (e.g. "/calendar/v3") is folded into each path.
+  //  - Gmail:    baseUrl https://gmail.googleapis.com/ → origin only, paths
+  //              already carry "gmail/v1/..." → "/gmail/v1/...".
+  //  - Calendar: baseUrl https://www.googleapis.com/calendar/v3/ → prefix
+  //              "/calendar/v3", method path "calendars/{calendarId}" →
+  //              "/calendar/v3/calendars/{calendarId}".
+  const baseUrlObj = new URL(doc.baseUrl);
+  const origin = baseUrlObj.origin;
+  const servicePrefix = baseUrlObj.pathname.replace(/\/+$/, "");
   const paths: OpenApiSpec["paths"] = {};
 
   const allMethods: DiscoveryMethod[] = [];
@@ -74,7 +87,7 @@ export function discoveryToOpenApi(doc: DiscoveryDoc): OpenApiSpec {
   for (const r of Object.values(doc.resources ?? {})) allMethods.push(...walkMethods(r));
 
   for (const m of allMethods) {
-    const path = "/" + m.path.replace(/^\//, "");
+    const path = servicePrefix + "/" + m.path.replace(/^\//, "");
     const method = m.httpMethod.toLowerCase();
     const op: OpenApiOperation = {
       operationId: m.id,
@@ -118,9 +131,64 @@ export function discoveryToOpenApi(doc: DiscoveryDoc): OpenApiSpec {
 
   return {
     openapi: "3.0.0",
-    info: { title: "Gmail (normalised from Discovery)", version: "v1" },
-    servers: [{ url: baseUrl }],
+    info: {
+      title: doc.title ?? "Google API (normalised from Discovery)",
+      version: doc.version ?? "v1",
+    },
+    servers: [{ url: origin }],
     paths,
     components: { schemas: doc.schemas as Record<string, unknown> },
+  };
+}
+
+/**
+ * Merge multiple normalised OpenAPI specs into one bundled spec. Used to expose
+ * several Google APIs (Gmail + Calendar) through a single provider definition.
+ *
+ * - `paths` are unioned. Path keys are host-root-relative and namespaced per API
+ *   (`/gmail/v1/...` vs `/calendar/v3/...`), so collisions are not expected; a
+ *   colliding path key throws.
+ * - `components.schemas` are unioned. A duplicate schema name throws, so future
+ *   discovery-doc drift cannot silently shadow a schema referenced by `$ref`.
+ *
+ * The merged `servers`/`info` are taken from `overrides` (the provider's
+ * apiBaseUrl is the runtime source of truth; servers here are cosmetic).
+ */
+export function mergeOpenApiSpecs(
+  specs: OpenApiSpec[],
+  overrides?: { title?: string; version?: string; description?: string; serverUrl?: string },
+): OpenApiSpec {
+  if (specs.length === 0) throw new Error("mergeOpenApiSpecs: no specs provided");
+
+  const paths: OpenApiSpec["paths"] = {};
+  const schemas: Record<string, unknown> = {};
+
+  for (const spec of specs) {
+    for (const [pathKey, methods] of Object.entries(spec.paths)) {
+      if (paths[pathKey]) {
+        throw new Error(`mergeOpenApiSpecs: duplicate path "${pathKey}"`);
+      }
+      paths[pathKey] = methods;
+    }
+    for (const [name, schema] of Object.entries(spec.components.schemas)) {
+      if (name in schemas) {
+        throw new Error(`mergeOpenApiSpecs: duplicate schema name "${name}"`);
+      }
+      schemas[name] = schema;
+    }
+  }
+
+  const description = overrides?.description ?? specs[0]!.info.description;
+
+  return {
+    openapi: "3.0.0",
+    info: {
+      title: overrides?.title ?? specs[0]!.info.title,
+      version: overrides?.version ?? specs[0]!.info.version,
+      ...(description ? { description } : {}),
+    },
+    servers: [{ url: overrides?.serverUrl ?? specs[0]!.servers[0]!.url }],
+    paths,
+    components: { schemas },
   };
 }

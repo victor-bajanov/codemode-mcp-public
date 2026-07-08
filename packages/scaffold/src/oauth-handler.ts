@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import type { ApiProvider, UpstreamTokenResponse } from "./api-provider";
+import { resolveEndpoints } from "./config";
 import { generateCodeVerifier, sha256Base64Url } from "./pkce";
 
 const STATE_KV_PREFIX = "auth-state:";
@@ -59,7 +60,8 @@ export function createOAuthHandler<
       }
     }
 
-    return Response.redirect(`${provider.oauth.authorizeUrl}?${params.toString()}`);
+    const { authorizeUrl } = resolveEndpoints(provider, c.env as Record<string, unknown>);
+    return Response.redirect(`${authorizeUrl}?${params.toString()}`);
   });
 
   app.get("/callback", async (c) => {
@@ -100,7 +102,8 @@ export function createOAuthHandler<
     });
     if (codeVerifier) tokenBody.set("code_verifier", codeVerifier);
 
-    const tokenRes = await fetch(provider.oauth.tokenUrl, {
+    const { tokenUrl, userInfoUrl } = resolveEndpoints(provider, c.env as Record<string, unknown>);
+    const tokenRes = await fetch(tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: tokenBody.toString(),
@@ -136,8 +139,8 @@ export function createOAuthHandler<
     }
 
     let userInfo: unknown = null;
-    if (provider.oauth.userInfoUrl) {
-      const userRes = await fetch(provider.oauth.userInfoUrl, {
+    if (userInfoUrl) {
+      const userRes = await fetch(userInfoUrl, {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
       });
       if (!userRes.ok) {
