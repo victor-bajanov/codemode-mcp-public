@@ -1,5 +1,4 @@
 import { McpAgent } from "agents/mcp";
-import { __DO_NOT_USE_WILL_BREAK__agentContext as agentContext } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RpcTarget } from "cloudflare:workers";
 import { z } from "zod";
@@ -7,14 +6,15 @@ import { z } from "zod";
 export interface Env {
   LOADER: WorkerLoader;
   MCP_OBJECT: DurableObjectNamespace;
-  WRAP: string;
 }
 
 /**
  * RpcTarget passed to the child Worker. The child invokes `runCallback()` via
- * Workers RPC; that call lands on the host as a fresh entrypoint invocation
- * with NO ancestor `agentContext.run(...)` frame, which is the heart of the
- * bug being reproduced.
+ * Workers RPC; that call lands on the host as a fresh entrypoint invocation.
+ * Pre-agents#1734 the ALS frame was severed here and elicitInput would throw
+ * "Agent was not found in send". agents#1734 fixes this by having the transport
+ * retain its owning McpAgent directly, so no agentContext.run(...) re-entry is
+ * needed.
  */
 class HostCallbackBridge extends RpcTarget {
   #cb: () => Promise<unknown>;
@@ -29,8 +29,9 @@ class HostCallbackBridge extends RpcTarget {
 
 // Child Worker source — evaluated inside an isolated isolate via env.LOADER.
 // It receives the bridge as the first arg to `run()` and immediately invokes
-// `bridge.runCallback()` over Workers RPC. That RPC call is what severs the
-// AsyncLocalStorage chain on the host side.
+// `bridge.runCallback()` over Workers RPC. The host-bound RPC arrives as a
+// fresh entrypoint; agents#1734 ensures the transport still resolves the
+// McpAgent without relying on an ALS frame at that entry point.
 const CHILD_MODULE_SOURCE = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 export default class Child extends WorkerEntrypoint {
@@ -45,30 +46,27 @@ export class ReproMCP extends McpAgent<Env, Record<string, never>, Record<string
 
   async init(): Promise<void> {
     const agent = this;
-    const wrap = this.env.WRAP === "1";
 
     this.server.registerTool(
       "repro_elicit",
       {
         description:
-          "Loads a child Worker and invokes a host-side callback from inside. " +
-          "The callback calls server.elicitInput. With WRAP=1 the host wraps the " +
-          "callback in agentContext.run(...) and the elicit succeeds; with WRAP unset " +
-          "the elicit throws 'Agent was not found in send'.",
+          "Regression guard for agents#1734. Loads a child Worker and invokes a " +
+          "host-side callback from inside. The callback calls server.elicitInput. " +
+          "With agents@0.17.1+ the transport retains its owning McpAgent so the " +
+          "elicit succeeds WITHOUT any agentContext.run wrap.",
         inputSchema: { message: z.string().optional() },
       },
       async ({ message }) => {
-        const promptText = message ?? "Please confirm to continue (repro)";
+        const promptText = message ?? "Please confirm to continue (regression guard)";
 
-        const alsBefore = agentContext.getStore() ? "set" : "unset";
-        console.log(`BEFORE-LOADER ALS=${alsBefore}`);
+        console.log(`BEFORE-LOADER: entering tool body`);
 
         // Body of the host-side callback. This is what the child triggers via RPC.
-        const rawBody = async (): Promise<unknown> => {
-          const alsInside = agentContext.getStore() ? "set" : "unset";
-          console.log(`INSIDE-CALLBACK ALS=${alsInside}`);
-          // server-initiated MCP request — fails when ALS is empty because
-          // StreamableHTTPServerTransport.send reads `agent` from agentContext.
+        // agents#1734: the transport now retains its owning McpAgent, so this
+        // succeeds without an explicit agentContext.run(...) re-entry wrap.
+        const callback = async (): Promise<unknown> => {
+          console.log(`INSIDE-CALLBACK: invoking elicitInput (no wrap)`);
           const result = await agent.server.server.elicitInput({
             message: promptText,
             requestedSchema: {
@@ -81,17 +79,6 @@ export class ReproMCP extends McpAgent<Env, Record<string, never>, Record<string
           });
           return result;
         };
-
-        // Optional wrap (the fix). The store contents are HOST-SIDE references
-        // only — no child-supplied data — matching the trust invariant from
-        // packages/scaffold/src/mcp-agent-factory.ts.
-        const callback = wrap
-          ? () =>
-              agentContext.run(
-                { agent, connection: undefined, request: undefined, email: undefined },
-                () => rawBody(),
-              )
-          : () => rawBody();
 
         const bridge = new HostCallbackBridge(callback);
 
@@ -109,7 +96,8 @@ export class ReproMCP extends McpAgent<Env, Record<string, never>, Record<string
 
         try {
           // The child invokes the bridge — which triggers a host-bound RPC call
-          // on a fresh entrypoint with no ancestor ALS frame.
+          // on a fresh entrypoint. With agents#1734 this no longer requires an
+          // ALS re-entry wrap on the host side.
           const result = await (stub.getEntrypoint() as unknown as {
             run: (b: HostCallbackBridge) => Promise<unknown>;
           }).run(bridge);

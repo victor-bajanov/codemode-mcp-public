@@ -9,12 +9,14 @@
  * dispatches through `executor.execute(codeBlob, { dispatcher })`. The code blob
  * runs inside a Worker-Loader child isolate; it calls back into the host via
  * `dispatcher.call({ operationName, params })`. Mirrors the exact RPC severance
- * pattern that breaks `agentContext` ALS in production.
+ * pattern where agentContext ALS is lost on the host-side callback.
  *
- * The host wrap (`request: (ctx) => agentContext.run(..., () => onRequest(ctx, server))`)
- * is the fix — same as `mcp-agent-factory.ts`.
+ * As of codemode 0.3.8, openApiMcpServer defaults to the Workers-safe
+ * CfWorkerJsonSchemaValidator. This analog mirrors that default so the accept
+ * path validates without codegen.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { RpcTarget } from "cloudflare:workers";
 import { z } from "zod";
 
@@ -67,6 +69,11 @@ export interface ScaffoldMiniArgs {
 
 export function scaffoldMini({ spec, executor, request }: ScaffoldMiniArgs): McpServer {
   const server = new McpServer({ name: "elicit-als-codemode-pattern", version: "0.0.1" });
+  // Mirror codemode 0.3.8: openApiMcpServer now defaults to the Workers-safe
+  // CfWorkerJsonSchemaValidator (no codegen). Apply the same default here so
+  // the accept path validates without "Code generation from strings disallowed".
+  (server.server as unknown as { _jsonSchemaValidator: unknown })._jsonSchemaValidator =
+    new CfWorkerJsonSchemaValidator();
 
   for (const op of spec.operations) {
     server.registerTool(

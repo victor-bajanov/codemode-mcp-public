@@ -12,7 +12,7 @@
 
 export const OUTBOUND_RECIPIENT_ALLOWLIST: readonly string[] = [
   "*@example.com",
-  "someone@gmail.com",
+  "adam@gmail.com",
 ] as const;
 
 /**

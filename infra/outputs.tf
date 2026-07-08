@@ -28,6 +28,9 @@ output "xero_access_application_id" {
   description = "Access application ID for the xero Worker."
 }
 
+
+
+
 output "gmail_dev_oauth_kv_id" {
   value       = module.gmail_dev.oauth_kv_id
   description = "Paste into apps/gmail/wrangler.jsonc env.dev.kv_namespaces[0].id."
@@ -57,3 +60,6 @@ output "xero_dev_access_application_id" {
   value       = module.xero_dev.access_application_id
   description = "Access application ID for the xero-dev Worker."
 }
+
+
+

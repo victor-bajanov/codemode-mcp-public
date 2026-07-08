@@ -1,51 +1,36 @@
 import { McpAgent } from "agents/mcp";
-import { __DO_NOT_USE_WILL_BREAK__agentContext as agentContext } from "agents";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { scaffoldMini, makeLoaderExecutor, type MiniSpec } from "./scaffold-mini";
 import { onRequest } from "./elicit-gate";
 
 export interface Env {
   LOADER: WorkerLoader;
   MCP_OBJECT: DurableObjectNamespace;
-  WRAP: string;
-  VALIDATOR: string;
 }
 
 /**
- * Realistic repro — mirrors the production `openApiMcpServer({ executor, request })`
+ * Regression guard — mirrors the production `openApiMcpServer({ executor, request })`
  * shape from `packages/scaffold/src/mcp-agent-factory.ts`.
  *
- * Two independent toggles, both off by default:
- *   WRAP=1                 — apply the agentContext.run wrap (ALS fix)
- *   VALIDATOR=cfworker     — swap the SDK's default AjvJsonSchemaValidator
- *                            for CfWorkerJsonSchemaValidator (AJV-codegen fix)
+ * Asserts the two upstream fixes hold:
+ *   - agents#1734: transport retains its owning McpAgent, so server-initiated
+ *     elicit works from a Worker-Loader child callback WITHOUT an agentContext.run
+ *     re-entry (no "Agent was not found in send" error).
+ *   - codemode 0.3.8: openApiMcpServer defaults to the MCP SDK's Workers-safe
+ *     CfWorkerJsonSchemaValidator, so the accept path validates WITHOUT a manual
+ *     _jsonSchemaValidator swap (no "Code generation from strings disallowed" error).
  *
- * Combined with verify.mjs's TRIGGER_VALIDATION flag (which controls whether
- * the mock MCP client returns content), the harness exercises:
- *   WRAP=0                                              -> ALS bug
- *   WRAP=1, TRIGGER_VALIDATION=0                        -> happy decline path
- *   WRAP=1, TRIGGER_VALIDATION=1                        -> AJV bug
- *   WRAP=1, TRIGGER_VALIDATION=1, VALIDATOR=cfworker    -> happy accept path
+ * Two scenarios (controlled by verify.mjs's TRIGGER_VALIDATION flag):
+ *   node verify.mjs                  -> delete_thing, decline path (no content to validate)
+ *   TRIGGER_VALIDATION=1 node verify.mjs -> delete_thing, accept path (content validated)
  *
- * INVARIANT: agentContext store contents are HOST-SIDE references only.
- * Never include child-supplied (RPC-arg-derived) values here.
+ * Both must pass (tool-success, no ALS error, no AJV error) — any failure is a regression.
  */
 export class ReproMCP extends McpAgent<Env, Record<string, never>, Record<string, never>> {
   // Placeholder — replaced in init() with the scaffolded server.
   server: McpServer = new McpServer({ name: "elicit-als-codemode-pattern-placeholder", version: "0.0.1" });
 
   async init(): Promise<void> {
-    const agent = this;
-    const wrap =
-      this.env.WRAP === "1"
-        ? (cb: () => Promise<unknown>) =>
-            agentContext.run(
-              { agent, connection: undefined, request: undefined, email: undefined },
-              cb,
-            )
-        : (cb: () => Promise<unknown>) => cb();
-
     const spec: MiniSpec = {
       operations: [
         { name: "delete_thing", destructive: true, description: "Delete a thing (destructive)." },
@@ -55,23 +40,18 @@ export class ReproMCP extends McpAgent<Env, Record<string, never>, Record<string
 
     const executor = makeLoaderExecutor(this.env.LOADER);
 
+    // No agentContext.run wrap — agents#1734 means the transport retains its
+    // owning McpAgent so server-initiated elicit works without ALS re-entry.
+    // No _jsonSchemaValidator swap — codemode 0.3.8 defaults to the Workers-safe
+    // CfWorkerJsonSchemaValidator so the accept path validates without codegen.
     this.server = scaffoldMini({
       spec,
       executor,
       request: (ctx) => {
-        const alsBefore = agentContext.getStore() ? "set" : "unset";
-        console.log(`BEFORE-LOADER op=${ctx.operationName} ALS=${alsBefore}`);
-        return wrap(() => onRequest(ctx, agent.server));
+        console.log(`BEFORE-LOADER op=${ctx.operationName}`);
+        return onRequest(ctx, this.server);
       },
     });
-
-    // Optional AJV-vs-Workers workaround. Unconditional in production
-    // (packages/scaffold/src/mcp-agent-factory.ts); conditional here so the
-    // harness can demonstrate both modes.
-    if (this.env.VALIDATOR === "cfworker") {
-      (this.server.server as unknown as { _jsonSchemaValidator: unknown })._jsonSchemaValidator =
-        new CfWorkerJsonSchemaValidator();
-    }
   }
 }
 

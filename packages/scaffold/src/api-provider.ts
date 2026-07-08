@@ -95,6 +95,18 @@ export interface ApiProvider<
    *  an upstream operationId allowed by `surfaceReview`. */
   attachmentHint?: string;
 
+  /** Provider-owned prose appended to the `execute` tool description,
+   *  immediately after codemode's generic base example and BEFORE the
+   *  harness's staging / body-modes blocks. Use this for high-signal workflow
+   *  guidance the agent should anchor on at tool-pick time (e.g. multi-op
+   *  flow ordering, plan-hash semantics, surface-review state machine).
+   *
+   *  Distinct from `attachmentHint`, which is staging-specific Step-3 content
+   *  spliced into both the execute and register_file_handle descriptions.
+   *  Leave unset if the provider has no general guidance — there is no
+   *  auto-fallback. */
+  executeHint?: string | undefined;
+
   /** Optional accessors that pull audit-log identifiers out of the request props.
    *  - principalId: the authenticated subject (OAuth sub).
    *  - context: provider-specific identifier blob (e.g. { tenantId } for Xero). */
@@ -102,4 +114,19 @@ export interface ApiProvider<
     principalIdAccessor?: (props: Props) => string | undefined;
     contextAccessor?: (props: Props) => Record<string, string> | undefined;
   };
+}
+
+/** Convenience: return `spec.info.description` as the executeHint value (or
+ *  undefined if absent / whitespace-only). Use when the provider's upstream
+ *  OpenAPI spec is the canonical home for the agent-facing prose —
+ *  re-vendoring the spec then updates the hint without touching provider
+ *  code.
+ *
+ *  Other patterns (inline string literal, computed from multiple sources)
+ *  remain valid; this helper just documents the "spec is source of truth"
+ *  pattern as a first-class option. */
+export function hintFromSpecInfo(
+  spec: { info?: { description?: string } },
+): string | undefined {
+  return spec.info?.description?.trim() || undefined;
 }

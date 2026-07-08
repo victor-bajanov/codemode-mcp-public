@@ -185,10 +185,13 @@ export interface RunElicitationArgs {
   reason?: string;
   inspectorSummary?: Record<string, Primitive>;
   entry: SurfaceReviewEntry;
+  /** Forwarded from HandleArgs; passed to elicitInput as relatedRequestId so
+   *  the server-initiated elicit routes through the originating POST stream. */
+  relatedRequestId?: string | number;
   elicitRenderers?: Partial<Record<string, ElicitRenderer>>;
   server: ServerLike & {
     server?: {
-      elicitInput?: (params: unknown) => Promise<unknown>;
+      elicitInput?: (params: unknown, options?: { relatedRequestId?: string | number }) => Promise<unknown>;
     };
   };
   emitAudit: (entry: {
@@ -291,7 +294,10 @@ export async function runElicitation(args: RunElicitationArgs): Promise<void> {
   let result: unknown;
   try {
     result = await raceTimeout(
-      elicitSrv.elicitInput({ message: rendered.message, requestedSchema }),
+      elicitSrv.elicitInput(
+        { message: rendered.message, requestedSchema },
+        args.relatedRequestId !== undefined ? { relatedRequestId: args.relatedRequestId } : undefined,
+      ),
       args.elicitTimeoutMs ?? DEFAULT_ELICIT_TIMEOUT_MS,
     );
   } catch (e) {

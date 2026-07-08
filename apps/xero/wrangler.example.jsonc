@@ -34,7 +34,12 @@
     "STAGING_UPLOAD_TTL_SECONDS": "300",
     "STAGING_FETCH_TTL_SECONDS": "3600",
     "STAGING_MAX_BYTES": "52428800",
-    "STAGING_UPLOAD_ORIGIN": "https://xero.bonhomme.workers.dev"
+    "STAGING_UPLOAD_ORIGIN": "https://xero.bonhomme.workers.dev",
+    "OAUTH_REGISTER_RATE_LIMIT": "1",
+    "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+    "OAUTH_TOKEN_RATE_LIMIT": "20",
+    "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+    "OAUTH_CLIENT_TTL_SECONDS": "2592000"
   },
   "observability": {
     "enabled": true,
@@ -73,7 +78,12 @@
         "STAGING_UPLOAD_TTL_SECONDS": "300",
         "STAGING_FETCH_TTL_SECONDS": "3600",
         "STAGING_MAX_BYTES": "52428800",
-        "STAGING_UPLOAD_ORIGIN": "https://xero-dev.bonhomme.workers.dev"
+        "STAGING_UPLOAD_ORIGIN": "https://xero-dev.bonhomme.workers.dev",
+        "OAUTH_REGISTER_RATE_LIMIT": "1",
+        "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+        "OAUTH_TOKEN_RATE_LIMIT": "20",
+        "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+        "OAUTH_CLIENT_TTL_SECONDS": "2592000"
       }
     }
   }

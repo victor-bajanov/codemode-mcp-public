@@ -1,25 +1,23 @@
 #!/usr/bin/env node
-// Spawns `wrangler dev`, connects an MCP client that advertises elicitation
-// capability, calls `delete_thing` (the destructive op routed through the
-// scaffold-mini dispatcher), and prints what happened.
+// Regression guard: spawns `wrangler dev`, connects an MCP client that
+// advertises elicitation capability, calls `delete_thing`, and asserts the
+// fixed behavior holds.
 //
-// Three independent toggles:
-//   WRAP=1                 -> apply the agentContext.run wrap (ALS fix)
-//   VALIDATOR=cfworker     -> swap the SDK's default AjvJsonSchemaValidator
-//                             for CfWorkerJsonSchemaValidator
+// One toggle:
 //   TRIGGER_VALIDATION=1   -> mock client returns {action:"accept", content:...}
 //                             so the SDK runs response-schema validation
 //                             (otherwise returns {action:"decline"} and
 //                             validation is skipped per SDK precondition
 //                             `result.action === 'accept' && result.content`)
 //
-// Toggle matrix and expected outcomes:
-//   WRAP=0                                              -> ALS bug
-//   WRAP=1, TRIGGER_VALIDATION=0                        -> happy decline path
-//   WRAP=1, TRIGGER_VALIDATION=1                        -> AJV bug
-//   WRAP=1, TRIGGER_VALIDATION=1, VALIDATOR=cfworker    -> happy accept path
+// Both scenarios must pass (tool-success, no ALS error, no AJV error):
+//   node verify.mjs                       -> decline path (agents#1734 guard)
+//   TRIGGER_VALIDATION=1 node verify.mjs  -> accept path (agents#1734 + codemode 0.3.8 guard)
 //
-// Exit code is 0 if the observed behavior matches the toggles, 1 otherwise.
+// A failure (tool-error, "Agent was not found in send", or
+// "Code generation from strings disallowed") indicates a regression.
+//
+// Exit code is 0 if the observed behavior matches expectation, 1 otherwise.
 
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -27,19 +25,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const WRAP = process.env.WRAP === "1";
 const TRIGGER_VALIDATION = process.env.TRIGGER_VALIDATION === "1";
-const VALIDATOR = process.env.VALIDATOR ?? "";
 const READY_TIMEOUT_MS = 60_000;
 const CALL_TIMEOUT_MS = 30_000;
 
 function startWrangler() {
-  // Pass toggles via --var so the deployed Worker sees them.
-  const args = [
-    "dev", "--port", "0",
-    "--var", `WRAP:${WRAP ? "1" : ""}`,
-    "--var", `VALIDATOR:${VALIDATOR}`,
-  ];
+  const args = ["dev", "--port", "0"];
   const child = spawn("npx", ["--yes", "wrangler", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, FORCE_COLOR: "0" },
@@ -111,11 +102,10 @@ async function main() {
     );
 
     // Mock elicit handler. Behavior depends on TRIGGER_VALIDATION:
-    //   off -> {action: "decline"}                  (no content; SDK skips validation)
-    //   on  -> {action: "accept", content: {...}}   (SDK compiles validator -> AJV throws under Workers)
-    // The schema in elicit-gate.ts is: confirm: enum["yes","no"]. Content value
-    // is irrelevant for triggering AJV codegen — even a mismatched value
-    // makes it past the validator-compile phase to the validator-run phase.
+    //   off -> {action: "decline"}                 (no content; SDK skips validation)
+    //   on  -> {action: "accept", content: {...}}  (SDK runs response-schema validation)
+    // With the codemode 0.3.8 default validator, the accept path must succeed
+    // without a manual _jsonSchemaValidator swap.
     client.setRequestHandler(ElicitRequestSchema, async (req) => {
       console.error(`[verify] elicit request received: ${JSON.stringify(req.params)}`);
       if (TRIGGER_VALIDATION) {
@@ -165,15 +155,13 @@ async function main() {
   const stdoutTail = wrangleLogs.stdout.slice(-4000);
 
   console.log("\n=== VERIFY SUMMARY ===");
-  console.log(`WRAP=${WRAP ? "1" : ""}`);
   console.log(`TRIGGER_VALIDATION=${TRIGGER_VALIDATION ? "1" : ""}`);
-  console.log(`VALIDATOR=${VALIDATOR}`);
   console.log(`observed=${observed}`);
   console.log(`detail=${observedDetail}`);
   console.log(`\n--- wrangler stdout (tail) ---\n${stdoutTail}`);
   console.log(`\n--- wrangler stderr (tail) ---\n${stderrTail}`);
 
-  // Failure markers
+  // Regression markers — either of these appearing is a FAIL.
   const sawAlsError =
     observedDetail.includes("Agent was not found in send") ||
     stderrTail.includes("Agent was not found in send") ||
@@ -183,20 +171,14 @@ async function main() {
     stderrTail.includes("Code generation from strings disallowed") ||
     stdoutTail.includes("Code generation from strings disallowed");
 
-  // Pass criteria depend on the toggle combination.
+  // Pass criteria: fixed behavior must hold in both scenarios.
   let pass = false;
   let expectation = "";
-  if (!WRAP) {
-    expectation = "ALS error";
-    pass = sawAlsError;
-  } else if (!TRIGGER_VALIDATION) {
-    expectation = "tool-success (decline)";
-    pass = observed === "tool-success" && !sawAlsError && !sawAjvError;
-  } else if (VALIDATOR !== "cfworker") {
-    expectation = "AJV codegen error";
-    pass = sawAjvError && !sawAlsError;
+  if (!TRIGGER_VALIDATION) {
+    expectation = "tool-success (decline), no ALS error even without the wrap";
+    pass = observed === "tool-success" && !sawAlsError;
   } else {
-    expectation = "tool-success (accept)";
+    expectation = "tool-success (accept), no ALS error and no AJV error without manual validator swap";
     pass = observed === "tool-success" && !sawAlsError && !sawAjvError;
   }
 

@@ -1,0 +1,82 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gmail",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "r2_buckets": [
+    { "binding": "STAGING_R2", "bucket_name": "gmail-staging" }
+  ],
+  "d1_databases": [
+    { "binding": "STAGING_D1", "database_name": "gmail-staging", "database_id": "910750df-df52-4e9a-b504-22b2aae1d71d", "migrations_dir": "../../packages/scaffold/src/staging/migrations" }
+  ],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "GmailMCP", "name": "MCP_OBJECT" },
+      { "class_name": "GmailTokenBroker", "name": "TOKEN_BROKER" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GmailMCP"] },
+    { "tag": "v2", "new_sqlite_classes": ["GmailTokenBroker"] }
+  ],
+  "vars": {
+    "GMAIL_API_BASE": "https://gmail.googleapis.com",
+    "DEPLOYMENT_NAME": "gmail",
+    "ALLOW_PII_IN_LOGS": "false",
+    "DEBUG_ELICIT": "false",
+    "STAGING_UPLOAD_TTL_SECONDS": "300",
+    "STAGING_FETCH_TTL_SECONDS": "3600",
+    "STAGING_MAX_BYTES": "52428800",
+    "STAGING_UPLOAD_ORIGIN": "https://gmail.bonhomme.workers.dev"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "env": {
+    "dev": {
+      "name": "gmail-dev",
+      "kv_namespaces": [
+        { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+      ],
+      "r2_buckets": [
+        { "binding": "STAGING_R2", "bucket_name": "gmail-dev-staging" }
+      ],
+      "d1_databases": [
+        { "binding": "STAGING_D1", "database_name": "gmail-dev-staging", "database_id": "816a9414-d8b1-4dfd-9b49-23929b9d46e6", "migrations_dir": "../../packages/scaffold/src/staging/migrations" }
+      ],
+      "triggers": { "crons": ["*/5 * * * *"] },
+      "worker_loaders": [
+        { "binding": "LOADER" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "GmailMCP", "name": "MCP_OBJECT" },
+          { "class_name": "GmailTokenBroker", "name": "TOKEN_BROKER" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["GmailMCP"] },
+        { "tag": "v2", "new_sqlite_classes": ["GmailTokenBroker"] }
+      ],
+      "vars": {
+        "GMAIL_API_BASE": "https://gmail.googleapis.com",
+        "DEPLOYMENT_NAME": "gmail-dev",
+        "ALLOW_PII_IN_LOGS": "false",
+        "DEBUG_ELICIT": "false",
+        "STAGING_UPLOAD_TTL_SECONDS": "300",
+        "STAGING_FETCH_TTL_SECONDS": "3600",
+        "STAGING_MAX_BYTES": "52428800",
+        "STAGING_UPLOAD_ORIGIN": "https://gmail-dev.bonhomme.workers.dev"
+      }
+    }
+  }
+}

@@ -35,4 +35,14 @@ describe("deepFreeze", () => {
     expect(() => deepFreeze(a)).not.toThrow();
     expect(Object.isFrozen(a)).toBe(true);
   });
+
+  it("does not throw on non-empty typed-array values; still freezes the outer object", () => {
+    const input = { a: new Uint8Array([1, 2, 3]) };
+    let output: typeof input;
+    expect(() => { output = deepFreeze(input); }).not.toThrow();
+    expect(Object.isFrozen(output!)).toBe(true);
+    // The typed array is left unfrozen (Object.freeze is impossible on it) but intact.
+    expect(Object.isFrozen(output!.a)).toBe(false);
+    expect(Array.from(output!.a)).toEqual([1, 2, 3]);
+  });
 });

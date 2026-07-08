@@ -1,0 +1,80 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xero",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "r2_buckets": [
+    { "binding": "STAGING_R2", "bucket_name": "xero-staging" }
+  ],
+  "d1_databases": [
+    { "binding": "STAGING_D1", "database_name": "xero-staging", "database_id": "ed349605-8ed5-4d43-a37c-251b3b54c4df", "migrations_dir": "../../packages/scaffold/src/staging/migrations" }
+  ],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "XeroMCP", "name": "MCP_OBJECT" },
+      { "class_name": "XeroTokenBroker", "name": "TOKEN_BROKER" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["XeroMCP"] },
+    { "tag": "v2", "new_sqlite_classes": ["XeroTokenBroker"] }
+  ],
+  "vars": {
+    "DEPLOYMENT_NAME": "xero",
+    "ALLOW_PII_IN_LOGS": "false",
+    "DEBUG_ELICIT": "false",
+    "STAGING_UPLOAD_TTL_SECONDS": "300",
+    "STAGING_FETCH_TTL_SECONDS": "3600",
+    "STAGING_MAX_BYTES": "52428800",
+    "STAGING_UPLOAD_ORIGIN": "https://xero.bonhomme.workers.dev"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "env": {
+    "dev": {
+      "name": "xero-dev",
+      "kv_namespaces": [
+        { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+      ],
+      "r2_buckets": [
+        { "binding": "STAGING_R2", "bucket_name": "xero-dev-staging" }
+      ],
+      "d1_databases": [
+        { "binding": "STAGING_D1", "database_name": "xero-dev-staging", "database_id": "717dd8d4-1dfd-45e6-8e80-386312560a77", "migrations_dir": "../../packages/scaffold/src/staging/migrations" }
+      ],
+      "triggers": { "crons": ["*/5 * * * *"] },
+      "worker_loaders": [
+        { "binding": "LOADER" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "XeroMCP", "name": "MCP_OBJECT" },
+          { "class_name": "XeroTokenBroker", "name": "TOKEN_BROKER" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["XeroMCP"] },
+        { "tag": "v2", "new_sqlite_classes": ["XeroTokenBroker"] }
+      ],
+      "vars": {
+        "DEPLOYMENT_NAME": "xero-dev",
+        "ALLOW_PII_IN_LOGS": "false",
+        "DEBUG_ELICIT": "false",
+        "STAGING_UPLOAD_TTL_SECONDS": "300",
+        "STAGING_FETCH_TTL_SECONDS": "3600",
+        "STAGING_MAX_BYTES": "52428800",
+        "STAGING_UPLOAD_ORIGIN": "https://xero-dev.bonhomme.workers.dev"
+      }
+    }
+  }
+}

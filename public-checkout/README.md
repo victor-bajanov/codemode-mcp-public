@@ -1,7 +1,7 @@
 # codemode-mcp
 
-Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail,
-Xero, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
+Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail +
+Google Calendar, Xero, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
 **Code Mode** pattern: each provider ships a `search` / `execute` pair and
 the client writes JavaScript that runs in a sandboxed sub-Worker, instead
 of issuing one MCP tool call per API operation.
@@ -23,11 +23,24 @@ repo wraps them into a turn-key, single-operator **provider scaffold**:
   in via a spec bump.
 - **Spec loaders** for the quirks of major SaaS APIs (Google Discovery →
   OpenAPI, multi-spec merging for Xero).
+- **Encrypted attachment staging** — opt-in R2 + D1 bindings give the
+  sandbox a `__stagingHost.{getFile, putFile, stageFromUpstreamJson}`
+  capability so LLM code can pass multi-MB binaries (Gmail attachments,
+  Xero documents) by reference instead of base64-inlining them into the
+  context. Bytes are HKDF/AES-GCM encrypted at rest in R2; a cron sweep
+  expires both rows and objects. See
+  [`packages/scaffold/src/staging/`](./packages/scaffold/src/staging/).
+- **Shared TokenBroker Durable Object** — refresh-token rotation runs in
+  a single-writer DO addressed by `userId`, so concurrent tool calls
+  can't race on a rotated refresh token. KV stores the slot; the DO is
+  the only writer.
 - **OpenTofu module** for the per-app infra — one KV namespace plus a
   Cloudflare Access policy gating the MCP endpoint to a single operator.
   One `tofu apply` per provider.
-- **Reference Gmail and Xero deployments** with vetted surface reviews to
-  copy from.
+- **Reference Gmail (+ Calendar) and Xero deployments** with vetted
+  surface reviews to copy from. The Gmail provider bundles the Gmail and
+  Google Calendar APIs in one Worker — same Google identity, OAuth client,
+  and consent screen — reached over the shared `www.googleapis.com` origin.
 
 The whole stack is designed for personal/operator-of-one use: OAuth tokens
 live in a per-app KV namespace and the MCP endpoint is fronted by
@@ -157,11 +170,13 @@ Note the outputs — you need `*_oauth_kv_id` for the next step.
      (Web application).
    - Authorized redirect URI:
      `https://gmail.<your-subdomain>.workers.dev/callback`
-   - Enable the Gmail API on the same project.
+   - Enable both the **Gmail API** and the **Google Calendar API** on the
+     same project (the provider exposes both).
    - OAuth consent screen: add yourself as a Test user (External, Testing
      mode is fine for a single-operator deployment).
    - Scopes used by the provider live in
-     `packages/providers/gmail/src/index.ts → gmailProvider.oauth.scopes`.
+     `packages/providers/gmail/src/index.ts → gmailProvider.oauth.scopes`
+     (full Gmail mail scope + least-privilege Calendar scopes).
 
 3. **Set Worker secrets**:
 
@@ -306,8 +321,17 @@ Access policy by hitting the deployed `/authorize` URL.
 - **Surface review**: each provider exports a `surfaceReview` allow-list
   classifying every `operationId` as `allow` / `elicit` / `deny`. New ops
   added by a spec re-sync are implicit-deny until classified.
-- **Refresh-token rotation**: handled in `packages/scaffold/src/refresh.ts`.
-  Xero rotates on every use (60-day idle expiry); Google's are long-lived.
+- **Refresh-token rotation**: minted inside a per-`userId` TokenBroker
+  Durable Object (`packages/scaffold/src/token-broker.ts`) which serialises
+  refresh + slot persistence; the underlying rotation logic lives in
+  `packages/scaffold/src/refresh.ts`. Xero rotates on every use (60-day
+  idle expiry); Google's are long-lived.
+- **Attachment staging** (optional): provider apps that bind R2 + D1 +
+  `STAGING_*` vars expose a `register_file_handle` MCP tool, a
+  `POST /staging/upload` + `GET /staging/fetch/<handle>` HTTP surface, and
+  the `__stagingHost` sandbox capability. Tokens are AEAD-bound to the
+  handle; expired rows are swept by the cron trigger. Apps without
+  staging bindings simply don't expose any of this.
 
 ## Adding a new provider
 

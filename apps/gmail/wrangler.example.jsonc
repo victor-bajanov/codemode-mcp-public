@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-03-10",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "gmail-codemode-mcp.example.com", "custom_domain": true }
+  ],
   "kv_namespaces": [
     { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
   ],
@@ -28,14 +32,19 @@
     { "tag": "v2", "new_sqlite_classes": ["GmailTokenBroker"] }
   ],
   "vars": {
-    "GMAIL_API_BASE": "https://gmail.googleapis.com",
+    "GMAIL_API_BASE": "https://www.googleapis.com",
     "DEPLOYMENT_NAME": "gmail",
     "ALLOW_PII_IN_LOGS": "false",
     "DEBUG_ELICIT": "false",
     "STAGING_UPLOAD_TTL_SECONDS": "300",
     "STAGING_FETCH_TTL_SECONDS": "3600",
     "STAGING_MAX_BYTES": "52428800",
-    "STAGING_UPLOAD_ORIGIN": "https://gmail.bonhomme.workers.dev"
+    "STAGING_UPLOAD_ORIGIN": "https://gmail.bonhomme.workers.dev",
+    "OAUTH_REGISTER_RATE_LIMIT": "1",
+    "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+    "OAUTH_TOKEN_RATE_LIMIT": "20",
+    "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+    "OAUTH_CLIENT_TTL_SECONDS": "2592000"
   },
   "observability": {
     "enabled": true,
@@ -44,6 +53,9 @@
   "env": {
     "dev": {
       "name": "gmail-dev",
+      // Block inheritance of the top-level prod custom-domain route —
+      // custom domains are exclusive, so an inheriting dev deploy steals it.
+      "routes": [],
       "kv_namespaces": [
         { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
       ],
@@ -68,14 +80,19 @@
         { "tag": "v2", "new_sqlite_classes": ["GmailTokenBroker"] }
       ],
       "vars": {
-        "GMAIL_API_BASE": "https://gmail.googleapis.com",
+        "GMAIL_API_BASE": "https://www.googleapis.com",
         "DEPLOYMENT_NAME": "gmail-dev",
         "ALLOW_PII_IN_LOGS": "false",
         "DEBUG_ELICIT": "false",
         "STAGING_UPLOAD_TTL_SECONDS": "300",
         "STAGING_FETCH_TTL_SECONDS": "3600",
         "STAGING_MAX_BYTES": "52428800",
-        "STAGING_UPLOAD_ORIGIN": "https://gmail-dev.bonhomme.workers.dev"
+        "STAGING_UPLOAD_ORIGIN": "https://gmail-dev.bonhomme.workers.dev",
+        "OAUTH_REGISTER_RATE_LIMIT": "1",
+        "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+        "OAUTH_TOKEN_RATE_LIMIT": "20",
+        "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+        "OAUTH_CLIENT_TTL_SECONDS": "2592000"
       }
     }
   }

@@ -78,43 +78,48 @@ scripts.
 
 ## Step 5 — Authenticate Wrangler
 
-Two options:
+Wrangler reads `CLOUDFLARE_API_TOKEN` from the environment, so the scoped
+token you'll mint in Step 6 (via `infra/create-api-token.sh`) covers both
+`tofu apply` and `wrangler deploy` / `wrangler secret put` — one token, one
+1Password item.
 
-**A. Interactive (recommended for first deploy).**
-
-```
-cd apps/gmail
-npx wrangler login
-```
-
-This opens a browser, you grant the local CLI a token tied to your account.
-Wrangler stashes it in `~/.config/.wrangler/`.
-
-**B. API token (CI / non-interactive).**
-
-Dashboard → **My Profile → API Tokens → Create Token →** "Edit Cloudflare
-Workers" template. Export it as `CLOUDFLARE_API_TOKEN` in your shell.
-
-Wrangler will use the token if present and skip the browser dance.
+For the very first deploy you can do `npx wrangler login` interactively
+(opens a browser, stashes a token in `~/.config/.wrangler/`); for everyday
+flows the repo's deploy scripts (`pnpm run deploy:*`) and the
+`scripts/bootstrap-*.sh` wrappers expect `op run --env-file=infra/.env --`
+to inject `CLOUDFLARE_API_TOKEN`.
 
 ## Step 6 — Authenticate OpenTofu
 
-The `infra/` stack uses Cloudflare's **Global API Key** (not a scoped token).
-Why: provisioning Zero Trust Access applications requires account-level
-permissions that the standard "Edit Workers" token doesn't grant in v4 of
-the Cloudflare provider.
+Both OpenTofu and `wrangler` read the same `CLOUDFLARE_API_TOKEN` env var, so
+we mint **one scoped token** that covers both: Workers Scripts + Workers KV +
+Zero Trust Access (apps and policies). No Global API Key.
 
-1. Dashboard → **My Profile → API Tokens → Global API Key → View**. This is
-   sensitive — it has full account access. Treat it like a password.
-2. Store it somewhere you can reference from `infra/.env`. The repo's
-   `.env.example` reads from 1Password via `op://` references — see
-   `infra/.env.example` for the expected fields:
-   - `username` (your account email)
-   - `credential` (the Global API Key value)
-   - `account id` (your account id)
-3. If you don't use 1Password, set these as plain env vars in your shell or
-   in a non-`op://` `.env` and drop the `op run --env-file=.env --` prefix
-   from the OpenTofu commands.
+The repo ships [`infra/create-api-token.sh`](../infra/create-api-token.sh)
+which calls Cloudflare's API to create (or update in place) a token named
+`codemode-mcp-deploy` with exactly those permission groups.
+
+1. **Mint a single-use creation token.** Dashboard → **My Profile → API
+   Tokens → Create Token → Custom token**. Add the permission "**User → API
+   Tokens → Edit**" and nothing else. This token only lives long enough to
+   run the script; delete it afterwards.
+2. **Run the script.**
+   ```
+   export CF_CREATE_TOKEN='<single-use creation token>'
+   ./infra/create-api-token.sh
+   ```
+   On first run it prints `Token ID` and `Value`. Store the value in
+   1Password as item `Codemode MCP Cloudflare Token`, field `credential`
+   (and add an `account id` field with your Cloudflare account ID — the
+   script doesn't need this, but `infra/.env` references it for
+   `TF_VAR_cloudflare_account_id`). On re-runs the script updates the
+   token's permissions in place and the value stays unchanged.
+3. **Point `infra/.env` at the new item.** See `infra/.env.example`. If
+   you don't use 1Password, set `CLOUDFLARE_API_TOKEN` and
+   `TF_VAR_cloudflare_account_id` as plain env vars in your shell or in a
+   non-`op://` `.env`, and drop the `op run --env-file=.env --` prefix
+   from the OpenTofu / deploy commands.
+4. **Delete the single-use creation token** in the dashboard.
 
 ## Step 7 — Enable Zero Trust and add an Identity Provider
 
@@ -176,14 +181,19 @@ The constant pattern: redirect URI is
 
 ## Step 10 — Set Worker secrets and deploy
 
+Wrap wrangler commands with `op run --env-file=infra/.env --` so they pick up
+`CLOUDFLARE_API_TOKEN`. (Alternative: `npx wrangler login` once, then drop
+the wrapper. The wrapper form is what `scripts/bootstrap-*.sh` use.)
+
 ```
-cd apps/gmail
-npx wrangler secret put GOOGLE_CLIENT_ID
-npx wrangler secret put GOOGLE_CLIENT_SECRET
-npx wrangler secret put COOKIE_ENCRYPTION_KEY   # any 32+ byte random string
+# From repo root:
+op run --env-file=infra/.env -- (cd apps/gmail && npx wrangler secret put GOOGLE_CLIENT_ID)
+op run --env-file=infra/.env -- (cd apps/gmail && npx wrangler secret put GOOGLE_CLIENT_SECRET)
+op run --env-file=infra/.env -- (cd apps/gmail && npx wrangler secret put COOKIE_ENCRYPTION_KEY)
+# (COOKIE_ENCRYPTION_KEY = any 32+ byte random string, e.g. `openssl rand -hex 32`)
 
 pnpm --filter @apps/gmail typecheck
-pnpm --filter @apps/gmail deploy
+op run --env-file=infra/.env -- pnpm run deploy:gmail
 ```
 
 Wrangler prints the deployed URL. Visit
@@ -218,10 +228,12 @@ grant in KV.
 
 ## Common gotchas
 
-- **"Authentication error [code: 10000]" from OpenTofu.** The Global API
-  Key auth env vars must be `CLOUDFLARE_EMAIL` and `CLOUDFLARE_API_KEY`
-  (not `CLOUDFLARE_API_TOKEN`). The provider auto-detects which auth mode
-  based on which vars are set.
+- **"Authentication error [code: 10000]" from OpenTofu.** Check that
+  `CLOUDFLARE_API_TOKEN` is set in your shell (e.g. via
+  `op run --env-file=infra/.env -- tofu ...`) and that it's the token
+  minted by `infra/create-api-token.sh`. Hand-built tokens that omit
+  "Access: Apps and Policies (Read+Write)" fail on the Access app
+  resources.
 - **Access app gates `/mcp` and breaks the connector.** The Access
   application's `domain` must include the `/authorize` path
   (`<worker>.<subdomain>.workers.dev/authorize`), not the bare hostname.

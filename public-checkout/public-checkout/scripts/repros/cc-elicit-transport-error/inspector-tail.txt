@@ -1,0 +1,23 @@
+POST https://gmail.bonhomme.workers.dev/mcp - Ok @ 10/05/2026, 11:24:11 pm
+POST https://gmail.bonhomme.workers.dev/mcp - Ok @ 10/05/2026, 11:24:15 pm
+GmailMCP.setName - Ok @ 10/05/2026, 11:17:12 pm
+GmailMCP.getInitializeRequest - Ok @ 10/05/2026, 11:24:12 pm
+GmailMCP.setName - Ok @ 10/05/2026, 11:24:12 pm
+GmailMCP.getInitializeRequest - Ok @ 10/05/2026, 11:24:15 pm
+Unknown Event - Ok @ 10/05/2026, 11:24:15 pm
+GET https://gmail.bonhomme.workers.dev/mcp - Canceled @ 10/05/2026, 11:24:15 pm
+
+# DEBUG-AGENTS + AUDIT logs (chronological)
+
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:24:12.397Z","sessionId":"20892da4c084bcd39b57c003d83837a38d34e26c57acdef30ea3fb0b9fa7e608","jsonrpc":{"id":0},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"elicit-response-handled","ts":"2026-05-10T13:24:15.313Z","sessionId":"20892da4c084bcd39b57c003d83837a38d34e26c57acdef30ea3fb0b9fa7e608","requestId":0,"isResult":true,"isError":false,"pendingCount":0}
+DEBUG-ELICIT {"stage":"elicit-result","ts":"2026-05-10T13:24:15.313Z","operationId":"gmail.users.threads.delete","action":"accept","validated":true}
+AUDIT {"deployment":"gmail","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","operationId":"gmail.users.threads.delete","decision":"elicit","elicitationOutcome":"accepted","category":"irreversible","elicitFields":{"confirm":true},"ts":"2026-05-10T13:24:15.313Z","principalId":"117813926851584410547"}
+AUDIT {"deployment":"gmail","method":"DELETE","path":"/gmail/v1/users/me/threads/19df5a712d9c336d","operationId":"gmail.users.threads.delete","decision":"allow","upstreamStatus":403,"ts":"2026-05-10T13:24:15.781Z","principalId":"117813926851584410547"}
+DEBUG-AGENTS {"stage":"send-entry","ts":"2026-05-10T13:24:15.781Z","sessionId":"20892da4c084bcd39b57c003d83837a38d34e26c57acdef30ea3fb0b9fa7e608","jsonrpc":{"id":3},"relatedRequestId":null}
+DEBUG-AGENTS {"stage":"send-pre-write","ts":"2026-05-10T13:24:15.781Z","channelKind":"per-request-sse","connectionId":"by26edpNfu8aUfHySVAmN","requestId":3,"shouldClose":true,"relatedIdsCount":1}
+
+# Notes
+
+- Capture was abridged by the user when pasted; the standalone-SSE pre-write probe for the outgoing elicit notification was likely truncated. The decisive signal is `elicit-response-handled requestId:0 isResult:true` (the elicit accept came back), which means the elicit WAS dispatched and round-tripped successfully.
+- 403 on the Gmail DELETE is a separate OAuth scope issue, orthogonal to the elicit transport. Not in scope for this diagnosis.

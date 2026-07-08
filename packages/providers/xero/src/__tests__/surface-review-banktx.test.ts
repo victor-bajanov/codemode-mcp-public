@@ -24,39 +24,84 @@ describe("inspectBankTxCreate", () => {
   });
 
   it("denies SPEND-OVERPAYMENT", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "SPEND-OVERPAYMENT" }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-type" });
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-type" });
+    expect(res.message).toContain("SPEND or RECEIVE");
+    expect(res.message).toContain("SPEND-OVERPAYMENT");
   });
 
   it("denies RECEIVE-OVERPAYMENT", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "RECEIVE-OVERPAYMENT" }] },
-    })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-type" });
+    });
+    expect(res).toMatchObject({ decision: "deny", reason: "banktx-disallowed-type" });
+    expect(res.message).toContain("RECEIVE-OVERPAYMENT");
   });
 
   it("denies TRANSFER", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "TRANSFER" }] },
-    })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-type" });
+    });
+    expect(res).toMatchObject({ decision: "deny", reason: "banktx-disallowed-type" });
+    expect(res.message).toContain("TRANSFER");
+  });
+
+  it("names the offending Type value in the disallowed-type message", () => {
+    const res = inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "TRANSFER" }] },
+    });
+    expect(res.message).toBeTruthy();
+    expect(res.message).toMatch(/SPEND or RECEIVE/);
+    expect(res.message).toContain('"TRANSFER"');
   });
 
   it("denies any tx with IsReconciled=true", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "SPEND", IsReconciled: true }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-reconciled" });
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-reconciled" });
+    expect(res.message).toContain("IsReconciled=true");
+    expect(res.message).toMatch(/forged/);
   });
 
   it("denies when BankTransactions array is empty", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [] },
-    })).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    expect(res.message).toContain('"BankTransactions"');
   });
 
   it("denies when key is missing", () => {
-    expect(inspectBankTxCreate({ body: {} })).toMatchObject({
+    const res = inspectBankTxCreate({ body: {} });
+    expect(res).toMatchObject({
       decision: "deny", category: "malformed", reason: "banktx-no-payload",
     });
+    expect(res.message).toContain('"BankTransactions"');
+  });
+
+  it("denies when body is missing/non-object", () => {
+    const missing = inspectBankTxCreate({});
+    expect(missing).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    expect(missing.message).toContain('"BankTransactions"');
+
+    const nonObject = inspectBankTxCreate({ body: "not-an-object" });
+    expect(nonObject).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    expect(nonObject.message).toContain('"BankTransactions"');
+  });
+
+  it("denies when BankTransactions is not an array", () => {
+    const res = inspectBankTxCreate({ body: { BankTransactions: { Type: "SPEND" } } });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    expect(res.message).toContain('"BankTransactions"');
+  });
+
+  it("denies when a tx entry is not an object", () => {
+    const res = inspectBankTxCreate({ body: { BankTransactions: ["SPEND"] } });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-no-payload" });
+    expect(res.message).toContain('"BankTransactions"');
   });
 
   it("treats Type case-insensitively", () => {
@@ -87,15 +132,21 @@ describe("inspectBankTxCreate", () => {
   });
 
   it("denies when Status is DELETED (destructive update)", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "SPEND", Status: "DELETED" }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-status" });
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-status" });
+    expect(res.message).toContain("AUTHORISED");
+    expect(res.message).toContain("DELETED");
   });
 
   it("denies when Status is VOIDED", () => {
-    expect(inspectBankTxCreate({
+    const res = inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "SPEND", Status: "VOIDED" }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-status" });
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-status" });
+    expect(res.message).toContain("AUTHORISED");
+    expect(res.message).toContain("VOIDED");
   });
 
   it("treats Status case-insensitively", () => {
