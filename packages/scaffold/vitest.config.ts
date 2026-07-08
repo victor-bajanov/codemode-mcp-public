@@ -5,9 +5,14 @@ import { defineConfig } from "vitest/config";
 // evaluation; Node's loader rejects the protocol so vitest needs a stub.
 // DurableObject's constructor assigns ctx/env on the instance so subclasses
 // that don't override it (e.g. TokenBrokerDO) can be unit-tested directly.
+// WorkerEntrypoint mirrors that shape: codemode 0.4.x's CodemodeConnector
+// extends it, so it must be a defined class or module load throws.
 const STUBS: Record<string, string> = {
   "cloudflare:workers": `
     export class DurableObject {
+      constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+    }
+    export class WorkerEntrypoint {
       constructor(ctx, env) { this.ctx = ctx; this.env = env; }
     }
     export class RpcTarget {}

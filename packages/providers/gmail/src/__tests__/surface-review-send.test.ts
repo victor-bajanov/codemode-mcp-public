@@ -30,8 +30,10 @@ import {
 } from "../inspectors/allowlist";
 import {
   inspectOutboundMessage,
+  inspectDraftSend,
   MASS_SEND_THRESHOLD,
 } from "../inspectors/outbound";
+import { surfaceReview } from "../surface-review";
 
 function rfc822(headers: Record<string, string>, body = ""): string {
   const headerLines = Object.entries(headers)
@@ -50,16 +52,16 @@ function toBase64Url(s: string): string {
 
 describe("A) isAllowedRecipient", () => {
   it("matches the exact-address allowlist entry", () => {
-    expect(isAllowedRecipient("someone@gmail.com")).toBe(true);
+    expect(isAllowedRecipient("adam@gmail.com")).toBe(true);
   });
 
   it("matches the wildcard-domain allowlist entry", () => {
-    expect(isAllowedRecipient("someone@example.com")).toBe(true);
+    expect(isAllowedRecipient("bob@example.com")).toBe(true);
   });
 
   it("rejects an unrelated address on a non-allowlisted domain", () => {
     // gmail.com itself is NOT allowlisted; only the specific burner address is.
-    expect(isAllowedRecipient("someone@gmail.com")).toBe(false);
+    expect(isAllowedRecipient("eve@gmail.com")).toBe(false);
   });
 
   it("normalizes case before comparing", () => {
@@ -68,11 +70,11 @@ describe("A) isAllowedRecipient", () => {
 
   it("treats plus-addressing as strict (a+tag@x ≠ a@x)", () => {
     // Known behavior, not a bug — see plan.
-    expect(isAllowedRecipient("someone+tag@gmail.com")).toBe(false);
+    expect(isAllowedRecipient("adam+tag@gmail.com")).toBe(false);
   });
 
   it("does not match subdomains of an allowlisted domain", () => {
-    expect(isAllowedRecipient("someone@sub.example.com")).toBe(false);
+    expect(isAllowedRecipient("eve@sub.example.com")).toBe(false);
   });
 
   it("OUTBOUND_RECIPIENT_ALLOWLIST contains the expected entries", () => {
@@ -80,7 +82,7 @@ describe("A) isAllowedRecipient", () => {
     // entries. This protects against accidental edits to the allowlist.
     expect(OUTBOUND_RECIPIENT_ALLOWLIST).toEqual([
       "*@example.com",
-      "someone@gmail.com",
+      "adam@gmail.com",
     ]);
   });
 });
@@ -95,7 +97,7 @@ describe("B) assertAllowlistEntry", () => {
   });
 
   it("does not throw on a valid exact-address entry", () => {
-    expect(() => assertAllowlistEntry("someone@gmail.com")).not.toThrow();
+    expect(() => assertAllowlistEntry("adam@gmail.com")).not.toThrow();
   });
 
   it("does not throw on a valid wildcard-domain entry", () => {
@@ -124,7 +126,7 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
         payload: {
           headers: [
             { name: "To", value: "alice@example.com" },
-            { name: "Cc", value: "attacker@example.com" },
+            { name: "Cc", value: "eve@evil.com" },
           ],
         },
       },
@@ -218,7 +220,7 @@ describe("D) inspectOutboundMessage — drafts.create body shape ({message: ...}
       body: {
         message: {
           payload: {
-            headers: [{ name: "To", value: "attacker@example.com" }],
+            headers: [{ name: "To", value: "eve@evil.com" }],
           },
         },
       },
@@ -254,6 +256,97 @@ describe("E) inspectOutboundMessage — drafts.update body shape ({id, message: 
       decision: "deny",
       category: "malformed",
       reason: "draft-update-no-message",
+    });
+  });
+});
+
+describe("F) drafts surface wiring (AUTHZ-VULN-04) — allowlist bites on create/update/send", () => {
+  it("wires inspectOutboundMessage onto drafts.create and drafts.update", () => {
+    for (const id of ["gmail.users.drafts.create", "gmail.users.drafts.update"]) {
+      const entry = surfaceReview[id];
+      expect(entry?.decision, id).toBe("allow");
+      expect(entry?.inspect, id).toBe(inspectOutboundMessage);
+    }
+  });
+
+  it("wires inspectDraftSend onto drafts.send", () => {
+    const entry = surfaceReview["gmail.users.drafts.send"];
+    expect(entry?.decision).toBe("allow");
+    expect(entry?.inspect).toBe(inspectDraftSend);
+  });
+
+  it("drafts.create denies an off-allowlist recipient (allowlist now bites)", () => {
+    const raw = toBase64Url(
+      rfc822({ To: "eve@evil.com", Subject: "Draft hello" }),
+    );
+    const inspect = surfaceReview["gmail.users.drafts.create"]!.inspect!;
+    expect(inspect({ body: { message: { raw } } })).toMatchObject({
+      decision: "deny",
+      category: "external_data_flow",
+      reason: "external-send",
+    });
+  });
+
+  it("drafts.update denies an off-allowlist recipient (allowlist now bites)", () => {
+    const inspect = surfaceReview["gmail.users.drafts.update"]!.inspect!;
+    expect(
+      inspect({
+        body: {
+          id: "d1",
+          message: {
+            payload: { headers: [{ name: "To", value: "eve@evil.com" }] },
+          },
+        },
+      }),
+    ).toMatchObject({
+      decision: "deny",
+      category: "external_data_flow",
+      reason: "external-send",
+    });
+  });
+});
+
+describe("G) inspectDraftSend — bare-id send is safe by construction; update-and-send is re-inspected", () => {
+  it("allows a bare {id} send (already-vetted draft)", () => {
+    expect(inspectDraftSend({ body: { id: "d1" } })).toMatchObject({
+      decision: "allow",
+    });
+  });
+
+  it("allows an empty body {} (no message carried)", () => {
+    expect(inspectDraftSend({ body: {} })).toMatchObject({ decision: "allow" });
+  });
+
+  it("denies an update-and-send carrying an off-allowlist message.raw", () => {
+    const raw = toBase64Url(
+      rfc822({ To: "eve@evil.com", Subject: "sneaky" }),
+    );
+    expect(inspectDraftSend({ body: { id: "d1", message: { raw } } })).toMatchObject({
+      decision: "deny",
+      category: "external_data_flow",
+      reason: "external-send",
+    });
+  });
+
+  it("allows an update-and-send carrying an allowlisted message.raw", () => {
+    const raw = toBase64Url(
+      rfc822({ To: "alice@example.com", Subject: "ok" }),
+    );
+    expect(inspectDraftSend({ body: { id: "d1", message: { raw } } })).toMatchObject({
+      decision: "allow",
+    });
+  });
+
+  it("delegates a non-JSON media channel to inspectOutboundMessage (off-allowlist denied)", () => {
+    const req = {
+      rawBody: new TextEncoder().encode(
+        "To: eve@evil.com\r\nSubject: hi\r\n\r\nbody",
+      ),
+      contentType: "message/rfc822",
+    };
+    expect(inspectDraftSend(req)).toMatchObject({
+      decision: "deny",
+      reason: "external-send",
     });
   });
 });

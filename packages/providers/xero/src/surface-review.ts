@@ -1,5 +1,5 @@
 import type { SurfaceReview } from "@local/shared";
-import { inspectInvoiceDraft } from "./inspectors/drafts.js";
+import { inspectInvoiceDraft, inspectCreditNoteDraft } from "./inspectors/drafts.js";
 import { inspectBankTxCreate } from "./inspectors/bank-transactions.js";
 
 import specJson from "./spec.json" with { type: "json" };
@@ -33,6 +33,14 @@ const TIER_1_ALLOW_INSPECT_OR_BARE: SurfaceReview = {
   // setting Status to VOIDED/DELETED, which the inspector denies (only allows
   // Status ∈ {DRAFT, SUBMITTED}).
   "xero.accounting.updateInvoice":               { decision: "allow", inspect: inspectInvoiceDraft },
+  // Credit notes mirror invoices exactly: bulk PUT/POST send { CreditNotes: [...] },
+  // singular updateCreditNote (by ID) sends a flat object. Same Status lifecycle, so
+  // the shared draft inspector gates them — only DRAFT/SUBMITTED (or a Status-omitted
+  // update carrying CreditNoteID) is allowed; AUTHORISED/PAID/VOIDED/DELETED are denied
+  // with a clear message. Xero has no separate delete/void op; that flows through these.
+  "xero.accounting.createCreditNotes":           { decision: "allow", inspect: inspectCreditNoteDraft },
+  "xero.accounting.updateOrCreateCreditNotes":   { decision: "allow", inspect: inspectCreditNoteDraft },
+  "xero.accounting.updateCreditNote":            { decision: "allow", inspect: inspectCreditNoteDraft },
   "xero.accounting.createContacts":              { decision: "allow", category: "standard_write" },
   "xero.accounting.updateOrCreateContacts":      { decision: "allow", category: "standard_write" },
   "xero.accounting.createRepeatingInvoices":         { decision: "allow", category: "standard_write" },
@@ -45,6 +53,8 @@ const TIER_1_ALLOW_INSPECT_OR_BARE: SurfaceReview = {
   // are passed). Re-wire the inspector once the handler forwards request bytes.
   "xero.accounting.createInvoiceAttachmentByFileName":      { decision: "allow", category: "standard_write" },
   "xero.accounting.updateInvoiceAttachmentByFileName":      { decision: "allow", category: "standard_write" },
+  "xero.accounting.createCreditNoteAttachmentByFileName":   { decision: "allow", category: "standard_write" },
+  "xero.accounting.updateCreditNoteAttachmentByFileName":   { decision: "allow", category: "standard_write" },
   "xero.files.uploadFile":                       { decision: "allow", category: "standard_write" },
   "xero.files.createFolder":                     { decision: "allow", category: "standard_write" },
 };

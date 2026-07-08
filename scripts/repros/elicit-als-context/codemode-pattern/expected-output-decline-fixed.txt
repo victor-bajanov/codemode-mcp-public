@@ -1,0 +1,53 @@
+[wrangler:stdout]
+ ⛅️ wrangler 4.90.0 (update available 4.105.0)
+──────────────────────────────────────────────
+[wrangler:stdout] Your Worker has access to the following bindings:
+[wrangler:stdout] Binding                        Resource            Mode
+env.MCP_OBJECT (ReproMCP)      Durable Object      local
+env.LOADER                     Worker Loader       local
+
+[wrangler:stdout] ⎔ Starting local server...
+[wrangler:stdout] [wrangler:info] Ready on http://localhost:54022
+[verify] wrangler ready at http://localhost:54022
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (26ms)
+[verify] MCP client connected
+[wrangler:stdout] [wrangler:info] POST /mcp 202 Accepted (2ms)
+[wrangler:stdout] [wrangler:info] GET /mcp 200 OK (1ms)
+[wrangler:stdout] [wrangler:info] POST /mcp 200 OK (3ms)
+[verify] elicit request received: {"mode":"form","message":"Confirm delete_thing?","requestedSchema":{"type":"object","properties":{"confirm":{"type":"string","enum":["yes","no"]}},"required":["confirm"]}}
+[wrangler:stdout] BEFORE-LOADER op=delete_thing
+[verify] tool result: {"content":[{"type":"text","text":"OK {\"deleted\":true,\"elicit\":{\"action\":\"decline\"}}"}]}
+[wrangler:stdout] INSIDE-CALLBACK op=delete_thing ALS=unset
+ELICIT-RESULT {"action":"decline"}
+[wrangler:info] POST /mcp 202 Accepted (2ms)
+
+=== VERIFY SUMMARY ===
+TRIGGER_VALIDATION=
+observed=tool-success
+detail=OK {"deleted":true,"elicit":{"action":"decline"}}
+
+--- wrangler stdout (tail) ---
+
+ ⛅️ wrangler 4.90.0 (update available 4.105.0)
+──────────────────────────────────────────────
+Your Worker has access to the following bindings:
+Binding                        Resource            Mode
+env.MCP_OBJECT (ReproMCP)      Durable Object      local
+env.LOADER                     Worker Loader       local
+
+⎔ Starting local server...
+[wrangler:info] Ready on http://localhost:54022
+[wrangler:info] POST /mcp 200 OK (26ms)
+[wrangler:info] POST /mcp 202 Accepted (2ms)
+[wrangler:info] GET /mcp 200 OK (1ms)
+[wrangler:info] POST /mcp 200 OK (3ms)
+BEFORE-LOADER op=delete_thing
+INSIDE-CALLBACK op=delete_thing ALS=unset
+ELICIT-RESULT {"action":"decline"}
+[wrangler:info] POST /mcp 202 Accepted (2ms)
+
+
+--- wrangler stderr (tail) ---
+
+
+PASS: observed expected behavior (tool-success (decline), no ALS error even without the wrap).

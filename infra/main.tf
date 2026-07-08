@@ -9,7 +9,8 @@ terraform {
 }
 
 # Auth via env vars set by `op run --env-file=.env`:
-#   CLOUDFLARE_EMAIL, CLOUDFLARE_API_KEY  (Global API Key)
+#   CLOUDFLARE_API_TOKEN  (scoped token minted by infra/create-api-token.sh —
+#                          same token is used by wrangler deploy)
 provider "cloudflare" {}
 
 module "gmail" {
@@ -32,6 +33,7 @@ module "xero" {
   access_allowed_idp_ids       = var.access_allowed_idp_ids
 }
 
+
 module "gmail_dev" {
   source                       = "./modules/worker"
   cloudflare_account_id        = var.cloudflare_account_id
@@ -51,6 +53,7 @@ module "xero_dev" {
   allowed_emails               = var.allowed_emails
   access_allowed_idp_ids       = var.access_allowed_idp_ids
 }
+
 
 # State migration from the previous app naming (`gmail` /
 # `xero`). The 1.1+ `moved` block re-anchors existing resources

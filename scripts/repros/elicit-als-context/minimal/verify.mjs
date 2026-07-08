@@ -1,12 +1,16 @@
 #!/usr/bin/env node
+// Regression guard for agents#1734.
+//
 // Spawns `wrangler dev`, connects an MCP client that advertises
-// elicitation capability, calls `repro_elicit`, and prints what happened.
+// elicitation capability, calls `repro_elicit`, and asserts the FIXED
+// behavior: elicitInput from inside a Worker-Loader child callback
+// succeeds WITHOUT manual ALS re-entry (no agentContext.run wrap).
 //
-// Behavior:
-//   WRAP=    -> expects ELICIT-ERROR ... "Agent was not found in send"
-//   WRAP=1   -> expects a successful elicit round-trip
+// Pass criteria:
+//   - observed=tool-success   (elicit round-tripped)
+//   - "Agent was not found in send" is ABSENT from all output
 //
-// Exit code is 0 if the observed behavior matches WRAP, 1 otherwise.
+// Exit code is 0 on pass, 1 on failure.
 
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -14,13 +18,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const WRAP = process.env.WRAP === "1";
 const READY_TIMEOUT_MS = 60_000;
 const CALL_TIMEOUT_MS = 30_000;
 
 function startWrangler() {
-  // Pass WRAP via --var so the deployed Worker sees it.
-  const args = ["dev", "--port", "0", "--var", `WRAP:${WRAP ? "1" : ""}`];
+  const args = ["dev", "--port", "0"];
   const child = spawn("npx", ["--yes", "wrangler", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, FORCE_COLOR: "0" },
@@ -142,34 +144,28 @@ async function main() {
   const stdoutTail = wrangleLogs.stdout.slice(-4000);
 
   console.log("\n=== VERIFY SUMMARY ===");
-  console.log(`WRAP=${WRAP ? "1" : ""}`);
   console.log(`observed=${observed}`);
   console.log(`detail=${observedDetail}`);
   console.log(`\n--- wrangler stdout (tail) ---\n${stdoutTail}`);
   console.log(`\n--- wrangler stderr (tail) ---\n${stderrTail}`);
 
-  // Pass criteria
+  // Pass criteria (regression guard for agents#1734):
+  //   - elicit round-tripped successfully (no-wrap default works)
+  //   - "Agent was not found in send" is absent (the pre-fix error must not reappear)
   const sawAlsError =
     observedDetail.includes("Agent was not found in send") ||
     stderrTail.includes("Agent was not found in send") ||
     stdoutTail.includes("Agent was not found in send");
 
-  let pass = false;
-  if (WRAP) {
-    pass = observed === "tool-success" && !sawAlsError;
-    console.log(
-      pass
-        ? `\nPASS: WRAP=1 produced a successful elicit round-trip.`
-        : `\nFAIL: WRAP=1 expected tool-success without ALS error.`,
-    );
-  } else {
-    pass = sawAlsError;
-    console.log(
-      pass
-        ? `\nPASS: WRAP unset reproduced "Agent was not found in send".`
-        : `\nFAIL: WRAP unset did not reproduce the expected ALS error.`,
-    );
-  }
+  const expectation =
+    "tool-success (decline), no ALS error without agentContext.run wrap (agents#1734 fixed)";
+  const pass = observed === "tool-success" && !sawAlsError;
+
+  console.log(
+    pass
+      ? `\nPASS: ${expectation}.`
+      : `\nFAIL: expected ${expectation}; got observed=${observed} sawAlsError=${sawAlsError}.`,
+  );
 
   process.exit(pass ? 0 : 1);
 }

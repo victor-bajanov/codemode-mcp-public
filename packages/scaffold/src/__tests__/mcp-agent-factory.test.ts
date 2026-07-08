@@ -4,30 +4,10 @@ import { fileURLToPath } from "node:url";
 import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
 import { registerFileHandleTool } from "../staging";
-
-// TypeScript-only canary — see "agents@0.12.4: __DO_NOT_USE_WILL_BREAK__agentContext
-// export and store shape are stable (#1490 canary)" test below.
-import type { __DO_NOT_USE_WILL_BREAK__agentContext as agentContextType } from "agents";
-import type { AsyncLocalStorage } from "node:async_hooks";
-type _StoreShapeStillCompatible =
-  typeof agentContextType extends AsyncLocalStorage<infer S>
-    ? S extends {
-        agent: unknown;
-        connection: unknown;
-        request: unknown;
-        email: unknown;
-      }
-      ? true
-      : never
-    : never;
-// Force the type to be used (otherwise unused-import lints may strip it):
-const _agentContextStoreShapeCanary: _StoreShapeStillCompatible = true;
-// biome-ignore lint/correctness/noUnusedVariables: the assignment IS the assertion
-void _agentContextStoreShapeCanary;
+import { buildExecuteAddendum } from "../mcp-agent-factory";
+import type { ApiProvider } from "../api-provider";
 
 const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
 const xeroSpec = JSON.parse(
@@ -39,7 +19,7 @@ const gmailSpec = JSON.parse(
 
 // Capturing executor: never evaluates the code argument; instead records the
 // namespaces (second arg) that openApiMcpServer passes for each tool invocation.
-// Under codemode 0.3.5 the codemode object is fully sandbox-internal (embedded in
+// Under codemode 0.4.2 the codemode object is fully sandbox-internal (embedded in
 // the generated code string). The host only passes __openapiHost for the execute
 // tool, and nothing for the search tool.
 type CapturedCall = { namespaces: Array<{ name: string; fns: unknown }> };
@@ -87,8 +67,8 @@ async function callExecute(
   await server.close();
 }
 
-describe("openApiMcpServer (codemode 0.3.5 contract)", () => {
-  it("codemode 0.3.5: search tool passes no external namespaces to executor (codemode is sandbox-internal)", async () => {
+describe("openApiMcpServer (codemode 0.4.2 contract)", () => {
+  it("codemode 0.4.2: search tool passes no external namespaces to executor (codemode is sandbox-internal)", async () => {
     const { executor, getCalls } = makeCapturingExecutor();
     const server = openApiMcpServer({
       spec: xeroSpec,
@@ -99,14 +79,14 @@ describe("openApiMcpServer (codemode 0.3.5 contract)", () => {
 
     const calls = getCalls();
     expect(calls).toHaveLength(1);
-    // Under 0.3.5, codemode.spec() is fully sandbox-internal — it is constructed
+    // Under 0.4.2, codemode.spec() is fully sandbox-internal — it is constructed
     // inside the generated code string, not passed as an external namespace.
     // The search tool therefore passes an empty namespaces array.
     expect(calls[0]!.namespaces).toHaveLength(0);
     expect(calls[0]!.namespaces.find((n) => n.name === "codemode")).toBeUndefined();
   });
 
-  it("codemode 0.3.5: execute tool passes __openapiHost (not codemode) as the only external namespace", async () => {
+  it("codemode 0.4.2: execute tool passes __openapiHost (not codemode) as the only external namespace", async () => {
     const { executor, getCalls } = makeCapturingExecutor();
     const server = openApiMcpServer({
       spec: xeroSpec,
@@ -137,51 +117,6 @@ describe("openApiMcpServer (codemode 0.3.5 contract)", () => {
     // Search tool ran and executor was called — basic construction sanity check.
     expect(calls[0]!.namespaces).toBeDefined();
   });
-
-  // Export-and-shape canary for #1490 (ALS re-entry workaround).
-  //
-  // This is a TypeScript-only check, not a runtime check. It does NOT
-  // verify that mcp-agent-factory.ts actually wraps its request callback
-  // in agentContext.run — that's covered by the Worker-Loader integration
-  // repro at scripts/repros/elicit-als-context/codemode-pattern/ (manual
-  // gate in the upgrade plan).
-  //
-  // What it DOES catch:
-  //   - If a future `agents` bump removes or renames the
-  //     __DO_NOT_USE_WILL_BREAK__agentContext export, `pnpm typecheck`
-  //     fails at the import below.
-  //   - If the AgentContextStore shape loses the `agent` field or any of
-  //     the other four fields the scaffold supplies, the conditional type
-  //     resolves to `never` and `pnpm typecheck` fails at the
-  //     `_StoreShapeStillCompatible` assertion.
-  it("agents@0.12.4: __DO_NOT_USE_WILL_BREAK__agentContext export and store shape are stable (#1490 canary)", () => {
-    // Compile-time only — the assertion lives in the type system.
-    // If typecheck passed, this test passes. If typecheck fails the build
-    // never reaches vitest.
-    expect(true).toBe(true);
-  });
-
-  // SDK-field-writability canary for #1491 (validator swap workaround).
-  //
-  // This is a unit check on the SDK's field shape, not on whether
-  // mcp-agent-factory.ts's init() actually performs the swap. The "does
-  // init() do the swap" path is covered by the Worker-Loader integration
-  // repro (codemode-pattern) which exercises elicit-accept and would fail
-  // with "Code generation from strings disallowed" if the swap didn't run.
-  //
-  // What this catches:
-  //   - If a future SDK bump renames _jsonSchemaValidator or makes it
-  //     readonly/constructor-only, the assignment below either fails at
-  //     typecheck (rename) or silently no-ops at runtime (the readback
-  //     returns undefined and the expect fails).
-  it("@modelcontextprotocol/sdk: McpServer._jsonSchemaValidator is writable (#1491 canary)", () => {
-    const server = new McpServer({ name: "canary", version: "0.0.0" });
-    const validator = new CfWorkerJsonSchemaValidator();
-    (server.server as unknown as { _jsonSchemaValidator: unknown })._jsonSchemaValidator = validator;
-    expect(
-      (server.server as unknown as { _jsonSchemaValidator: unknown })._jsonSchemaValidator,
-    ).toBe(validator);
-  });
 });
 
 describe("register_file_handle tool wiring", () => {
@@ -196,5 +131,70 @@ describe("register_file_handle tool wiring", () => {
     const result = await tool.handler({});
     expect(result.upload_url).toBe("https://x.test/staging/upload");
     expect(result.token.startsWith("stg_")).toBe(true);
+  });
+});
+
+const dummyProvider = {
+  name: "test",
+  displayName: "Test",
+  oauth: {} as never,
+  spec: {} as never,
+  surfaceReview: {} as never,
+  apiBaseUrl: "https://test.example",
+} as unknown as ApiProvider;
+
+describe("buildExecuteAddendum", () => {
+  it("always documents the response envelope, before every other block", () => {
+    for (const stagingEnabled of [true, false]) {
+      const out = buildExecuteAddendum(
+        { ...dummyProvider, executeHint: "FLOW: do A then B." },
+        stagingEnabled,
+      );
+      const envIdx = out.indexOf("## Response envelope");
+      expect(envIdx).toBeGreaterThanOrEqual(0);
+      expect(out).toContain("result: unknown");
+      expect(out).toContain("return r.result;");
+      expect(envIdx).toBeLessThan(out.indexOf("FLOW: do A then B."));
+      expect(envIdx).toBeLessThan(out.indexOf("## codemode.request body modes"));
+    }
+  });
+
+  it("includes executeHint at the top of the addendum when set, before harness blocks", () => {
+    const out = buildExecuteAddendum(
+      { ...dummyProvider, executeHint: "FLOW: do A then B." },
+      /* stagingEnabled */ true,
+    );
+    expect(out).toContain("FLOW: do A then B.");
+    const hintIdx = out.indexOf("FLOW: do A then B.");
+    const stagingIdx = out.indexOf("## Attachments / file uploads");
+    const bodyIdx = out.indexOf("## codemode.request body modes");
+    expect(stagingIdx).toBeGreaterThan(hintIdx);
+    expect(bodyIdx).toBeGreaterThan(hintIdx);
+  });
+
+  it("omits executeHint section entirely when unset", () => {
+    const without = buildExecuteAddendum(dummyProvider, /* stagingEnabled */ false);
+    const withHint = buildExecuteAddendum(
+      { ...dummyProvider, executeHint: "SHOULD-NOT-APPEAR" },
+      /* stagingEnabled */ false,
+    );
+    expect(without).not.toContain("SHOULD-NOT-APPEAR");
+    expect(withHint).toContain("SHOULD-NOT-APPEAR");
+    // No leading hint marker: the addendum starts with the envelope block
+    // (always present), preceded only by the standard newline separator.
+    expect(without.trimStart().startsWith("## Response envelope")).toBe(true);
+  });
+
+  it("attachmentHint still appears at the bottom when staging + attachmentHint set", () => {
+    const out = buildExecuteAddendum(
+      { ...dummyProvider, attachmentHint: "ATTACH-MARKER" },
+      /* stagingEnabled */ true,
+    );
+    expect(out).toContain("## Upstream-specific attachment snippet for this server");
+    expect(out).toContain("ATTACH-MARKER");
+    // Attachment block is the last block in the assembled addendum.
+    expect(out.indexOf("ATTACH-MARKER")).toBeGreaterThan(
+      out.indexOf("## codemode.request body modes"),
+    );
   });
 });

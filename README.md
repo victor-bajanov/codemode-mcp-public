@@ -1,7 +1,7 @@
 # codemode-mcp
 
-Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail,
-Xero, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
+Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail +
+Google Calendar, Xero, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
 **Code Mode** pattern: each provider ships a `search` / `execute` pair and
 the client writes JavaScript that runs in a sandboxed sub-Worker, instead
 of issuing one MCP tool call per API operation.
@@ -37,8 +37,10 @@ repo wraps them into a turn-key, single-operator **provider scaffold**:
 - **OpenTofu module** for the per-app infra — one KV namespace plus a
   Cloudflare Access policy gating the MCP endpoint to a single operator.
   One `tofu apply` per provider.
-- **Reference Gmail and Xero deployments** with vetted surface reviews to
-  copy from.
+- **Reference Gmail (+ Calendar) and Xero deployments** with vetted
+  surface reviews to copy from. The Gmail provider bundles the Gmail and
+  Google Calendar APIs in one Worker — same Google identity, OAuth client,
+  and consent screen — reached over the shared `www.googleapis.com` origin.
 
 The whole stack is designed for personal/operator-of-one use: OAuth tokens
 live in a per-app KV namespace and the MCP endpoint is fronted by
@@ -168,11 +170,13 @@ Note the outputs — you need `*_oauth_kv_id` for the next step.
      (Web application).
    - Authorized redirect URI:
      `https://gmail.<your-subdomain>.workers.dev/callback`
-   - Enable the Gmail API on the same project.
+   - Enable both the **Gmail API** and the **Google Calendar API** on the
+     same project (the provider exposes both).
    - OAuth consent screen: add yourself as a Test user (External, Testing
      mode is fine for a single-operator deployment).
    - Scopes used by the provider live in
-     `packages/providers/gmail/src/index.ts → gmailProvider.oauth.scopes`.
+     `packages/providers/gmail/src/index.ts → gmailProvider.oauth.scopes`
+     (full Gmail mail scope + least-privilege Calendar scopes).
 
 3. **Set Worker secrets**:
 
