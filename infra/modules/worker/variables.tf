@@ -18,6 +18,12 @@ variable "worker_display_name" {
   type        = string
 }
 
+variable "custom_domain" {
+  description = "Custom domain this Worker also serves on (the `custom_domain` route in apps/<deployment>/wrangler.jsonc), e.g. \"gmail-codemode-mcp.example.com\". Empty means workers.dev only. When set, a second Access application gates /authorize on that hostname — without it the custom domain bypasses Access entirely."
+  type        = string
+  default     = ""
+}
+
 variable "allowed_emails" {
   description = "Email addresses allowed through Cloudflare Access on /authorize."
   type        = list(string)

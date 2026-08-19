@@ -1,12 +1,12 @@
 # Fix-verified evidence — 2026-05-12
 
 Workers Observability MCP queries against the deployed `gmail` worker
-on script version `WORKER_SCRIPT_VERSION` (the deploy carrying
+on script version `de1685c6-471b-4df7-970a-4a45dae79840` (the deploy carrying
 the `transport.send` monkey-patch from this branch).
 
 **Account:** `REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID`
 **Service:** `gmail`
-**Script version:** `WORKER_SCRIPT_VERSION`
+**Script version:** `de1685c6-471b-4df7-970a-4a45dae79840`
 **Window inspected:** last 3 hours from 2026-05-12 query time, covering the
 user's E2E test through Claude Code (`gmail.users.threads.delete` accept flow).
 
@@ -54,7 +54,7 @@ the wrap-pre line (or revert to `wrangler tail` for a single-shot capture).
 timestamp:    2026-05-11T11:16:45.440Z
 requestId:    9fa0c5f6fd1cd6fd
 trigger:      GET /mcp
-scriptVersion: WORKER_SCRIPT_VERSION
+scriptVersion: de1685c6-471b-4df7-970a-4a45dae79840
 message:      DEBUG-ELICIT {"stage":"elicit-caps","ts":"2026-05-11T11:16:45.440Z","operationId":"gmail.users.threads.delete","supportsElicit":true,"capsRaw":{"elicitation":{"form":{}},"roots":{}}}
 outcome:      canceled (long-poll stream wrap-up — normal)
 ```
@@ -67,7 +67,7 @@ was reverted on main, so they only appear on older script versions):
 
 ```
 timestamp:    2026-05-11T00:03:13.198Z
-scriptVersion: WORKER_SCRIPT_VERSION
+scriptVersion: 63b28357-d537-48f2-af66-512fe3eb4c2a
 message:      DEBUG-AGENTS {"stage":"send-pre-write","channelKind":"per-request-sse","connectionId":"AmxUY31xFmXJFlnrNhLdi","requestId":1,"shouldClose":true,"relatedIdsCount":1}
 ```
 

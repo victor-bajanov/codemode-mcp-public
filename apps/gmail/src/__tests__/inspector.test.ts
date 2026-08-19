@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleUpstreamRequest, getOrRefreshAccessToken } from "@local/scaffold";
-import { spec } from "@local/providers-gmail";
+import { spec, surfaceReview as gmailSurfaceReview } from "@local/providers-gmail";
 import type { SurfaceReview } from "@local/shared";
 
 function makeFakeBroker() {
@@ -34,6 +34,7 @@ const baseProps = {
 function makeArgs<R extends SurfaceReview>(opts: {
   surfaceReview: R;
   refreshToken?: string;
+  env?: Record<string, string>;
 }) {
   const props = { ...baseProps, refreshToken: opts.refreshToken ?? baseProps.refreshToken };
   return {
@@ -49,7 +50,7 @@ function makeArgs<R extends SurfaceReview>(opts: {
       broker: makeFakeBroker(),
     },
     audit: {},
-    env: {} as { ALLOW_PII_IN_LOGS?: string },
+    env: (opts.env ?? {}) as { ALLOW_PII_IN_LOGS?: string },
   };
 }
 
@@ -220,6 +221,43 @@ describe("request-handler inspector path", () => {
 
     expect(inspectSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("threads the deployment env into inspectors: OUTBOUND_RECIPIENT_ALLOWLIST decides sends end-to-end", async () => {
+    // Uses the REAL gmail surface review, so this pins the whole chain:
+    // wrangler var → HandleArgs.env → review.inspect(req, env) → allowlist.
+    const fetchSpy = makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const sendCtx = (to: string) => ({
+      method: "POST" as const,
+      path: "/gmail/v1/users/me/messages/send",
+      body: { payload: { headers: [{ name: "To", value: to }] } },
+    });
+    const testerEnv = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@tester.example" };
+
+    // On-list for THIS deployment → upstream fetch happens.
+    const ok = (await handleUpstreamRequest({
+      ...makeArgs({ surfaceReview: gmailSurfaceReview, refreshToken: "RT-env-1", env: testerEnv }),
+      ctx: sendCtx("pal@tester.example"),
+    })) as { success: boolean };
+    expect(ok.success).toBe(true);
+
+    // Off-list for this deployment (even though another deployment allows it) → deny.
+    await expect(
+      handleUpstreamRequest({
+        ...makeArgs({ surfaceReview: gmailSurfaceReview, refreshToken: "RT-env-2", env: testerEnv }),
+        ctx: sendCtx("you@example.com"),
+      }),
+    ).rejects.toThrow(/denied by surface review/);
+
+    // No env var at all → every send denies (fail closed).
+    await expect(
+      handleUpstreamRequest({
+        ...makeArgs({ surfaceReview: gmailSurfaceReview, refreshToken: "RT-env-3" }),
+        ctx: sendCtx("pal@tester.example"),
+      }),
+    ).rejects.toThrow(/denied by surface review/);
   });
 
   it("static elicit (no inspector) → routes through runElicitation, emits transport-error when server has no elicitInput", async () => {

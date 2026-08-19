@@ -166,6 +166,7 @@ describe("integration: putFile round-trip via fetch_url", () => {
     expect(dlRes.status).toBe(200);
     expect(dlRes.headers.get("Content-Type")).toBe("application/pdf");
     expect(dlRes.headers.get("X-Filename")).toBe("a.pdf");
+    expect(dlRes.headers.get("Content-Disposition")).toBe('attachment; filename="a.pdf"');
     const dl = new Uint8Array(await dlRes.arrayBuffer());
     expect(Buffer.from(dl).equals(Buffer.from(plain))).toBe(true);
   });

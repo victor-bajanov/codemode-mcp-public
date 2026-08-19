@@ -1,5 +1,5 @@
-import type { InspectRequest, InspectResult } from "@local/shared";
-import { isAllowedRecipient } from "./allowlist.js";
+import type { InspectEnv, InspectRequest, InspectResult } from "@local/shared";
+import { isAllowedRecipient, outboundAllowlistFromEnv } from "./allowlist.js";
 
 /** Strictly-greater-than threshold for mass-send elicitation. 26+ recipients elicits. */
 export const MASS_SEND_THRESHOLD = 25;
@@ -217,9 +217,13 @@ function rfc822FromNonJson(req: InspectRequest): string | null {
 }
 
 /** Shared decision from a recipient set + lazy subject getter. */
-function decideRecipients(recipients: string[], getSubject: () => string): InspectResult {
+function decideRecipients(
+  recipients: string[],
+  allowlist: readonly string[],
+  getSubject: () => string,
+): InspectResult {
   for (const r of recipients) {
-    if (!isAllowedRecipient(r)) {
+    if (!isAllowedRecipient(r, allowlist)) {
       return { decision: "deny", category: "external_data_flow", reason: "external-send" };
     }
   }
@@ -328,16 +332,18 @@ function extractRecipients(message: Record<string, unknown>): string[] {
 }
 
 /**
- * Inspector for outbound Gmail operations: messages.send, drafts.create,
- * drafts.update.
+ * Inspector for outbound Gmail sends: messages.send directly, and drafts.send
+ * update-and-send bodies via `inspectDraftSend`. (drafts.create / drafts.update
+ * are deliberately NOT inspected — a draft is inert until sent, so it may
+ * address anyone; the allowlist bites at send time instead.)
  *
  * Dispatches by the *effective* payload channel (see `InspectRequest`):
  *
  *   JSON body (`req.body`):
  *     1. Body must be an object. (Otherwise → deny/malformed/send-no-recipients.)
- *     2. If body looks like a drafts.update wrapper (`id` present, no usable
- *        `message`), return deny/malformed/draft-update-no-message.
- *     3. Unwrap `body.message` if present (drafts.create / drafts.update).
+ *     2. If body looks like a draft wrapper with no usable message (`id`
+ *        present, no usable `message`), return deny/malformed/draft-update-no-message.
+ *     3. Unwrap `body.message` if present (drafts.send update-and-send).
  *     4. Extract recipients from `raw` or `payload.headers`. Empty → deny/malformed.
  *
  *   Non-JSON payload (`req.rawBody` media upload, or `req.multipart` upload):
@@ -346,16 +352,19 @@ function extractRecipients(message: Record<string, unknown>): string[] {
  *     (fail closed).
  *
  *   Either path then applies the same recipient decision:
- *     5. Any recipient off the allowlist → deny/external_data_flow/external-send.
+ *     5. Any recipient off the deployment's allowlist (from the
+ *        OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list, so
+ *        every recipient denies) → deny/external_data_flow/external-send.
  *        (Off-allowlist wins over mass-send.)
  *     6. Recipient count > MASS_SEND_THRESHOLD → elicit/mass-send.
  *     7. Otherwise → allow.
  */
-export function inspectOutboundMessage(req: InspectRequest): InspectResult {
+export function inspectOutboundMessage(req: InspectRequest, env?: InspectEnv): InspectResult {
+  const allowlist = outboundAllowlistFromEnv(env);
   if (isObject(req.body)) {
     const body = req.body;
 
-    // Detect drafts.create / drafts.update wrapper.
+    // Detect the Draft resource wrapper (drafts.send update-and-send).
     let message: Record<string, unknown>;
     if ("message" in body) {
       const inner = body["message"];
@@ -389,7 +398,7 @@ export function inspectOutboundMessage(req: InspectRequest): InspectResult {
     if (recipients.length === 0) {
       return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
     }
-    return decideRecipients(recipients, () => extractSubject(message));
+    return decideRecipients(recipients, allowlist, () => extractSubject(message));
   }
 
   // Non-JSON effective payload: media upload (rawBody) or multipart upload.
@@ -401,29 +410,42 @@ export function inspectOutboundMessage(req: InspectRequest): InspectResult {
   if (recipients.length === 0) {
     return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
   }
-  return decideRecipients(recipients, () => subjectFromRfc822(text));
+  return decideRecipients(recipients, allowlist, () => subjectFromRfc822(text));
 }
 
 /**
- * Inspector for `drafts.send`. A legitimate call is either a bare `{id}` (send
- * an already-vetted draft — its recipients were checked at drafts.create /
- * drafts.update time) or `{id, message}` (update-and-send, which carries fresh
- * recipients that must be re-inspected).
+ * Inspector for `drafts.send`. Drafts are created and updated WITHOUT
+ * recipient gating (a draft is inert, and may legitimately address anyone or
+ * no one while being composed), so a stored draft's recipients are unvetted.
+ * Inspectors are synchronous and see only the request, so a bare `{id}` send
+ * — whose recipients live server-side in the stored draft — cannot be checked
+ * against the allowlist and must fail closed.
  *
- * `inspectOutboundMessage` would DENY a bare `{id}` as draft-update-no-message,
- * breaking the normal send-by-id flow. So: a JSON object body carrying no
- * `message`/`raw`/`payload` (bare id or empty) is safe by construction → allow.
- * Any other shape — a carried message, or a non-JSON media/multipart channel —
- * is delegated to `inspectOutboundMessage` so the allowlist still bites.
+ * The workable send path is update-and-send: `{id, message}` replaces the
+ * draft's content with the carried message before Gmail sends it, so the
+ * carried recipients ARE the send's recipients. That shape (and any non-JSON
+ * media/multipart channel) is delegated to `inspectOutboundMessage`, where
+ * the allowlist and mass-send checks bite exactly as for messages.send.
  */
-export function inspectDraftSend(req: InspectRequest): InspectResult {
+export function inspectDraftSend(req: InspectRequest, env?: InspectEnv): InspectResult {
   if (
     isObject(req.body) &&
     !("message" in req.body) &&
     !("raw" in req.body) &&
     !("payload" in req.body)
   ) {
-    return { decision: "allow" };
+    return {
+      decision: "deny",
+      category: "external_data_flow",
+      reason: "draft-send-unvetted-recipients",
+      message:
+        "Refusing to send a draft by id alone: recipients are not checked at " +
+        "draft time and the stored draft cannot be read at send time, so its " +
+        "recipients cannot be verified against the outbound allowlist. Send " +
+        "it as an update-and-send instead — POST the same drafts.send request " +
+        "with { id, message: { raw } } carrying the full message — so the " +
+        "recipients ride in the request and pass inspection.",
+    };
   }
-  return inspectOutboundMessage(req);
+  return inspectOutboundMessage(req, env);
 }

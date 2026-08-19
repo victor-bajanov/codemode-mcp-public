@@ -32,7 +32,8 @@ The deploy token has no user-scoped permissions; instead `infra/.env` sets `CLOU
 ```bash
 cd infra
 cp .env.example .env
-# Edit .env: set TF_VAR_cloudflare_workers_subdomain and TF_VAR_allowed_emails.
+# Edit .env: set TF_VAR_cloudflare_workers_subdomain and TF_VAR_allowed_emails
+# (plus TF_VAR_extra_allowed_emails for any per-worker grants).
 # Adjust the op:// paths if your vault layout differs.
 op run --env-file=.env -- tofu init
 op run --env-file=.env -- tofu plan
@@ -47,7 +48,8 @@ After `apply`, tofu prints:
 
 - `cloudflare_workers_kv_namespace.oauth` — the `OAUTH_KV` namespace.
 - `cloudflare_zero_trust_access_application.authorize` — self-hosted Access app on `/authorize`, path-restricted (does **not** cover `/mcp`, `/token`, `/callback`).
-- `cloudflare_zero_trust_access_policy.allow_operator` — single allow policy gating on `var.allowed_email`.
+- `cloudflare_zero_trust_access_policy.allow_operator` — single allow policy per Access app. Its email list is `var.allowed_emails` (the operator baseline, applied to **every** worker) plus `var.extra_allowed_emails[<worker_name>]` (that worker only). Grant a tester one deployment via the latter: anything added to `allowed_emails` reaches all six workers, so they could run an OAuth flow against any of them. Both are set in `.env`, keyed by `worker_name` — not the module label, which differs for the `-dev` deployments.
+- `cloudflare_zero_trust_access_application.authorize_custom_domain` (+ its policy) — the same pair again for a Worker's custom domain, created only when the module is passed a non-empty `custom_domain`. **An Access application matches on host+path**, so a Worker serving both `<name>.workers.dev` and a custom domain needs one app per hostname; without the second app the custom-domain `/authorize` is completely ungated. Any deployment that adds a `custom_domain` route to its `wrangler.jsonc` must set `custom_domain` on its module block here in the same change.
 
 ## What this does NOT manage
 

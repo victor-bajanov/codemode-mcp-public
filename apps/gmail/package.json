@@ -6,6 +6,7 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --env dev",
+    "deploy:tester": "wrangler deploy --env tester",
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests"

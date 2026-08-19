@@ -64,11 +64,43 @@ export interface InspectResult {
   summary?: Record<string, Primitive>;
 }
 
+/** Deployment vars visible to an inspector (the worker's wrangler `vars`,
+ *  passed through by the request handler). Lets an inspector resolve
+ *  per-deployment policy — e.g. an outbound recipient allowlist — instead of
+ *  baking it in at compile time. */
+export type InspectEnv = Readonly<Record<string, unknown>>;
+
 export interface SurfaceReviewEntry {
   decision: Decision;
   category?: SurfaceReviewCategory;
+  /** Reviewer-facing justification for the decision — why a human reviewer
+   *  chose it (e.g. "Same concern as gmail delegates.list"). Internal prose:
+   *  it is NEVER shown to a client. Client-visible text goes in `clientNote`;
+   *  the two are deliberately separate fields so review rationale cannot leak
+   *  into the model's context. */
   reasoning?: string;
-  inspect?: (req: InspectRequest) => InspectResult;
+  /** Client-visible prose, aimed at the model, describing any request-time
+   *  condition that determines whether this call actually succeeds — what will
+   *  get it refused, and what shape of request passes. Typically that is the
+   *  condition this entry's `inspect` hook applies, but it also covers
+   *  conditions outside the inspector, e.g. an operation the surface review
+   *  allows but the granted OAuth scopes cannot reach (it will 403 whatever the
+   *  inspector decides), so the model does not plan around an endpoint that
+   *  cannot work.
+   *
+   *  Appended to the operation's spec `description` by
+   *  `annotateSpecWithSurfaceReview`, so `search` surfaces it at the moment it
+   *  is relevant. Distinct from `reasoning` (reviewer-facing, never surfaced):
+   *  keep the two apart. Terse — it is paid for on every search hit. The
+   *  structural facts (denied / needs approval / inspected at all) are
+   *  generated from `decision` + the presence of `inspect`, so do not repeat
+   *  them here. */
+  clientNote?: string;
+  /** Body-level inspector. `env` is optional (test batteries and probes omit
+   *  it); an inspector whose policy depends on env must fail closed — treat a
+   *  missing var the same as an empty policy, never fall back to a permissive
+   *  default. */
+  inspect?: (req: InspectRequest, env?: InspectEnv) => InspectResult;
   /** Per-op override; runs ahead of `provider.elicitRenderers[category]`. */
   elicit?: ElicitRenderer;
 }

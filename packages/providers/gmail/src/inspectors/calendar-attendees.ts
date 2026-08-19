@@ -1,5 +1,5 @@
-import type { InspectRequest, InspectResult } from "@local/shared";
-import { isAllowedRecipient } from "./allowlist.js";
+import type { InspectEnv, InspectRequest, InspectResult } from "@local/shared";
+import { isAllowedRecipient, outboundAllowlistFromEnv } from "./allowlist.js";
 
 /** Strictly-greater-than threshold for mass-invite elicitation. 26+ attendees elicits.
  *  Mirrors the outbound mail MASS_SEND_THRESHOLD. */
@@ -34,9 +34,10 @@ function extractAttendees(body: Record<string, unknown>): string[] {
 /**
  * Inspector for Calendar event writes that can email invitations to attendees:
  * events.insert, events.update, events.patch, events.import. Gates attendee
- * addresses through the same allowlist as outbound Gmail (isAllowedRecipient),
- * so the agent cannot invite — and thereby email / leak event details to —
- * arbitrary external addresses.
+ * addresses through the same per-deployment allowlist as outbound Gmail
+ * (OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list, so any
+ * attendee denies), so the agent cannot invite — and thereby email / leak
+ * event details to — arbitrary external addresses.
  *
  * Decision flow (parallel to inspectOutboundMessage):
  *   1. Body not an object, or no `attendees` → allow (no invitees introduced;
@@ -49,15 +50,16 @@ function extractAttendees(body: Record<string, unknown>): string[] {
  *      mass-invite, with a primitives-only summary.
  *   5. Otherwise → allow.
  */
-export function inspectEventAttendees(req: InspectRequest): InspectResult {
+export function inspectEventAttendees(req: InspectRequest, env?: InspectEnv): InspectResult {
   const body = req.body;
   if (!isObject(body)) return { decision: "allow" };
 
   const attendees = extractAttendees(body);
   if (attendees.length === 0) return { decision: "allow" };
 
+  const allowlist = outboundAllowlistFromEnv(env);
   for (const a of attendees) {
-    if (!isAllowedRecipient(a)) {
+    if (!isAllowedRecipient(a, allowlist)) {
       return {
         decision: "deny",
         category: "external_data_flow",

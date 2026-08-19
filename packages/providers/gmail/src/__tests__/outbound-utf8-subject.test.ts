@@ -12,6 +12,11 @@
 import { describe, it, expect } from "vitest";
 import { inspectOutboundMessage } from "../inspectors/outbound";
 
+// Mirrors the prod (gmail/gmail-dev) wrangler var.
+const ENV = {
+  OUTBOUND_RECIPIENT_ALLOWLIST: "*@example.com,adam@gmail.com",
+};
+
 const RECIPIENTS = Array.from(
   { length: 30 },
   (_, i) => `user${i}@example.com`,
@@ -34,7 +39,7 @@ function toBase64Url(s: string): string {
 
 function summarySubjectFor(subjectHeaderValue: string): string {
   const raw = toBase64Url(rfc822({ To: RECIPIENTS, Subject: subjectHeaderValue }));
-  const result = inspectOutboundMessage({ body: { raw } });
+  const result = inspectOutboundMessage({ body: { raw } }, ENV);
   expect(result).toMatchObject({ decision: "elicit", reason: "mass-send" });
   return (result.summary as { subject: string }).subject;
 }

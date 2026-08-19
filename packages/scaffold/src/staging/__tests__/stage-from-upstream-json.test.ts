@@ -189,6 +189,128 @@ describe("createStageFromUpstreamJsonCapability", () => {
     expect(upstreamRequest).not.toHaveBeenCalled();
   });
 
+  describe("contentTypeOverride", () => {
+    it("override wins over an envelope mimeType", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: {
+          success: true,
+          status: 200,
+          result: { data: "AAAA", mimeType: "application/pdf" },
+        },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "image/png");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "image/png", null);
+    });
+
+    it("override supplies the type when the envelope has no mimeType (Gmail case)", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "application/pdf");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("omitted override preserves existing fallback to envelope mimeType", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: {
+          success: true,
+          status: 200,
+          result: { data: "AAAA", mimeType: "application/pdf" },
+        },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null);
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("null override preserves existing fallback to envelope mimeType", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: {
+          success: true,
+          status: 200,
+          result: { data: "AAAA", mimeType: "application/pdf" },
+        },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, null);
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("neither override nor envelope mimeType present falls back to octet-stream", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, null);
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/octet-stream", null);
+    });
+
+    it("empty-string override falls through to envelope mimeType", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: {
+          success: true,
+          status: 200,
+          result: { data: "AAAA", mimeType: "application/pdf" },
+        },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("whitespace-only override falls through to envelope mimeType", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: {
+          success: true,
+          status: 200,
+          result: { data: "AAAA", mimeType: "application/pdf" },
+        },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "   ");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("override with surrounding whitespace reaches putFile trimmed", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "  application/pdf ");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/pdf", null);
+    });
+
+    it("whitespace-only envelope mimeType (no override) falls back to octet-stream", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA", mimeType: "   " } },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, null);
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/octet-stream", null);
+    });
+
+    it("empty-string override AND absent envelope mimeType falls back to octet-stream", async () => {
+      const { cap, putFile } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+
+      await cap(BASE_REQ, "data", "base64", null, "");
+
+      expect(putFile).toHaveBeenCalledWith("AAAA", "application/octet-stream", null);
+    });
+  });
+
   describe("base64url padding correctness", () => {
     it("3 chars → 1 pad char ('AAA' → 'AAA=')", async () => {
       const { cap, putFile } = makeDeps({

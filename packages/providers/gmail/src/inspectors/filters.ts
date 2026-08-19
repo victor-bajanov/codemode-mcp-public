@@ -34,8 +34,19 @@ export function inspectFilterCreate(req: InspectRequest): InspectResult {
 
   const removeLabelIds = action["removeLabelIds"];
   if (Array.isArray(removeLabelIds) && removeLabelIds.includes("INBOX")) {
-    // Actual operator policy is `allow` (auto-archive is a common legitimate use case);
-    // `elicit` is kept here to exercise the inspector->elicit path until live elicitation lands in slice 2.
+    // Operator policy is `elicit`, deliberately. A filter that strips INBOX
+    // hides matching mail from the user's view for every future message, with
+    // no notification — persistent state the user should agree to explicitly,
+    // even though auto-archive is itself a common legitimate use case.
+    //
+    // Consequence, and it is intended: on a client that cannot render an
+    // elicitation prompt (Claude.ai — see scaffold/src/elicit.ts, which throws
+    // `outcome: unsupported` rather than prompting), this is a hard failure,
+    // so auto-archive filters cannot be created there at all. Failing closed is
+    // the right side to err on for a rule that silently hides mail. The
+    // surface-review `clientNote` tells the model this up front, and the
+    // annotator appends the cannot-approve caveat, so the model reports it as
+    // unavailable rather than claiming it asked for a confirmation.
     return {
       decision: "elicit",
       category: "persistent_state",
