@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { FakeD1 } from "./__fixtures__/fake-d1";
-import { registerFileHandleTool } from "../register-tool";
+import { registerFileHandleTool, REGISTER_TOOL_INPUT_SHAPE } from "../register-tool";
 import { lookupByHash } from "../repo";
 import { sha256Bearer } from "../crypto";
 import type { StagingConfig } from "../types";
@@ -54,5 +55,87 @@ describe("registerFileHandleTool", () => {
     const b = await tool.handler({});
     expect(a.token).not.toBe(b.token);
     expect(a.file_handle).not.toBe(b.file_handle);
+  });
+});
+
+describe("registerFileHandleTool description — scope (issue #41)", () => {
+  it("no longer claims to be the tool for ANY file/attachment workflow", () => {
+    const tool = registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    });
+    // Old headline promised this tool covers every file workflow, including
+    // download — but it is upload-only, so an agent asked to download an
+    // attachment called it and got steered into the upload flow.
+    expect(tool.description).not.toMatch(/ANY FILE\s*\/\s*ATTACHMENT WORKFLOW/i);
+  });
+
+  it("scopes itself to the upload/send direction", () => {
+    const tool = registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    });
+    expect(tool.description).toMatch(/UPLOAD\s*\/\s*SEND A FILE.*\bTO\b.*upstream/i);
+  });
+
+  it("routes the download/export direction to the execute tool's staging modes instead of itself", () => {
+    const tool = registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    });
+    expect(tool.description).toMatch(/download(ing)?/i);
+    expect(tool.description).toMatch(/never calls this tool/i);
+    expect(tool.description).toContain("execute");
+  });
+
+  it("keeps Steps 1-2 and the stepThree splice mechanism intact", () => {
+    const withHint = registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+      attachmentHint: "CUSTOM-STEP-THREE-MARKER",
+    });
+    expect(withHint.description).toContain("Step 1");
+    expect(withHint.description).toContain("Step 2");
+    expect(withHint.description).toContain("__stagingHost.getFile");
+    expect(withHint.description).toContain("CUSTOM-STEP-THREE-MARKER");
+
+    const withoutHint = registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    });
+    // Generic fallback Step 3 still present when no provider hint is given.
+    expect(withoutHint.description).toContain("Step 3");
+  });
+});
+
+describe("REGISTER_TOOL_INPUT_SHAPE — filename cap (adjudicated)", () => {
+  // This wave's Content-Disposition emission (fetch-handler.ts) amplifies a
+  // long filename ~12x into a header via percent-encoding; the zod cap here
+  // gives a clean 400 at registration on the primary path, with a truncation
+  // backstop on the fetch side (impl-40's file, not this one).
+  const schema = z.object(REGISTER_TOOL_INPUT_SHAPE);
+
+  it("accepts a filename at the 255-character limit", () => {
+    const result = schema.safeParse({ filename: "a".repeat(255) });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a filename over the 255-character limit", () => {
+    const result = schema.safeParse({ filename: "a".repeat(256) });
+    expect(result.success).toBe(false);
+  });
+
+  it("still allows filename to be omitted entirely", () => {
+    const result = schema.safeParse({});
+    expect(result.success).toBe(true);
+  });
+
+  it("documents the cap in the field description", () => {
+    expect(REGISTER_TOOL_INPUT_SHAPE.filename.description).toMatch(/255/);
   });
 });

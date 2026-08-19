@@ -1,14 +1,16 @@
 // Inspector for `users.settings.sendAs.create`.
 //
-// Validates that `sendAsEmail` is on the outbound recipient allowlist using
-// the shared `isAllowedRecipient` matcher. The body's `smtpMsa` sub-object
-// is now inspected via `inspectSmtpMsa` (host-allowlist enforcement).
+// Validates that `sendAsEmail` is on the deployment's outbound recipient
+// allowlist (OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list,
+// so any sendAsEmail denies) using the shared `isAllowedRecipient` matcher.
+// The body's `smtpMsa` sub-object is inspected via `inspectSmtpMsa`
+// (host-allowlist enforcement).
 
-import type { InspectRequest, InspectResult } from "@local/shared";
-import { isAllowedRecipient } from "./allowlist.js";
+import type { InspectEnv, InspectRequest, InspectResult } from "@local/shared";
+import { isAllowedRecipient, outboundAllowlistFromEnv } from "./allowlist.js";
 import { inspectSmtpMsa } from "./smtp-msa.js";
 
-export function inspectSendAsCreate(req: InspectRequest): InspectResult {
+export function inspectSendAsCreate(req: InspectRequest, env?: InspectEnv): InspectResult {
   const body = req.body;
   if (typeof body !== "object" || body === null) {
     return { decision: "deny", category: "malformed", reason: "sendas-no-email" };
@@ -19,7 +21,7 @@ export function inspectSendAsCreate(req: InspectRequest): InspectResult {
   if (typeof email !== "string" || email.length === 0) {
     return { decision: "deny", category: "malformed", reason: "sendas-no-email" };
   }
-  if (!isAllowedRecipient(email)) {
+  if (!isAllowedRecipient(email, outboundAllowlistFromEnv(env))) {
     return { decision: "deny", category: "capability_escalation", reason: "external-sendas" };
   }
   return { decision: "allow" };

@@ -10,6 +10,13 @@ export {
 } from "./request-handler.js";
 export { mostRestrictive } from "./restrict";
 export {
+  annotateSpecWithSurfaceReview,
+  SURFACE_REVIEW_MARKER,
+  SURFACE_REVIEW_SUMMARY_MARKER,
+  type AnnotatableSpec,
+} from "./annotate-spec.js";
+export type { UpstreamRateLimit, ReadRateLimit } from "./rate-limit.js";
+export {
   getOrRefreshAccessToken,
   hashRefreshToken,
   type GrantSlot,
@@ -18,7 +25,22 @@ export {
 } from "./refresh.js";
 export { type TokenRotation, type UpstreamTokenResponse, type CompleteAuthHookArgs } from "./api-provider.js";
 export { createOAuthHandler } from "./oauth-handler.js";
-export { createProviderMcpAgent, type ProviderEnv } from "./mcp-agent-factory.js";
+// buildExecuteAddendum is LEGACY: since description-budget-docs-surface no
+// client-visible description is built from it (init() serves the compact
+// descriptions + docs tool instead). Kept exported for reference and for
+// pre-existing provider tests; candidate for removal — see the plan's
+// follow-ups.
+export {
+  createProviderMcpAgent,
+  buildExecuteAddendum,
+  type ProviderEnv,
+} from "./mcp-agent-factory.js";
+export { DOC_SECTIONS, buildProviderDocs, type DocSection } from "./descriptions/docs.js";
+export {
+  buildCompactExecuteDescription,
+  COMPACT_SEARCH_DESCRIPTION,
+  buildCompactRegisterFileHandleDescription,
+} from "./descriptions/compact.js";
 export { setupProvider } from "./setup-provider.js";
 export {
   createTokenBrokerDO,

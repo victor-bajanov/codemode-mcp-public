@@ -9,6 +9,7 @@
     "typecheck": "pnpm -r typecheck",
     "deploy:gmail": "pnpm --filter @apps/gmail run deploy",
     "deploy:gmail:dev": "pnpm --filter @apps/gmail run deploy:dev",
+    "deploy:gmail:tester": "pnpm --filter @apps/gmail run deploy:tester",
     "deploy:xero": "pnpm --filter @apps/xero run deploy",
     "deploy:xero:dev": "pnpm --filter @apps/xero run deploy:dev",
     "harness:mcp": "tsx scripts/harnesses/mcp-client.ts",

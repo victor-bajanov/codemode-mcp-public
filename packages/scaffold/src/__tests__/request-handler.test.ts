@@ -124,6 +124,131 @@ describe("request-handler slice-2 extensions", () => {
     expect(Object.keys(headers).filter((k) => k.toLowerCase() !== "authorization")).toEqual([]);
   });
 
+  it("forwards ctx.headers (e.g. Accept) to the upstream fetch", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+
+    await handleUpstreamRequest({
+      ...baseArgs,
+      ctx: { method: "GET", path: "/widgets", headers: { Accept: "application/octet-stream" } },
+      props: { refreshToken: "RT-1", userId: "test-user" },
+    });
+
+    const fetchSpy = (globalThis as unknown as { fetch: ReturnType<typeof vi.fn> }).fetch;
+    const upstreamCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes("/widgets"))!;
+    const headers = (upstreamCall[1] as RequestInit).headers as Record<string, string>;
+    expect(headers["Accept"]).toBe("application/octet-stream");
+    expect(headers["Authorization"]).toBe("Bearer AT-x");
+  });
+
+  it("rejects disallowed ctx.headers with a ToolError before any upstream fetch", async () => {
+    const fetchSpy = makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+    captureAudit();
+
+    for (const name of ["Authorization", "authorization", "X-HTTP-Method-Override", "Cookie"]) {
+      await expect(
+        handleUpstreamRequest({
+          ...baseArgs,
+          ctx: { method: "GET", path: "/widgets", headers: { [name]: "x" } },
+          props: { refreshToken: "RT-1", userId: "test-user" },
+        }),
+      ).rejects.toThrow(`Header "${name}" cannot be set from sandbox code`);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects content-type via ctx.headers, pointing at the contentType option", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+
+    await expect(
+      handleUpstreamRequest({
+        ...baseArgs,
+        ctx: { method: "GET", path: "/widgets", headers: { "Content-Type": "text/plain" } },
+        props: { refreshToken: "RT-1", userId: "test-user" },
+      }),
+    ).rejects.toThrow(/use the `contentType` option/);
+  });
+
+  it("rejects two casings of the same ctx.header — fetch would comma-combine their values", async () => {
+    const fetchSpy = makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+    captureAudit();
+
+    await expect(
+      handleUpstreamRequest({
+        ...baseArgs,
+        ctx: {
+          method: "GET",
+          path: "/widgets",
+          headers: { Accept: "application/json", ACCEPT: "application/octet-stream" },
+        },
+        props: { refreshToken: "RT-1", userId: "test-user" },
+      }),
+    ).rejects.toThrow(/appears more than once/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects ctx.headers on inspected and elicit-gated operations — approval surfaces never see headers", async () => {
+    const fetchSpy = makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+    captureAudit();
+
+    const SPEC_GATED: OpenApiSpec = {
+      openapi: "3.0.0", info: { title: "T", version: "1" }, servers: [{ url: "https://api.example.com" }],
+      paths: {
+        "/inspected": { post: { operationId: "inspectedOp", responses: { "200": { description: "OK" } } } },
+        "/elicited": { post: { operationId: "elicitedOp", responses: { "200": { description: "OK" } } } },
+      },
+      components: { schemas: {} },
+    };
+    const SR_GATED: SurfaceReview = {
+      inspectedOp: {
+        decision: "allow",
+        category: "standard_write",
+        inspect: () => ({ decision: "allow", category: "standard_write" }),
+      },
+      elicitedOp: { decision: "elicit", category: "external_data_flow" },
+    } as unknown as SurfaceReview;
+
+    for (const path of ["/inspected", "/elicited"]) {
+      await expect(
+        handleUpstreamRequest({
+          ...baseArgs,
+          spec: SPEC_GATED,
+          surfaceReview: SR_GATED,
+          ctx: { method: "POST", path, body: { a: 1 }, headers: { Accept: "application/json" } },
+          props: { refreshToken: "RT-1", userId: "test-user" },
+        }),
+      ).rejects.toThrow(/subject to inspection\/approval/);
+    }
+    // Neither the upstream endpoint nor the token endpoint was reached for the gated calls.
+    expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/inspected"))).toHaveLength(0);
+    expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/elicited"))).toHaveLength(0);
+  });
+
+  it("provider requestHeaders wins over a case-colliding ctx.header — values never combine", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy());
+    captureAudit();
+
+    const props = { refreshToken: "RT-1", userId: "test-user", tenantId: "TENANT-XYZ" };
+    await handleUpstreamRequest({
+      ...baseArgs,
+      ctx: { method: "GET", path: "/widgets", headers: { "Xero-Tenant-Id": "evil" } },
+      props,
+      requestHeaders: (p) => ({ "xero-tenant-id": p.tenantId as string }),
+    });
+
+    const fetchSpy = (globalThis as unknown as { fetch: ReturnType<typeof vi.fn> }).fetch;
+    const upstreamCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes("/widgets"))!;
+    const raw = (upstreamCall[1] as RequestInit).headers as Record<string, string>;
+    // One key survives regardless of casing, and it carries the provider value.
+    const winner = new Headers(raw).get("xero-tenant-id");
+    expect(winner).toBe("TENANT-XYZ");
+    expect(Object.keys(raw).filter((k) => k.toLowerCase() === "xero-tenant-id")).toHaveLength(1);
+  });
+
   it("forwards ctx.contentType when set (overrides default application/json)", async () => {
     const fetchSpy = makeFetchSpy();
     vi.stubGlobal("fetch", fetchSpy);

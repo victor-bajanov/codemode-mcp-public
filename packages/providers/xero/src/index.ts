@@ -3,6 +3,7 @@ import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import specJson from "./spec.json" with { type: "json" };
 import { surfaceReview } from "./surface-review.js";
 import { xeroElicitRenderers } from "./elicit-renderers.js";
+import { readXeroRateLimit } from "./rate-limit.js";
 
 const spec = specJson as unknown as OpenApiSpec;
 
@@ -27,7 +28,17 @@ const XERO_ATTACHMENT_HINT =
   "  });\n\n" +
   "Notes:\n" +
   "- Both operations are allowed by the Xero surface review (createInvoiceAttachmentByFileName, updateInvoiceAttachmentByFileName, xero.files.uploadFile).\n" +
-  "- Never pass `f.bytesBase64` through `rawBody` — that path is for text/XML and will silently corrupt binary.\n\n" +
+  "- Never pass `f.bytesBase64` through `rawBody` — that path is for text/XML and will silently corrupt binary.";
+
+// Provider-specific download guidance for the staging workflow (issue #41
+// follow-up): the opposite direction of XERO_ATTACHMENT_HINT above, wired to
+// `downloadHint` and spliced only into the `execute` tool description, right
+// after the harness's Mode A/B/C staging block — never into
+// `register_file_handle`, which is upload-only. This used to live inside
+// XERO_ATTACHMENT_HINT itself, which meant register_file_handle's description
+// said "downloading never calls this tool" and then walked through
+// downloading a few paragraphs later.
+const XERO_DOWNLOAD_HINT =
   "## Downloading an attachment FROM Xero\n\n" +
   "Xero's attachment endpoints return raw bytes when `Accept: application/octet-stream` is set: `GET /api.xro/2.0/Invoices/{InvoiceId}/Attachments/{FileName}` and `GET /files.xro/1.0/Files/{FileId}/Content`. Use `codemode.request` with `returnAs: \"stage\"` — the host streams the bytes straight from upstream into R2 server-side; you get back a file-handle envelope without the bytes ever entering your context.\n\n" +
   "  const r = await codemode.request({\n" +
@@ -106,9 +117,30 @@ export const xeroProvider: ApiProvider<XeroProps> = {
   elicitRenderers: xeroElicitRenderers,
   apiBaseUrl: "https://api.xero.com",
   attachmentHint: XERO_ATTACHMENT_HINT,
+  downloadHint: XERO_DOWNLOAD_HINT,
+  // Full-prose counterpart of the compactHint below, served as the `docs`
+  // tool's "provider" section — without it, a docs-first reader would never
+  // see the tenant-scoping fact (the compactHint is the only other carrier).
+  executeHint:
+    "## Xero tenant scoping\n\n" +
+    "Every call is scoped to the single authorised tenant: the scaffold injects the " +
+    "`xero-tenant-id` header server-side from the connection's props. Never set it yourself — " +
+    "sandbox-supplied auth-adjacent headers are rejected, and there is no multi-tenant switching " +
+    "at request time (re-authorise to change tenants).\n\n" +
+    "Xero enforces per-minute and per-day rate caps; every response envelope carries `rateLimit` " +
+    "(remaining calls per window), and a 429 names the limit hit and how long to wait — see docs " +
+    "section \"rate-limit\".",
+  // ≤200-char slot in the compact `execute` description
+  // (description-budget-docs-surface spec D3 item 4). The compact
+  // description already appends a rate-limit envelope clause automatically
+  // for providers with `readRateLimit` set, so this only points at the
+  // full explanation rather than repeating it.
+  compactHint:
+    "The xero-tenant-id header is injected server-side from the authorised tenant — never set it yourself. Rate-limited; see docs section 'rate-limit'.",
 
   tokenRotation: "rotating",
   requestHeaders: (props) => ({ "xero-tenant-id": props.tenantId }),
+  readRateLimit: readXeroRateLimit,
 
   completeAuthHook: async ({ tokens }) => {
     const r = await fetch("https://api.xero.com/connections", {
@@ -137,4 +169,4 @@ export const xeroProvider: ApiProvider<XeroProps> = {
   },
 };
 
-export { spec, surfaceReview };
+export { spec, surfaceReview, readXeroRateLimit };

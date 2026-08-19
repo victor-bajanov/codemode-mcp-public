@@ -69,23 +69,65 @@ const GMAIL_ATTACHMENT_HINT =
   "- Recipients must pass the send inspector's allowlist (see gmail.users.messages.send surface entry).\n" +
   "- For HTML body, change the first inner part to `Content-Type: text/html; charset=\"UTF-8\"`. For both, wrap text+html in a nested `multipart/alternative`.\n" +
   "- UNICODE (don't ship mojibake): non-ASCII in HEADERS (Subject, display names) must be wrapped with `encHeader` (RFC 2047 encoded-word) as shown — an unlabelled UTF-8 byte in a header is re-read as CP1252 and renders as mojibake (an em dash — becomes \"Ã¢Â€Â\"). Non-ASCII in the BODY is fine as long as the part declares `charset=\"UTF-8\"` (above), since the whole MIME is UTF-8-encoded into `raw` exactly once. Apply the UTF-8->bytes step ONCE: never wrap it with encodeURIComponent/unescape on top, and never base64 an already-base64'd string.\n\n" +
+  "## Send size limit\n\n" +
+  "The JSON `{ raw }` path above is the ONLY send channel for Gmail — no `/upload/...` path is registered (it resolves to a denied no-op), and the scaffold's `bodyBase64`/`multipart` body modes do not work on Gmail send endpoints (see Step 3 above). An inspected send whose effective JSON body exceeds 50 MB is denied before it is sent, so keep the whole request under 50 MB. Note the attachment is base64-encoded twice on this path (once as the MIME part, once when the whole MIME becomes `raw`), inflating original bytes ~1.8x, so the practical ceiling is roughly 28 MB of original attachment content — this 50 MB cap binds before Gmail's own ~35 MB messages.send limit does. If a send is denied for size, shrink or drop the attachment; do not try an alternate upload channel (there isn't one).";
+
+// Provider-specific download guidance for the staging workflow (issue #41):
+// the opposite direction of GMAIL_ATTACHMENT_HINT above, wired to
+// `downloadHint` and spliced only into the `execute` tool description, right
+// after the harness's Mode A/B/C staging block — never into
+// `register_file_handle`, which is upload-only.
+const GMAIL_DOWNLOAD_HINT =
   "## Downloading an attachment FROM Gmail (gmail.users.messages.attachments.get)\n\n" +
-  "This endpoint returns `{ size, data: <base64url>, attachmentId }`. Use `__stagingHost.stageFromUpstreamJson` — the host extracts the `data` field server-side (no 64KB truncation cap, no base64url→base64 conversion needed) and stages the bytes into R2 in one round trip:\n\n" +
+  "This endpoint returns `{ size, data: <base64url>, attachmentId }`. Use `__stagingHost.stageFromUpstreamJson` (also callable as `__stagingHost.stageFromAttachment`) — the host extracts the `data` field server-side (no 64KB truncation cap, no base64url→base64 conversion needed) and stages the bytes into R2 in one round trip:\n\n" +
   "  const f = await __stagingHost.stageFromUpstreamJson(\n" +
   "    { method: \"GET\", path: `/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}` },\n" +
   "    \"data\",            // field name\n" +
   "    \"base64url\",       // Gmail returns base64url (this is the default; can be omitted)\n" +
   "    filename ?? null,  // optional override; otherwise null\n" +
+  "    mimeType ?? null,  // from the parent messages.get part headers — the attachments.get envelope has NO mimeType field\n" +
   "  );\n" +
   "  if (!f.ok) throw new Error(`stage: ${f.status} ${f.message}`);\n" +
   "  return { file_handle: f.file_handle, token: f.token, fetch_url: f.fetch_url, byte_length: f.byte_length };\n\n" +
-  "The MIME type and filename come from the parent `messages.get` payload (part headers); pass `filename` through so the eventual `/staging/fetch/*` response carries the right `Content-Disposition`. The endpoint's `mimeType` field (when present in the JSON envelope) is used by the host as `Content-Type`; otherwise it falls back to `application/octet-stream`.\n\n" +
-  "## Send size limit\n\n" +
-  "The JSON `{ raw }` path above is the ONLY send channel for Gmail — no `/upload/...` path is registered (it resolves to a denied no-op), and the scaffold's `bodyBase64`/`multipart` body modes do not work on Gmail send endpoints (see Step 3 above). An inspected send whose effective JSON body exceeds 50 MB is denied before it is sent, so keep the whole request under 50 MB. Note the attachment is base64-encoded twice on this path (once as the MIME part, once when the whole MIME becomes `raw`), inflating original bytes ~1.8x, so the practical ceiling is roughly 28 MB of original attachment content — this 50 MB cap binds before Gmail's own ~35 MB messages.send limit does. If a send is denied for size, shrink or drop the attachment; do not try an alternate upload channel (there isn't one).";
+  "Gmail's attachments.get envelope never includes a `mimeType` field, so ALWAYS pass the part's mimeType — read it from the parent `messages.get` payload's part headers — as the 5th argument above; skip it and the staged file serves as `application/octet-stream`. Pass `filename` through too, so the eventual `/staging/fetch/*` response carries `X-Filename` and `Content-Disposition: attachment; filename=...`.";
+
+// The dual-API fact ("this server also speaks Google Calendar") reaches
+// clients in two forms since description-budget-docs-surface: the ≤200-char
+// `compactHint` below is the piece carried inside the compact `execute` tool
+// description — the ONLY client-visible description slot — and this fuller
+// hint is served as the `docs` tool's "provider" section. Without them,
+// clients read "Gmail" off the deployment name and never discover the
+// Calendar half of the merged spec. The claims are pinned to
+// surface-review.ts by __tests__/execute-hint-calendar.test.ts — update both
+// together.
+//
+// The elicit tier is described as failing rather than prompting on purpose:
+// scaffold/src/elicit.ts throws ToolError("...outcome: unsupported") without
+// rendering anything when the client does not advertise the elicitation
+// capability, and Claude.ai — the primary client for these deployments — does
+// not. Promising a dialog there would have the model report a confirmation
+// request the user never saw.
+// The one thing a client cannot discover any other way: that this connection
+// carries two APIs. Everything per-operation is generated onto each operation's
+// own `description` by annotateSpecWithSurfaceReview, and the ACCESS convention
+// itself is explained once by the scaffold for every provider
+// (ACCESS_CONVENTION_BLOCK) — so this hint neither lists operations nor repeats
+// the key. Only the compactHint is paid for in every context window; this
+// fuller text costs a `docs` call. Keep both pointers, not manuals.
+const GMAIL_CALENDAR_HINT =
+  "## This connection serves TWO Google APIs on one identity: Gmail AND Google Calendar\n\n" +
+  "Both are reachable through the same `codemode.request()` — Gmail under `/gmail/v1/users/me/...`, " +
+  "Google Calendar under `/calendar/v3/...`. Meetings, availability, invitations and scheduling are in scope on this " +
+  "connection, not just mail. `search` covers both specs at once — operationIds are prefixed `gmail.` and `calendar.`.\n\n" +
+  "Availability varies per operation — see the ACCESS convention above; it applies to both APIs.\n";
 
 export const gmailProvider: ApiProvider = {
   name: "gmail",
-  displayName: "Gmail + Calendar (personal)",
+  // Provider-level, so every deployment built from this provider shares it —
+  // gmail, gmail-dev and gmail-tester alike. There is no per-deployment
+  // override (no wrangler var, no env resolution), so it must not describe any
+  // one deployment's account; DEPLOYMENT_NAME is what distinguishes those.
+  displayName: "Gmail + Calendar",
   oauth: {
     authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
@@ -122,7 +164,15 @@ export const gmailProvider: ApiProvider = {
   surfaceReview,
   elicitRenderers: gmailElicitRenderers,
   apiBaseUrl: "https://www.googleapis.com",
+  executeHint: GMAIL_CALENDAR_HINT,
+  // Distilled from GMAIL_CALENDAR_HINT above for the compact `execute`
+  // description (≤200 chars — description-budget-docs-surface spec D3
+  // item 4). Full prose stays in executeHint, which now also feeds the
+  // `docs` tool's "provider" section.
+  compactHint:
+    "This connection serves Gmail AND Google Calendar on one identity. Calendar is reachable under /calendar/v3. operationIds are prefixed `gmail.` / `calendar.` — search covers both.",
   attachmentHint: GMAIL_ATTACHMENT_HINT,
+  downloadHint: GMAIL_DOWNLOAD_HINT,
   audit: {
     principalIdAccessor: (props) => props.userId as string | undefined,
   },

@@ -67,6 +67,7 @@ describe("createPutFileCapability — happy path", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("image/png");
     expect(res.headers.get("X-Filename")).toBe("icon.png");
+    expect(res.headers.get("Content-Disposition")).toBe('attachment; filename="icon.png"');
     const got = new Uint8Array(await res.arrayBuffer());
     expect(Buffer.from(got).equals(Buffer.from(bytes))).toBe(true);
   });
@@ -182,6 +183,7 @@ describe("createPutFileCapability — bad inputs", () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get("X-Filename")).toBeNull();
+    expect(res.headers.get("Content-Disposition")).toBe("attachment");
   });
 });
 

@@ -10,6 +10,7 @@ import { deepFreeze } from "./freeze";
 import { allowPiiInLogs, debugLog } from "./config";
 import { buildUpstreamUrl } from "./build-upstream-url";
 import type { PutFileResult } from "./staging/putfile-capability";
+import type { ReadRateLimit, UpstreamRateLimit } from "./rate-limit";
 
 export interface MultipartPart {
   /** Form-data field name (required). */
@@ -29,6 +30,14 @@ export interface UpstreamCtx {
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
+  /** Extra outbound request headers (e.g. `Accept: application/octet-stream`
+   *  for endpoints that content-negotiate binary). Merged BENEATH the
+   *  scaffold-controlled set: they can never override `Authorization`, the
+   *  computed `Content-Type` (use `contentType` for that), or headers set by
+   *  the provider's `requestHeaders` hook. Names in DISALLOWED_CTX_HEADERS
+   *  (auth material, cookies, method-override variants, content-type, …)
+   *  throw a ToolError — loudly, never silently dropped. */
+  headers?: Record<string, string>;
   /** Override the outbound `Content-Type` header. When unset and `body` is
    *  present, defaults to `application/json`. */
   contentType?: string;
@@ -270,6 +279,11 @@ export interface HandleArgs<P extends Record<string, unknown>> {
   // Per-request provider hook — merged into outbound fetch headers
   requestHeaders?: (props: P) => Record<string, string>;
 
+  /** Provider hook — parses the upstream's rate-limit response headers.
+   *  When set, its result rides on the response envelope as `rateLimit` and,
+   *  on a 429, leads `errors[0].message`. See `rate-limit.ts`. */
+  readRateLimit?: ReadRateLimit;
+
   // Audit — fire-and-forget side effects
   audit: {
     waitUntil?: (p: Promise<unknown>) => void;
@@ -315,10 +329,58 @@ function emitAudit<P extends Record<string, unknown>>(
   }
 }
 
+// Header names sandbox code may NOT supply via ctx.headers. Auth material
+// never enters the sandbox; content-type has dedicated fields (`contentType`,
+// `multipart` — which owns its boundary header); and the method-override
+// family would let an allowed operation impersonate a different, unreviewed
+// verb upstream (Google APIs honour X-HTTP-Method-Override). Rejection is a
+// loud ToolError: the silently-dropped-header behaviour this feature replaces
+// produced wrong upstream bytes with no error anywhere.
+const DISALLOWED_CTX_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "host",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "content-type",
+  "x-http-method-override",
+  "x-http-method",
+  "x-method-override",
+]);
+
+function assertAllowedCtxHeaders(headers: Record<string, string> | undefined): void {
+  if (!headers) return;
+  const seen = new Set<string>();
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase();
+    if (DISALLOWED_CTX_HEADERS.has(lower)) {
+      throw new ToolError(
+        lower === "content-type"
+          ? 'headers may not set content-type — use the `contentType` option (or `multipart`, which generates its own)'
+          : `Header "${name}" cannot be set from sandbox code`,
+      );
+    }
+    // Two casings of one name would BOTH survive the plain-object spread and
+    // fetch's Headers would comma-combine their values ("application/json,
+    // application/octet-stream") — corrupted content negotiation with no error.
+    if (seen.has(lower)) {
+      throw new ToolError(
+        `Header "${name}" appears more than once (names differing only by case are the same header)`,
+      );
+    }
+    seen.add(lower);
+  }
+}
+
 export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   args: HandleArgs<P>,
 ): Promise<unknown> {
   const { spec, surfaceReview } = args;
+  // Validate before any token mint / elicitation round: a doomed request must
+  // not cost the user an approval dialog first.
+  assertAllowedCtxHeaders(args.ctx.headers);
   const ctx = {
     ...args.ctx,
     ...(args.ctx.body !== undefined ? { body: deepFreeze(args.ctx.body) } : {}),
@@ -374,6 +436,24 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
   }
 
+  // Sandbox-supplied headers are refused outright on gated operations. The
+  // inspector receives query/body only, the elicit dialog renders
+  // method/path/body/query only, and the audit line records none of the
+  // headers — so a semantics-bearing header (If-Match, Prefer, …) would ride
+  // through approval unseen and the approved request would differ from the
+  // bytes actually sent. Plain "allow" operations grant the caller the
+  // operation wholesale, so extra headers add no authority there.
+  if (
+    ctx.headers &&
+    Object.keys(ctx.headers).length > 0 &&
+    (review.inspect !== undefined || review.decision === "elicit")
+  ) {
+    throw new ToolError(
+      `Operation ${op.operationId} is subject to inspection/approval — ` +
+        "sandbox-supplied `headers` are not allowed on it; remove `headers` from this codemode.request call",
+    );
+  }
+
   let decision: Decision = review.decision;
   let category: string | undefined = review.category;
   let reason: string | undefined;
@@ -420,7 +500,9 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     }
     // Freeze the derived request so inspectors cannot mutate what will be sent,
     // matching the deepFreeze protection previously applied to ctx.body.
-    inspectResult = review.inspect(deepFreeze(derived.req));
+    // env rides along un-frozen (it is the live worker env, bindings included)
+    // so inspectors can resolve per-deployment policy vars.
+    inspectResult = review.inspect(deepFreeze(derived.req), args.env);
     decision = mostRestrictive(decision, inspectResult.decision);
     if (inspectResult.category) category = inspectResult.category;
     if (inspectResult.reason) reason = inspectResult.reason;
@@ -519,21 +601,55 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     throw err;
   }
 
-  const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+  // ctx.headers first (validated at entry), so the scaffold-controlled set
+  // below always wins on collision — sandbox code can extend, never override.
+  // Collisions are matched case-insensitively: a plain-object spread would
+  // keep `Xero-Tenant-Id` and `xero-tenant-id` as distinct keys, and fetch's
+  // Headers would then COMBINE both values — an override-by-casing bypass.
+  const headers: Record<string, string> = { ...ctx.headers };
+  const setHeader = (name: string, value: string): void => {
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === name.toLowerCase()) delete headers[k];
+    }
+    headers[name] = value;
+  };
+  setHeader("Authorization", `Bearer ${accessToken}`);
 
   // Marshal the SAME effective payload resolved before inspection, so the bytes
   // inspected and the bytes sent are one and the same.
   const { bodyToSend, contentType: outboundContentType } = marshalBody(ctx, eff);
   if (outboundContentType) {
-    headers["content-type"] = outboundContentType;
+    setHeader("content-type", outboundContentType);
   }
 
-  if (args.requestHeaders) Object.assign(headers, args.requestHeaders(args.props));
+  if (args.requestHeaders) {
+    for (const [name, value] of Object.entries(args.requestHeaders(args.props))) {
+      setHeader(name, value);
+    }
+  }
 
   const fetchOptions: RequestInit = { method: ctx.method, headers };
   if (bodyToSend !== undefined) fetchOptions.body = bodyToSend;
 
   const upstreamRes = await fetch(urlString, fetchOptions);
+
+  // Rate-limit headers are read off EVERY response (2xx included) so the caller
+  // sees its remaining budget before it runs out, not only once throttled. A
+  // provider reader is best-effort telemetry: if it throws, the upstream result
+  // still gets returned intact.
+  let rateLimit: UpstreamRateLimit | undefined;
+  if (args.readRateLimit) {
+    try {
+      rateLimit = args.readRateLimit(upstreamRes);
+    } catch (err) {
+      debugLog(args.env, "rate-limit-reader-threw", { message: String(err) }, { containsPii: false });
+    }
+  }
+  const rateLimitField = rateLimit ? { rateLimit } : {};
+  // Audit only the throttled responses: `problem`/`retryAfterSeconds` are the
+  // operationally interesting signal, whereas per-call remaining counters would
+  // bloat every audit line.
+  const rateLimitAudit = rateLimit && upstreamRes.status === 429 ? { rateLimit } : {};
 
   // Stage-mode: only on 2xx + putFile dep present. Bytes go straight to R2,
   // bypassing truncateForReturn. On non-2xx, fall through to the normal error
@@ -565,6 +681,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
         status: staged.status,
         result: { error: "stage_failed", message: staged.message },
         errors: [{ code: staged.status, message: staged.message }],
+        ...rateLimitField,
       };
     }
     return {
@@ -580,6 +697,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
         ...(filename ? { filename } : {}),
       },
       errors: [],
+      ...rateLimitField,
     };
   }
 
@@ -594,13 +712,25 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     operationId: op.operationId,
     decision: "allow",
     upstreamStatus: upstreamRes.status,
+    ...rateLimitAudit,
     ts: new Date().toISOString(),
   });
+
+  // On a 429 the upstream body is usually a bare "oops, rate limit exceeded"
+  // with no indication of WHICH limit or how long to wait — that lives in the
+  // headers. The envelope contract points clients at `errors[0].message`, so
+  // the reason leads there (body kept after it, for debugging).
+  const errorMessage = responseText.slice(0, 500);
+  const rateLimitedMessage =
+    upstreamRes.status === 429 && rateLimit?.message
+      ? (errorMessage ? `${rateLimit.message} Upstream said: ${errorMessage}` : rateLimit.message)
+      : errorMessage;
 
   return {
     success: upstreamRes.ok,
     status: upstreamRes.status,
     result: ctx.bypassTruncate ? parsed : truncateForReturn(parsed),
-    errors: upstreamRes.ok ? [] : [{ code: upstreamRes.status, message: responseText.slice(0, 500) }],
+    errors: upstreamRes.ok ? [] : [{ code: upstreamRes.status, message: rateLimitedMessage }],
+    ...rateLimitField,
   };
 }

@@ -6,7 +6,8 @@
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./testing": "./src/testing.ts"
+    "./testing": "./src/testing.ts",
+    "./annotate-spec": "./src/annotate-spec.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

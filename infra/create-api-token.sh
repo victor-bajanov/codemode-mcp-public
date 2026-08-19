@@ -47,6 +47,13 @@ WANTED=(
   "account|Workers KV Storage Read"
   "account|Workers KV Storage Write"
 
+  # --- staging resources for bootstrap scripts: `wrangler d1 create` /
+  #     `d1 migrations apply --remote` and `wrangler r2 bucket create` ---
+  "account|D1 Read"
+  "account|D1 Write"
+  "account|Workers R2 Storage Read"
+  "account|Workers R2 Storage Write"
+
   # --- tofu: Zero Trust Access apps + policies (and identity reads for allowed_idps) ---
   "account|Access: Apps and Policies Read"
   "account|Access: Apps and Policies Write"

@@ -32,6 +32,7 @@ export type StageFromUpstreamJsonCapability = (
   dataField: string,
   dataEncoding?: "base64url" | "base64",
   filenameOverride?: string | null,
+  contentTypeOverride?: string | null,
 ) => Promise<PutFileResult>;
 
 function base64urlToBase64(s: string): string {
@@ -48,6 +49,7 @@ export function createStageFromUpstreamJsonCapability(
     dataField,
     dataEncoding = "base64url",
     filenameOverride = null,
+    contentTypeOverride = null,
   ) {
     if (!dataField || typeof dataField !== "string") {
       return { ok: false, status: 400, message: "dataField must be a non-empty string" };
@@ -79,9 +81,14 @@ export function createStageFromUpstreamJsonCapability(
     }
 
     const b64 = dataEncoding === "base64url" ? base64urlToBase64(raw) : raw;
-    const mime = typeof result.mimeType === "string" && result.mimeType.length > 0
-      ? result.mimeType
-      : "application/octet-stream";
+    const overrideTrimmed = typeof contentTypeOverride === "string" ? contentTypeOverride.trim() : "";
+    const envelopeTrimmed = typeof result.mimeType === "string" ? result.mimeType.trim() : "";
+    const mime =
+      overrideTrimmed.length > 0
+        ? overrideTrimmed
+        : envelopeTrimmed.length > 0
+          ? envelopeTrimmed
+          : "application/octet-stream";
 
     return deps.putFile(b64, mime, filenameOverride ?? null);
   };

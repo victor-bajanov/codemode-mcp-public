@@ -10,7 +10,12 @@ import type { StagingConfig } from "../types";
 
 const CFG: StagingConfig = { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 };
 
-async function seed(now: number, body: Uint8Array, ct = "application/octet-stream") {
+async function seed(
+  now: number,
+  body: Uint8Array,
+  ct = "application/octet-stream",
+  filename: string | null = null,
+) {
   const d1 = new FakeD1();
   const r2 = new FakeR2();
   const token = mintToken();
@@ -18,7 +23,7 @@ async function seed(now: number, body: Uint8Array, ct = "application/octet-strea
   const token_hash = await sha256Bearer(token);
   await insertPending(d1 as unknown as D1Database, {
     token_hash, file_handle: handle, content_type_hint: null,
-    expected_byte_len: null, filename: null, created_at: now, expires_at: now + 300,
+    expected_byte_len: null, filename, created_at: now, expires_at: now + 300,
   });
   const upRes = await handleUpload(
     new Request("https://x.test/staging/upload", {
@@ -141,5 +146,106 @@ describe("handleFetch", () => {
       const out = new Uint8Array(await res.arrayBuffer());
       expect(Buffer.from(out).equals(Buffer.from(plain))).toBe(true);
     }
+  });
+
+  describe("Content-Disposition", () => {
+    async function fetchWithFilename(filename: string | null) {
+      const now = 1_000_000;
+      const { d1, r2, token, handle } = await seed(now, new Uint8Array([1]), "application/octet-stream", filename);
+      return handleFetch(
+        new Request(`https://x.test/staging/fetch/${handle}`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => now + 2 },
+      );
+    }
+
+    it("plain ASCII filename produces attachment; filename=\"...\" alongside X-Filename", async () => {
+      const filename = "superchoice-product-disclosure-statement.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBe(filename);
+      expect(res.headers.get("Content-Disposition")).toBe(
+        "attachment; filename=\"superchoice-product-disclosure-statement.pdf\"",
+      );
+    });
+
+    it("backslash-escapes embedded quote and backslash characters", async () => {
+      const filename = "weird\"name\\file.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBe(filename);
+      expect(res.headers.get("Content-Disposition")).toBe(
+        "attachment; filename=\"weird\\\"name\\\\file.pdf\"",
+      );
+    });
+
+    it("non-ASCII filename gets an ascii fallback plus RFC 5987 filename*", async () => {
+      const filename = "résumé — final.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      // X-Filename is a raw, unencoded header — the em dash (U+2014) is outside
+      // the ByteString range Headers.set allows, so it's substituted with "_"
+      // there. The full name survives in Content-Disposition's filename*
+      // (RFC 5987, UTF-8).
+      expect(res.headers.get("X-Filename")).toBe("résumé _ final.pdf");
+      expect(res.headers.get("Content-Disposition")).toBe(
+        "attachment; filename=\"r_sum_ _ final.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%E2%80%94%20final.pdf",
+      );
+    });
+
+    it("no filename means Content-Disposition is bare and X-Filename is absent", async () => {
+      const res = await fetchWithFilename(null);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBeNull();
+      expect(res.headers.get("Content-Disposition")).toBe("attachment");
+    });
+
+    it("a filename that is control characters only behaves like no filename", async () => {
+      const res = await fetchWithFilename("\r\n\t");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBeNull();
+      expect(res.headers.get("Content-Disposition")).toBe("attachment");
+    });
+
+    it("strips CR/LF from the filename so the response never 500s", async () => {
+      const filename = "report\r\n.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBe("report.pdf");
+      expect(res.headers.get("Content-Disposition")).toBe('attachment; filename="report.pdf"');
+    });
+
+    it("strips an unpaired surrogate instead of letting encodeURIComponent throw", async () => {
+      const filename = "a\ud800b.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("X-Filename")).toBe("ab.pdf");
+      expect(res.headers.get("Content-Disposition")).toBe('attachment; filename="ab.pdf"');
+    });
+
+    it("truncates a very long non-ASCII filename to 255 code points before building headers", async () => {
+      const filename = "é".repeat(300) + ".pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      // The truncated name is 255 "é"s with the ".pdf" suffix cut off entirely.
+      expect(res.headers.get("X-Filename")).toBe("é".repeat(255));
+      const cd = res.headers.get("Content-Disposition");
+      expect(cd).not.toBeNull();
+      expect(cd!.length).toBeLessThanOrEqual(4096);
+      expect(cd).toBe(
+        `attachment; filename="${"_".repeat(255)}"; filename*=UTF-8''${"%C3%A9".repeat(255)}`,
+      );
+    });
+
+    it("combines non-ASCII substitution with escaping of RFC 5987 attr-char exclusions", async () => {
+      const filename = "résumé (v1)'s !*.pdf";
+      const res = await fetchWithFilename(filename);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Disposition")).toBe(
+        "attachment; filename=\"r_sum_ (v1)'s !*.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%28v1%29%27s%20%21%2A.pdf",
+      );
+    });
   });
 });

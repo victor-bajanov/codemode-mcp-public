@@ -1,4 +1,5 @@
 import type { FormFields } from "@local/shared";
+import type { UpstreamRateLimit } from "./rate-limit.js";
 
 export interface AuditEntry {
   deployment: string;
@@ -19,6 +20,10 @@ export interface AuditEntry {
   category?: string;
   reason?: string;
   upstreamStatus?: number;
+  /** Upstream rate-limit state, recorded only when the upstream throttled us
+   *  (429) — which limit was hit and how long it asked us to wait. Operational
+   *  metadata, no PII. */
+  rateLimit?: UpstreamRateLimit;
   /** Authenticated principal (OAuth `sub` or equivalent). */
   principalId?: string;
   /** Provider-specific identifier blob (e.g. { tenantId: "..." } for Xero). */

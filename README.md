@@ -24,8 +24,10 @@ repo wraps them into a turn-key, single-operator **provider scaffold**:
 - **Spec loaders** for the quirks of major SaaS APIs (Google Discovery →
   OpenAPI, multi-spec merging for Xero).
 - **Encrypted attachment staging** — opt-in R2 + D1 bindings give the
-  sandbox a `__stagingHost.{getFile, putFile, stageFromUpstreamJson}`
-  capability so LLM code can pass multi-MB binaries (Gmail attachments,
+  sandbox a `__stagingHost.{getFile, putFile, stageFromUpstreamJson,
+  stageFromAttachment}` capability (`stageFromAttachment` is an alias for
+  `stageFromUpstreamJson` — same function, task-shaped name) so LLM code can
+  pass multi-MB binaries (Gmail attachments,
   Xero documents) by reference instead of base64-inlining them into the
   context. Bytes are HKDF/AES-GCM encrypted at rest in R2; a cron sweep
   expires both rows and objects. See

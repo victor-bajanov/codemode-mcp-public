@@ -1,7 +1,7 @@
 # CC elicit transport-error — Accept-header probe capture
 
 **Date:** 2026-05-11
-**Deployment:** `gmail.your-subdomain.workers.dev` (script version `WORKER_SCRIPT_VERSION`)
+**Deployment:** `gmail.your-subdomain.workers.dev` (script version `de1685c6-471b-4df7-970a-4a45dae79840`)
 **Probe patch:** `patches/agents@0.12.3.patch` (commit `2c05f8d`)
 **Branch:** `claude/brainstorm-todo-task-Ybvpm`
 

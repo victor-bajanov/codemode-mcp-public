@@ -36,7 +36,30 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { openApiMcpServer } from "@cloudflare/codemode/mcp";
+import { z } from "zod";
 import type { ApiProvider } from "./api-provider";
+import { annotateSpecWithSurfaceReview } from "./annotate-spec";
+import { buildProviderDocs, type DocSection } from "./descriptions/docs";
+import {
+  buildCompactExecuteDescription,
+  COMPACT_SEARCH_DESCRIPTION,
+  DOCS_TOOL_DESCRIPTION,
+} from "./descriptions/compact";
+// Moved to descriptions/compact.ts (review: keeps the battery's import free of
+// this module's cloudflare:workers chain); re-exported for compatibility.
+export { DOCS_TOOL_DESCRIPTION } from "./descriptions/compact";
+import {
+  ACCESS_CONVENTION_BLOCK,
+  BODY_MODES_BLOCK,
+  ENVELOPE_BLOCK,
+  RATE_LIMIT_BLOCK,
+  STAGING_BLOCK,
+  buildSearchStrategyBlock,
+} from "./descriptions/fragments";
+
+// Re-exported from ./descriptions/fragments (moved there in Task 1 of the
+// description-budget plan) so existing import sites and tests keep working.
+export { RESPONSE_CHAR_CAP, buildSearchStrategyBlock } from "./descriptions/fragments";
 import { resolveEndpoints } from "./config";
 import { handleUpstreamRequest, type HandleArgs, type UpstreamCtx } from "./request-handler";
 import { ToolError } from "./elicit";
@@ -69,115 +92,182 @@ export interface ProviderEnv extends Record<string, unknown> {
   STAGING_UPLOAD_ORIGIN?: string;     // e.g., "https://xero.example.com"; required when staging is enabled
 }
 
-// Always-included envelope contract block. The library's base description
-// (openApiMcpServer) declares `request(): Promise<unknown>` and its example
-// returns the raw call result, so without this block clients routinely read
-// the upstream payload off the envelope's top level instead of `.result`.
-const ENVELOPE_BLOCK =
-  "## Response envelope — codemode.request() never resolves to the raw API payload\n\n" +
-  "Every codemode.request() call resolves to this envelope (it does NOT throw on non-2xx):\n\n" +
-  "  {\n" +
-  "    success: boolean,  // true iff upstream status is 2xx\n" +
-  "    status: number,    // upstream HTTP status\n" +
-  "    result: unknown,   // upstream response body (JSON-parsed when possible) — the API payload is ALWAYS here\n" +
-  "    errors: { code: number, message: string }[],  // empty on success\n" +
-  "  }\n\n" +
-  "Always check `.success` and read the API data from `.result` — fields like messages/items/Invoices live under `.result`, never at the top level:\n\n" +
-  "  const r = await codemode.request({ method: \"GET\", path: \"/...\" });\n" +
-  "  if (!r.success) throw new Error(`HTTP ${r.status}: ${r.errors[0]?.message}`);\n" +
-  "  return r.result;  // return the unwrapped payload, not `r`\n\n";
-
-// Splice into the codemode `execute` tool's description when this server has
-// staging bindings (STAGING_D1 + STAGING_R2 + STAGING_UPLOAD_ORIGIN). Documents
-// the register_file_handle → bytes-out-of-band → __stagingHost.getFile workflow
-// plus the three modes for returning large binary payloads from execute().
-const STAGING_BLOCK =
-  "\n## Attachments / file uploads — ALWAYS use `register_file_handle` first\n\n" +
-  "When the user wants to attach, upload, send, or otherwise transmit ANY file/binary on this server, " +
-  "the workflow is fixed and non-negotiable:\n\n" +
-  "  1. Call the `register_file_handle` tool (NOT codemode.request) → get { upload_url, token, file_handle }.\n" +
-  "  2. POST the file bytes to upload_url out-of-band, with `Authorization: Bearer <token>` (your runtime/host does this — bytes never enter execute()).\n" +
-  "  3. Inside execute(), read the bytes via the sandbox capability:\n" +
-  "       const f = await __stagingHost.getFile(file_handle, token);\n" +
-  "       // f = { ok: true, contentType, byteLength, filename, bytesBase64 } | { ok: false, status, message }\n" +
-  "       // __stagingHost is a sandbox-scope local (NOT on codemode.*, NOT on globalThis).\n" +
-  "  4. Forward `f.bytesBase64` to the upstream API per the provider-specific snippet below.\n\n" +
-  "Do NOT try to read files from disk, embed bytes literally in code, fetch URLs into Uint8Array, or pass Uint8Array/ArrayBuffer through codemode.request — none of those paths reach the host as binary. The sandbox→host RPC rejects typed-array views outright: a Uint8Array/ArrayBuffer in codemode.request `body` (with or without `rawBody`) throws `Cannot freeze array buffer views with elements`. Use `register_file_handle` (above) or `bodyBase64`/`multipart` (below) instead.\n\n" +
-  "## Returning large binary payloads from execute() — three modes\n\n" +
-  "When upstream responses contain multi-MB binary, DO NOT return the bytes inline (`r.result.data`); they will be truncated to ~64KB by the response budget AND flood your context on the next turn. Use one of the three modes below.\n\n" +
-  "**Mode A — JSON envelope with base64 field (e.g. Gmail attachments.get returns `{data: <base64url>, mimeType, size}`):**\n\n" +
-  "  const f = await __stagingHost.stageFromUpstreamJson(\n" +
-  "    { method: \"GET\", path: \"/<endpoint>\" },\n" +
-  "    \"data\",            // field name in the JSON envelope\n" +
-  "    \"base64url\",       // \"base64url\" (default, Gmail) or \"base64\"\n" +
-  "    filename ?? null,  // staged filename; null lets the host omit it\n" +
-  "  );\n" +
-  "  if (!f.ok) throw new Error(`stage: ${f.status} ${f.message}`);\n" +
-  "  return { file_handle: f.file_handle, token: f.token, fetch_url: f.fetch_url, byte_length: f.byte_length };\n\n" +
-  "Host extracts the field server-side (no 64KB cap, no base64url→base64 conversion needed). Uses upstream `result.mimeType` as Content-Type if present, else `application/octet-stream`.\n\n" +
-  "**Mode B — Raw upstream body (e.g. Xero `/api.xro/2.0/Invoices/{id}/Attachments/{name}` with `Accept: application/octet-stream`):**\n\n" +
-  "  const r = await codemode.request({\n" +
-  "    method: \"GET\",\n" +
-  "    path: \"/<endpoint>\",\n" +
-  "    headers: { Accept: \"application/octet-stream\" },\n" +
-  "    returnAs: \"stage\",   // bytes go upstream→R2 server-side; r.result is the file-handle envelope\n" +
-  "  });\n" +
-  "  if (!r.success) throw new Error(`stage: ${r.status}`);\n" +
-  "  return { file_handle: r.result.file_handle, token: r.result.token, fetch_url: r.result.fetch_url, byte_length: r.result.byte_length };\n\n" +
-  "On 2xx upstream the bytes are staged automatically; Content-Type and filename are taken from the upstream response headers (Content-Disposition). On non-2xx, the normal error envelope is returned (no staging).\n\n" +
-  "**Mode C — Bytes you computed in execute() (fallback when neither A nor B applies):**\n\n" +
-  "  const f = await __stagingHost.putFile(bytesAsBase64, contentType, filename ?? null);\n" +
-  "  if (!f.ok) throw new Error(`stage: ${f.status} ${f.message}`);\n" +
-  "  return { file_handle: f.file_handle, token: f.token, fetch_url: f.fetch_url, byte_length: f.byte_length };\n\n" +
-  "Use this only when the bytes originate inside execute() (e.g. you computed them, decompressed something, merged multiple sources). For upstream payloads, prefer Mode A or B — they avoid pulling the bytes through your context entirely.\n\n" +
-  "The client (or user) downloads any staged file with:\n" +
-  "  curl -H \"Authorization: Bearer <token>\" <fetch_url> -o file.bin\n\n" +
-  "Notes:\n" +
-  "- The token is short-lived (default 60 min, matches getFile). After expiry the row is swept and the URL returns 410.\n" +
-  "- A later turn in this same conversation can re-pull the bytes via `__stagingHost.getFile(file_handle, token)` if needed.\n\n";
-
-// Always-included codemode.request body-modes block. Documents the JSON / text
-// rawBody / bodyBase64 / multipart escape hatches. A Uint8Array/ArrayBuffer in
-// `body` cannot cross the sandbox→host RPC at all — it throws
-// `Cannot freeze array buffer views with elements` (with or without rawBody);
-// use bodyBase64/multipart for binary.
-const BODY_MODES_BLOCK =
-  "## codemode.request body modes (binary / non-JSON)\n\n" +
-  "codemode.request marshals `options` to the host over an RPC that rejects typed-array views — a Uint8Array/ArrayBuffer in `body` throws `Cannot freeze array buffer views with elements`, so use the explicit binary modes below. " +
-  "`rawBody: true` only suppresses JSON serialisation of `body` — it does NOT enable Uint8Array/ArrayBuffer passthrough. " +
-  "The host-side modes (handled by this server, forwarded verbatim upstream):\n\n" +
-  "  • Default (JSON):       `body: {...}` → serialised; Content-Type defaults to application/json.\n" +
-  "  • Text body:            `body: \"…\", rawBody: true, contentType: \"…\"` (e.g. application/xml). Do NOT use rawBody with binary.\n" +
-  "  • Binary octet-stream:  `bodyBase64: \"<base64>\", contentType: \"…\"` — host decodes base64 before fetching.\n" +
-  "  • multipart/form-data:  `multipart: [{ name, filename?, contentType?, value? | bodyBase64? }, …]` — host generates the boundary and Content-Type; do NOT set `contentType` yourself.\n" +
-  "  • contentType is forwarded as-is for body / bodyBase64 / rawBody; only `multipart` overrides it.\n\n";
-
 /**
- * Build the `description` argument that `mcp-agent-factory` passes to
- * `openApiMcpServer`. Pure: depends only on `provider.executeHint`,
- * `provider.attachmentHint`, and the boolean `stagingEnabled`.
+ * LEGACY — no longer feeds any client-visible description: init() passes no
+ * `description` to openApiMcpServer and replaces the search/execute text with
+ * the compact builders; the full content now ships via buildProviderDocs
+ * (descriptions/docs.ts). Kept for reference and pre-existing tests only;
+ * candidate for deletion once its remaining test consumers are repointed.
  *
- * Assembled order:
+ * Historically built the `description` argument this factory passed to
+ * `openApiMcpServer`. Pure: depends only on `provider.executeHint`,
+ * `provider.attachmentHint`, `provider.downloadHint`, and the boolean
+ * `stagingEnabled`.
+ *
+ * Assembled order (issue #41). Rationale, stated honestly: buildSearchStrategyBlock
+ * is a FIXED-size block (~1KB — two interpolated integers, not the operation
+ * list itself) despite the "measured from this spec" framing below, so moving
+ * STAGING_BLOCK ahead of it only buys about that much. The real fix for #41 was
+ * splitting Gmail's download guidance out of the provider-owned attachmentHint
+ * (previously spliced dead last) into `downloadHint`, spliced right after
+ * STAGING_BLOCK: on the Gmail provider this moves that guidance from ~11.9KB
+ * deep in the assembled description to ~5.3KB deep — the actual distance a
+ * truncating client saves. Exact offsets vary per provider/spec; these are
+ * measured Gmail numbers, not a general bound.
  *   1. ENVELOPE_BLOCK             [always]
- *   2. executeHint                [provider-owned, ungated by staging]
+ *   2. RATE_LIMIT_BLOCK           [only if provider.readRateLimit is set]
  *   3. STAGING_BLOCK              [only if stagingEnabled]
- *   4. BODY_MODES_BLOCK           [always]
- *   5. attachmentHint, wrapped    [only if stagingEnabled + attachmentHint set]
+ *   4. downloadHint, verbatim     [only if stagingEnabled + downloadHint set — sits next to Mode A/B]
+ *   5. search-strategy block      [always — sizes measured from this spec]
+ *   6. ACCESS_CONVENTION_BLOCK    [always — every spec is annotated]
+ *   7. executeHint                [provider-owned]
+ *   8. BODY_MODES_BLOCK           [always]
+ *   9. attachmentHint, wrapped    [only if stagingEnabled + attachmentHint set — upload snippet]
  */
 export function buildExecuteAddendum(
-  provider: Pick<ApiProvider, "executeHint" | "attachmentHint">,
+  provider: Pick<
+    ApiProvider,
+    "executeHint" | "attachmentHint" | "downloadHint" | "readRateLimit" | "spec" | "surfaceReview"
+  >,
   stagingEnabled: boolean,
+  annotatedSpec?: unknown,
 ): string {
+  // Prefer the already-annotated spec from init(); fall back to annotating
+  // here so the stated sizes always describe what the client will actually see.
+  const measured =
+    annotatedSpec ??
+    (provider.spec
+      ? annotateSpecWithSurfaceReview(
+          provider.spec as unknown as Record<string, unknown>,
+          provider.surfaceReview ?? {},
+        )
+      : undefined);
   return (
     "\n" + ENVELOPE_BLOCK +
-    (provider.executeHint ? "\n" + provider.executeHint + "\n" : "") +
+    (provider.readRateLimit ? RATE_LIMIT_BLOCK : "") +
     (stagingEnabled ? STAGING_BLOCK : "") +
+    (stagingEnabled && provider.downloadHint ? "\n" + provider.downloadHint + "\n" : "") +
+    (measured ? buildSearchStrategyBlock(measured) : "") +
+    ACCESS_CONVENTION_BLOCK +
+    (provider.executeHint ? "\n" + provider.executeHint + "\n" : "") +
     BODY_MODES_BLOCK +
     (stagingEnabled && provider.attachmentHint
       ? "## Upstream-specific attachment snippet for this server\n\n" + provider.attachmentHint + "\n"
       : "")
   );
 }
+
+/**
+ * Builds the `{ name: "__stagingHost", fns }` capability object handed to
+ * codemode's executor. Pure positional-arg dispatch glue, extracted out of
+ * `createProviderMcpAgent`'s `init()` so it is unit-testable without a live
+ * `WorkerLoader` — `init()` constructs the three capability closures (which DO
+ * need real D1/R2 bindings) and passes them in here.
+ *
+ * codemode 0.4.x dispatches every tool call positionally, so:
+ *   __stagingHost.getFile(handle, token)
+ *   __stagingHost.putFile(bytesBase64, contentType, filename)
+ *   __stagingHost.stageFromUpstreamJson(opts, dataField, encoding?, filename?, contentType?)
+ *   __stagingHost.stageFromAttachment(...)  — same signature, alias (issue #41: agents
+ *     grep for task-shaped names and miss the mechanism-shaped original)
+ * arrive as positional args without any per-provider flag.
+ */
+export function buildStagingHostFns(caps: {
+  getFile: ReturnType<typeof createGetFileCapability>;
+  putFile: ReturnType<typeof createPutFileCapability>;
+  stageFromUpstreamJson: (
+    requestOpts: StageRequestOpts,
+    dataField: string,
+    dataEncoding?: "base64url" | "base64",
+    filenameOverride?: string | null,
+    contentTypeOverride?: string | null,
+  ) => Promise<unknown>;
+}): { name: "__stagingHost"; fns: Record<string, (...args: unknown[]) => Promise<unknown>> } {
+  const stageFromUpstreamJsonFn = (...args: unknown[]) =>
+    caps.stageFromUpstreamJson(
+      args[0] as StageRequestOpts,
+      args[1] as string,
+      (args[2] as "base64url" | "base64" | undefined) ?? "base64url",
+      (args[3] as string | null | undefined) ?? null,
+      (args[4] as string | null | undefined) ?? null,
+    );
+  return {
+    name: "__stagingHost",
+    fns: {
+      getFile: (...args: unknown[]) => caps.getFile(args[0] as string, args[1] as string),
+      putFile: (...args: unknown[]) =>
+        caps.putFile(
+          args[0] as string,
+          args[1] as string,
+          (args[2] as string | null | undefined) ?? null,
+        ),
+      stageFromUpstreamJson: stageFromUpstreamJsonFn,
+      stageFromAttachment: stageFromUpstreamJsonFn,
+    },
+  };
+}
+
+/**
+ * The unique seam in codemode 0.4.2's generated sandbox code, right at the
+ * close of its `const codemode = { spec, request? }` object literal. Every
+ * fixed template line before it, and the LLM's own code after it (embedded
+ * inside the `__truncateResponse(await (…)())` call), so the FIRST occurrence
+ * is always the generated one. Pinned against the installed bundle by
+ * __tests__/codemode-cap-drift.test.ts.
+ */
+export const CODEMODE_SANDBOX_ANCHOR = "\n};\nreturn __truncateResponse(";
+
+/**
+ * Best-effort `codemode.docs()` alias (spec D6). The sandbox's `codemode` is
+ * a `const` local of the generated arrow body, shadowing anything the
+ * executor could provide — so the only way to put `docs` ON that object is a
+ * string patch at the anchor above, turning
+ *   `const codemode = { spec, request };`
+ * into
+ *   `const codemode = { spec, request, docs: … };`
+ * On no match (codemode upgrade moved the seam) the code is forwarded
+ * unpatched and `__docsHost.docs()` — the canonical, patch-free path —
+ * still works.
+ */
+export function patchCodemodeDocsAlias(code: string): string {
+  const idx = code.indexOf(CODEMODE_SANDBOX_ANCHOR);
+  if (idx === -1) return code;
+  return (
+    code.slice(0, idx) +
+    ",\n  docs: async (section) => await __docsHost.docs(section)" +
+    code.slice(idx)
+  );
+}
+
+/**
+ * Builds the `{ name: "__docsHost", fns }` capability handed to codemode's
+ * executor — positional-dispatch glue in the same shape as
+ * buildStagingHostFns, and the guaranteed sandbox path to the docs text
+ * (`codemode.docs` above is the best-effort sugar over it).
+ */
+export function buildDocsHostFns(
+  docs: (section?: DocSection) => string,
+): { name: "__docsHost"; fns: Record<string, (...args: unknown[]) => Promise<unknown>> } {
+  return {
+    name: "__docsHost",
+    fns: {
+      // args[0] == null also catches the JSON-marshalled `undefined` from a
+      // no-arg `codemode.docs()` — the sandbox RPC serialises it to `null`.
+      docs: async (...args: unknown[]) =>
+        docs(args[0] == null ? undefined : (args[0] as DocSection)),
+    },
+  };
+}
+
+/** Version reported in MCP `serverInfo`. Single source of truth: the field
+ *  initializer below and the openApiMcpServer instance that replaces it in
+ *  init() must agree, or the advertised version depends on init() timing.
+ *  That agreement is enforced — see "advertises the same identity before and
+ *  after init()" in __tests__/mcp-agent-factory.test.ts, which reads both
+ *  through an MCP client rather than trusting either call site.
+ *  Kept at the repo's own 0.1.0 rather than codemode's 1.0.0 default — these
+ *  servers make no 1.0 stability promise. */
+const SERVER_VERSION = "0.1.0";
 
 /** Returns a constructor suitable for use as a Durable Object class.
  *  The returned class extends `McpAgent` and is parameterised by `provider`. */
@@ -188,7 +278,7 @@ export function createProviderMcpAgent<
   return class ProviderMCP extends McpAgent<Env, Record<string, never>, P> {
     server: McpServer = new McpServer({
       name: provider.name,
-      version: "0.1.0",
+      version: SERVER_VERSION,
     });
 
     async init(): Promise<void> {
@@ -218,14 +308,15 @@ export function createProviderMcpAgent<
       // configured). This is the minimum surface change and avoids forking
       // openApiMcpServer.
       //
-      // Limitation: codemode 0.4.2 has no sandbox prelude that runs before LLM
-      // code in the OpenAPI execute path (the `modules` option on
-      // DynamicWorkerExecutorOptions exists but is not exposed here, and the
-      // sandbox code string is generated by openApiMcpServer itself). So LLM
-      // code must invoke `__stagingHost.getFile(handle, token)` directly and
-      // base64-decode `bytesBase64` itself. A prelude/modules-prepend API
-      // would let us wrap that in a Response-like object; until codemode
-      // ships one, callers see the raw wire form.
+      // On preludes: codemode 0.4.2 DOES have a sandbox prelude (the fixed
+      // template createOpenApiSandboxCode emits before the LLM's code), but
+      // nothing we inject through it can reach the `const codemode = {...}`
+      // local that shadows any executor-level provider of the same name — so
+      // extending `codemode.*` itself requires the string patch applied by
+      // patchCodemodeDocsAlias at CODEMODE_SANDBOX_ANCHOR (see both above).
+      // Capabilities that live under their own names (__stagingHost,
+      // __docsHost) need no patch at all; LLM code invokes them directly and
+      // base64-decodes `bytesBase64` itself.
       // Gate requires STAGING_UPLOAD_ORIGIN as well: putFile populates its
       // `fetch_url` return field from it. In every deployment that has D1+R2
       // STAGING_UPLOAD_ORIGIN is already present (it gates register-tool too),
@@ -277,61 +368,56 @@ export function createProviderMcpAgent<
                     buildUpstreamArgsRef.current(ctx as unknown as UpstreamCtx),
                   ) as Promise<UpstreamRequestResult>,
               });
-              // codemode 0.4.x dispatches every tool call positionally, so
-              //   __stagingHost.getFile(handle, token)
-              //   __stagingHost.putFile(bytesBase64, contentType, filename)
-              //   __stagingHost.stageFromUpstreamJson(opts, dataField, encoding?, filename?)
-              // arrive as positional args without any per-provider flag.
-              return {
-                name: "__stagingHost",
-                fns: {
-                  getFile: (...args: unknown[]) =>
-                    getFile(args[0] as string, args[1] as string),
-                  putFile: (...args: unknown[]) =>
-                    putFile(
-                      args[0] as string,
-                      args[1] as string,
-                      (args[2] as string | null | undefined) ?? null,
-                    ),
-                  stageFromUpstreamJson: (...args: unknown[]) =>
-                    stageFromUpstreamJson(
-                      args[0] as StageRequestOpts,
-                      args[1] as string,
-                      (args[2] as "base64url" | "base64" | undefined) ?? "base64url",
-                      (args[3] as string | null | undefined) ?? null,
-                    ),
-                },
-              };
+              return buildStagingHostFns({ getFile, putFile, stageFromUpstreamJson });
             })()
           : null;
 
-      const executor = stagingProvider
-        ? {
-            execute: (
-              code: string,
-              providersOrFns:
-                | Array<{ name: string; fns: Record<string, (...args: unknown[]) => Promise<unknown>> }>
-                | Record<string, (...args: unknown[]) => Promise<unknown>>,
-            ) => {
-              // openApiMcpServer always passes an array form; the Record form
-              // is the legacy convenience API. Append only when array form.
-              if (Array.isArray(providersOrFns)) {
-                return baseExecutor.execute(code, [...providersOrFns, stagingProvider]);
-              }
-              return baseExecutor.execute(code, providersOrFns);
-            },
-          }
-        : baseExecutor;
-
       const stagingEnabled = stagingProvider !== null;
-      // Appended to codemode's executeDescription. Closes a real gap in codemode
-      // 0.4.2: its declared RequestOptions interface (body?:unknown, rawBody?:boolean)
-      // reads as "use rawBody for binary" — but the sandbox→host RPC marshals args
-      // via JSON.stringify, which destroys Uint8Array/ArrayBuffer before reaching
-      // the host. Result: rawBody+Uint8Array silently uploads "[object Object]"
-      // (15 bytes). This addendum documents the bodyBase64 / multipart escape
-      // hatches (handled server-side in request-handler.ts).
-      const executeAddendum = buildExecuteAddendum(provider, stagingEnabled);
+      // Annotate ONCE per Durable Object: the same object is handed to
+      // openApiMcpServer and measured for the docs builder's search-strategy
+      // section, so the sizes the docs state are the sizes of the spec the
+      // client receives.
+      const annotatedSpec = annotateSpecWithSurfaceReview(
+        provider.spec as unknown as Record<string, unknown>,
+        provider.surfaceReview,
+      );
+      // One source of truth for the full documentation (spec D1): the `docs`
+      // tool, the codemode://docs resource, and the __docsHost sandbox
+      // capability below all read this object.
+      const providerDocs = buildProviderDocs(provider, stagingEnabled, annotatedSpec);
+      const docsFn = (section?: DocSection): string => {
+        if (section === undefined) return providerDocs.full;
+        return (
+          providerDocs.sections[section] ??
+          `Section "${section}" is not applicable to this server. Available sections: ` +
+            `${Object.keys(providerDocs.sections).join(", ")}.`
+        );
+      };
+      const docsProvider = buildDocsHostFns(docsFn);
+
+      // Wrap unconditionally: __docsHost is appended to EVERY sandbox run
+      // (search included — codemode passes the array form for both tools),
+      // __stagingHost only when staging bindings exist, and the code string is
+      // alias-patched (best-effort, spec D6) before forwarding.
+      const executor = {
+        execute: (
+          code: string,
+          providersOrFns:
+            | Array<{ name: string; fns: Record<string, (...args: unknown[]) => Promise<unknown>> }>
+            | Record<string, (...args: unknown[]) => Promise<unknown>>,
+        ) => {
+          // openApiMcpServer always passes an array form; the Record form
+          // is the legacy convenience API. Append only when array form.
+          if (Array.isArray(providersOrFns)) {
+            return baseExecutor.execute(patchCodemodeDocsAlias(code), [
+              ...providersOrFns,
+              ...(stagingProvider ? [stagingProvider] : []),
+              docsProvider,
+            ]);
+          }
+          return baseExecutor.execute(code, providersOrFns);
+        },
+      };
       // Single source of truth for the per-request HandleArgs object. Both
       // call sites (codemode `request` closure for execute(), and the
       // stageFromUpstreamJson sandbox capability) build their args via this
@@ -378,6 +464,7 @@ export function createProviderMcpAgent<
           ...(provider.requestHeaders
             ? { requestHeaders: provider.requestHeaders }
             : {}),
+          ...(provider.readRateLimit ? { readRateLimit: provider.readRateLimit } : {}),
           ...(provider.elicitRenderers ? { elicitRenderers: provider.elicitRenderers } : {}),
           ...(putFileCapability ? { putFile: putFileCapability } : {}),
           audit: {
@@ -394,9 +481,24 @@ export function createProviderMcpAgent<
       buildUpstreamArgsRef.current = buildUpstreamArgs;
 
       this.server = openApiMcpServer({
-        spec: provider.spec as unknown as Record<string, unknown>,
+        // Annotated, not raw: each operation's description states its own
+        // availability and any request-time condition, so `search` surfaces
+        // the gating where it is relevant instead of the executeHint carrying
+        // it in every context window. The annotator is pure — `provider.spec`
+        // is an imported JSON module shared process-wide, and mutating it
+        // would corrupt every other consumer.
+        spec: annotatedSpec,
         executor,
-        description: executeAddendum,
+        // This instance replaces the McpServer field above, so its identity is
+        // the one clients see in `serverInfo`. Without an explicit name the
+        // library defaults to "openapi", which says nothing about which API is
+        // behind it. `provider.name` is per-provider, not per-deployment —
+        // gmail/gmail-dev/gmail-tester all report "gmail"; DEPLOYMENT_NAME is
+        // what distinguishes those (it is what audit lines carry).
+        name: provider.name,
+        version: SERVER_VERSION,
+        // No `description`: it only feeds codemode's oversized executeDescription,
+        // which is replaced wholesale with the compact text right below.
         // codemode forwards the originating MCP request context as the second
         // arg (codemode#1793). `context.requestId` lets elicit route its
         // server-initiated message back through that request's POST stream.
@@ -407,6 +509,76 @@ export function createProviderMcpAgent<
           }),
       });
 
+      // Replace codemode's oversized search/execute descriptions with the
+      // compact, budgeted ones (spec D2/D3). `_registeredTools` is a private
+      // SDK field and `update()` is safe pre-connect (`sendToolListChanged` is
+      // `isConnected()`-guarded) — both facts pinned by
+      // __tests__/codemode-cap-drift.test.ts.
+      const registeredTools = (this.server as unknown as {
+        _registeredTools?: Record<string, { update(u: { description?: string }): void }>;
+      })._registeredTools;
+      if (!registeredTools?.execute || !registeredTools?.search) {
+        throw new Error(
+          "codemode tool registry shape changed — see codemode-cap-drift.test.ts",
+        );
+      }
+      registeredTools.execute.update({
+        description: buildCompactExecuteDescription(
+          provider,
+          stagingEnabled,
+          Object.keys(providerDocs.sections),
+        ),
+      });
+      registeredTools.search.update({ description: COMPACT_SEARCH_DESCRIPTION });
+
+      // The docs tool — UNCONDITIONAL (not staging-gated): it is the recovery
+      // channel for everything the compact descriptions evict. `_meta` opts it
+      // out of client-side ToolSearch deferral and raises its result-size cap.
+      //
+      // The `section` enum is narrowed to THIS provider's actual sections, not
+      // the full DOC_SECTIONS vocabulary — a schema that admits "rate-limit"
+      // on a server whose docs omit it promises a section the config doesn't
+      // implement (claude.ai live-verification finding). Both the enum and the
+      // sections are computed once per DO init, so they cannot drift apart.
+      // The unvalidated sandbox path (__docsHost.docs / codemode.docs) keeps
+      // the docsFn fallback text above as its out-of-vocabulary answer.
+      const availableSections = Object.keys(providerDocs.sections) as [
+        DocSection,
+        ...DocSection[],
+      ];
+      this.server.registerTool(
+        "docs",
+        {
+          description: DOCS_TOOL_DESCRIPTION,
+          inputSchema: { section: z.enum(availableSections).optional() },
+          _meta: {
+            "anthropic/alwaysLoad": true,
+            "anthropic/maxResultSizeChars": 100_000,
+          },
+        },
+        async ({ section }: { section?: DocSection | undefined }) => ({
+          content: [{ type: "text" as const, text: docsFn(section) }],
+        }),
+      );
+
+      // Same text as a resource, for clients that @-mention resources instead
+      // of spending a tool call. Must register pre-connect: registerResource
+      // lazily registers the `resources` capability, which throws after a
+      // transport is attached.
+      this.server.registerResource(
+        "docs",
+        "codemode://docs",
+        {
+          title: `${provider.displayName} — full codemode documentation`,
+          mimeType: "text/markdown",
+        },
+        async (uri) => ({
+          contents: [
+            { uri: uri.href, mimeType: "text/markdown", text: providerDocs.full },
+          ],
+        }),
+      );
+
       // Staging attachments — register the tool only when bindings are present.
       if (this.env.STAGING_D1 && this.env.STAGING_R2 && this.env.STAGING_UPLOAD_ORIGIN) {
         const { registerFileHandleTool } = await import("./staging/index.js");
@@ -415,6 +587,10 @@ export function createProviderMcpAgent<
           STAGING_D1: this.env.STAGING_D1,
           config: readStagingConfig(this.env as unknown as Record<string, unknown>),
           uploadOrigin: this.env.STAGING_UPLOAD_ORIGIN,
+          // Compact body (spec D3): the provider-specific Step-3 snippet moves
+          // to the docs tool's "attachments" section; attachmentHint still
+          // feeds the docs builder above.
+          descriptionMode: "compact",
           ...(provider.attachmentHint ? { attachmentHint: provider.attachmentHint } : {}),
         });
         this.server.registerTool(

@@ -106,7 +106,7 @@ Capture the divergence + cause + named row in `diff.md`. The named row's draft t
 
 ## 2026-05-12 — Fix verified (transport.send patch engaged)
 
-**Deployment:** `gmail.your-subdomain.workers.dev`, script version `WORKER_SCRIPT_VERSION`
+**Deployment:** `gmail.your-subdomain.workers.dev`, script version `de1685c6-471b-4df7-970a-4a45dae79840`
 **Branch:** `cc-elicit-transport-send-patch` (transport.send patch + ALS wiring)
 
 ### Result
