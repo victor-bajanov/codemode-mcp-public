@@ -1,0 +1,85 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "optical",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "OpticalMCP", "name": "MCP_OBJECT" },
+      { "class_name": "OpticalTokenBroker", "name": "TOKEN_BROKER" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["OpticalMCP"] },
+    { "tag": "v2", "new_sqlite_classes": ["OpticalTokenBroker"] }
+  ],
+  // Cron drives the OAuth inactive-client sweep (setupProvider's `scheduled`
+  // hook). Optical has no staging bindings, but the sweep runs whenever
+  // OAUTH_KV is bound.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": {
+    "DEPLOYMENT_NAME": "optical",
+    "ALLOW_PII_IN_LOGS": "false",
+    "DEBUG_ELICIT": "false",
+    "OAUTH_REGISTER_RATE_LIMIT": "1",
+    "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+    "OAUTH_TOKEN_RATE_LIMIT": "20",
+    "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+    "OAUTH_CLIENT_TTL_SECONDS": "2592000"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "env": {
+    "dev": {
+      "name": "optical-dev",
+      "kv_namespaces": [
+        { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+      ],
+      "worker_loaders": [
+        { "binding": "LOADER" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "OpticalMCP", "name": "MCP_OBJECT" },
+          { "class_name": "OpticalTokenBroker", "name": "TOKEN_BROKER" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["OpticalMCP"] },
+        { "tag": "v2", "new_sqlite_classes": ["OpticalTokenBroker"] }
+      ],
+      "triggers": { "crons": ["*/5 * * * *"] },
+      "vars": {
+        "DEPLOYMENT_NAME": "optical-dev",
+        "ALLOW_PII_IN_LOGS": "false",
+        "DEBUG_ELICIT": "false",
+        "OAUTH_REGISTER_RATE_LIMIT": "1",
+        "OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS": "300",
+        "OAUTH_TOKEN_RATE_LIMIT": "20",
+        "OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS": "60",
+        "OAUTH_CLIENT_TTL_SECONDS": "2592000",
+        // Repoint the dev worker at optical's isolated dev backend, served on
+        // its Custom Domain. Must NOT use the workers.dev hostname: Cloudflare
+        // refuses same-account worker->workers.dev fetches at the edge (error
+        // 1042), which 404s the /callback token exchange, and the scheduler's
+        // __Host-login_nonce cookie binds the OAuth flow to whichever host
+        // served /oauth/authorize — flows started on workers.dev fail with
+        // "Login session mismatch" at /auth/callback on the custom domain.
+        // Prod sets none of these and uses the provider's static prod URLs.
+        "API_BASE_URL_OVERRIDE": "https://scheduler-dev.example.com",
+        "OAUTH_AUTHORIZE_URL_OVERRIDE": "https://scheduler-dev.example.com/oauth/authorize",
+        "OAUTH_TOKEN_URL_OVERRIDE": "https://scheduler-dev.example.com/oauth/token",
+        "OAUTH_USERINFO_URL_OVERRIDE": "https://scheduler-dev.example.com/oauth/userinfo"
+      }
+    }
+  }
+}

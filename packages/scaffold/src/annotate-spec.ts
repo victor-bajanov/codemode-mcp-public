@@ -76,7 +76,7 @@ const MARKER_SEP = "\n\n";
  * Why a second field at all: which field carries an operation's prose is not
  * consistent across the bundled specs. Every one of Gmail's 79 operations has a
  * `description` and NO `summary`; 260 of Xero's 283 have a `summary` and no
- * `description`; 19 Xero operations have both; 4 Xero
+ * `description`; 19 Xero and all 33 optical operations have both; 4 Xero
  * operations have neither. Client search code picks one field — codemode's own
  * worked example in the search tool description returns `op.summary` — so an
  * annotation written only to `description` is invisible to a `summary` reader

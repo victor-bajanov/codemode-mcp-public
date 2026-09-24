@@ -1,6 +1,7 @@
 import type { SurfaceReview } from "@local/shared";
 import { inspectFilterCreate } from "./inspectors/filters.js";
 import { inspectOutboundMessage, inspectDraftSend } from "./inspectors/outbound.js";
+import { normalizeOutboundMessage } from "./inspectors/normalize-subject.js";
 // NB: `inspectSendAsCreate` (./inspectors/sendas.js) is deliberately NOT
 // imported — sendAs.create is denied outright, and a static deny short-circuits
 // before `inspect` is read. The inspector is retained as the reference
@@ -62,9 +63,9 @@ export const surfaceReview: SurfaceReview = {
   "gmail.users.threads.untrash":           { decision: "allow", category: "standard_write" },
   "gmail.users.drafts.list":               { decision: "allow", category: "standard_read" },
   "gmail.users.drafts.get":                { decision: "allow", category: "standard_read" },
-  "gmail.users.drafts.create":             { decision: "allow", category: "standard_write",
-                                              reasoning: "Deliberately uninspected: a draft is inert until sent, so it may address any recipient (or none at all mid-composition). The outbound allowlist is enforced at send time — messages.send and drafts.send both carry recipients through inspectOutboundMessage." },
-  "gmail.users.drafts.update":             { decision: "allow", category: "standard_write",
+  "gmail.users.drafts.create":             { decision: "allow", category: "standard_write", normalizeBody: normalizeOutboundMessage,
+                                              reasoning: "Deliberately uninspected: a draft is inert until sent, so it may address any recipient (or none at all mid-composition). The outbound allowlist is enforced at send time — messages.send and drafts.send both carry recipients through inspectOutboundMessage. Subject normalization still applies (a stored draft can be sent later from the Gmail UI, bypassing our send path)." },
+  "gmail.users.drafts.update":             { decision: "allow", category: "standard_write", normalizeBody: normalizeOutboundMessage,
                                               reasoning: "Deliberately uninspected, same rationale as drafts.create: recipient gating happens at send time, not draft time." },
   "gmail.users.drafts.delete":             { decision: "allow", category: "standard_write" },
 
@@ -74,7 +75,7 @@ export const surfaceReview: SurfaceReview = {
   "gmail.users.messages.attachments.get":  { decision: "allow", category: "standard_read" },
 
   // === Tier 2: outbound + irreversible. Sends are inspected; remaining elicit ops enforce as deny in slice 1. ===
-  "gmail.users.messages.send":             { decision: "allow", inspect: inspectOutboundMessage,
+  "gmail.users.messages.send":             { decision: "allow", inspect: inspectOutboundMessage, normalizeBody: normalizeOutboundMessage,
                                               clientNote:
                                                 "Every To/Cc/Bcc recipient must be on this deployment's outbound " +
                                                 "allowlist (the OUTBOUND_RECIPIENT_ALLOWLIST var; unset means an empty " +
@@ -83,7 +84,7 @@ export const surfaceReview: SurfaceReview = {
                                                 "uploaded RFC 822 message for a media/multipart upload); a payload " +
                                                 "with no readable recipients is denied. More than 25 recipients needs " +
                                                 "interactive approval instead." },
-  "gmail.users.drafts.send":               { decision: "allow", inspect: inspectDraftSend,
+  "gmail.users.drafts.send":               { decision: "allow", inspect: inspectDraftSend, normalizeBody: normalizeOutboundMessage,
                                               reasoning: "Drafts are created/updated ungated, so a stored draft's recipients are unvetted. inspectDraftSend denies a bare send-by-id (a synchronous inspector cannot read the stored draft to verify its recipients) and delegates update-and-send ({id, message}) to inspectOutboundMessage, whose carried recipients are what Gmail actually sends to.",
                                               clientNote:
                                                 "Sending by id alone is always denied: drafts are created and updated " +

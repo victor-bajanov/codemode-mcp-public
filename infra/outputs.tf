@@ -38,8 +38,20 @@ output "xero_access_application_id" {
   description = "Access application ID for the xero Worker."
 }
 
+output "optical_oauth_kv_id" {
+  value       = module.optical.oauth_kv_id
+  description = "Paste into apps/optical/wrangler.jsonc kv_namespaces[0].id."
+}
 
+output "optical_authorize_url" {
+  value       = module.optical.authorize_url
+  description = "Visit in a browser to test the Optical Access policy."
+}
 
+output "optical_access_application_id" {
+  value       = module.optical.access_application_id
+  description = "Access application ID for the optical Worker."
+}
 
 output "gmail_dev_oauth_kv_id" {
   value       = module.gmail_dev.oauth_kv_id
@@ -86,5 +98,17 @@ output "xero_dev_access_application_id" {
   description = "Access application ID for the xero-dev Worker."
 }
 
+output "optical_dev_oauth_kv_id" {
+  value       = module.optical_dev.oauth_kv_id
+  description = "Paste into apps/optical/wrangler.jsonc env.dev.kv_namespaces[0].id."
+}
 
+output "optical_dev_authorize_url" {
+  value       = module.optical_dev.authorize_url
+  description = "Visit in a browser to test the optical-dev Access policy."
+}
 
+output "optical_dev_access_application_id" {
+  value       = module.optical_dev.access_application_id
+  description = "Access application ID for the optical-dev Worker."
+}

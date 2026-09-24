@@ -128,7 +128,7 @@ export function providerSurfaceReviewTests<P extends Record<string, unknown>>(
  *  describe/it from vitest; intended to be called from a *.test.ts file.
  *
  *  `opts.stagingEnabled` must match how the real worker configures this
- *  provider (gmail/xero: true) — several assertions below
+ *  provider (gmail/xero: true, optical: false) — several assertions below
  *  are conditioned on it, mirroring the docs builder's own conditions.
  *
  *  `opts.expectsCrlfJoin` and `opts.expectCompactHint` turn two previously

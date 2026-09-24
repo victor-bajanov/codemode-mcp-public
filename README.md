@@ -1,7 +1,7 @@
 # codemode-mcp
 
 Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail +
-Google Calendar, Xero, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
+Google Calendar, Xero, Optical, …) to MCP clients (Claude.ai, Claude Code, etc) using Cloudflare's
 **Code Mode** pattern: each provider ships a `search` / `execute` pair and
 the client writes JavaScript that runs in a sandboxed sub-Worker, instead
 of issuing one MCP tool call per API operation.
@@ -39,10 +39,12 @@ repo wraps them into a turn-key, single-operator **provider scaffold**:
 - **OpenTofu module** for the per-app infra — one KV namespace plus a
   Cloudflare Access policy gating the MCP endpoint to a single operator.
   One `tofu apply` per provider.
-- **Reference Gmail (+ Calendar) and Xero deployments** with vetted
+- **Reference Gmail (+ Calendar), Xero, and Optical deployments** with vetted
   surface reviews to copy from. The Gmail provider bundles the Gmail and
   Google Calendar APIs in one Worker — same Google identity, OAuth client,
   and consent screen — reached over the shared `www.googleapis.com` origin.
+  The Optical provider fronts a self-hosted Optical scheduling backend; point
+  it at your own Optical deployment.
 
 The whole stack is designed for personal/operator-of-one use: OAuth tokens
 live in a per-app KV namespace and the MCP endpoint is fronted by
@@ -59,11 +61,13 @@ this repo assumes.
 apps/
   gmail/                  deployable Worker — Gmail
   xero/                   deployable Worker — Xero (Demo Company)
+  optical/                deployable Worker — Optical scheduler (your own Optical deployment)
 packages/
   scaffold/               provider-agnostic Worker scaffold (OAuth, MCP agent,
                           request-handler, audit, elicitation)
   providers/gmail/        Gmail provider definition + surface review + spec
   providers/xero/         Xero provider definition + surface review + spec
+  providers/optical/      Optical provider definition + surface review + spec
   shared/                 cross-package types (surface review, elicit)
   spec-loaders/           OpenAPI spec ingestion (Google Discovery, Xero merge)
 infra/                    OpenTofu — KV namespace + Cloudflare Access policy
@@ -100,8 +104,9 @@ export default OAuthHandler;
   Zero Trust enabled. See the
   [getting-started guide](./docs/cloudflare-getting-started.md) if you don't
   have these yet.
-- A **Google Cloud OAuth client** (for Gmail) and/or a **Xero OAuth app**
-  (for Xero). See the per-app sections below.
+- A **Google Cloud OAuth client** (for Gmail), a **Xero OAuth app** (for
+  Xero), and/or a **PKCE client registered on your Optical deployment** (for
+  Optical). See the per-app sections below.
 
 ## Install
 
@@ -117,7 +122,8 @@ The flow is the same for every app:
 
 1. **Provision Cloudflare resources** (KV namespace + Access policy on
    `/authorize`).
-2. **Register the OAuth app** with the upstream provider (Google / Xero).
+2. **Register the OAuth app** with the upstream provider (Google / Xero /
+   your Optical deployment).
 3. **Configure the Worker** (paste the KV id; set Worker secrets).
 4. **`wrangler deploy`**.
 5. **Connect from your MCP client**.
@@ -217,10 +223,33 @@ Short version:
 3. Secrets: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `COOKIE_ENCRYPTION_KEY`.
 4. `pnpm --filter @apps/xero deploy`.
 
+### App: `optical`
+
+See [`apps/optical/README.md`](./apps/optical/README.md) for the per-app
+specifics (PKCE client registration on the Optical side, bootstrap script,
+spec re-sync). Optical is a separate, self-hosted scheduling backend; this
+provider is a reference that expects you to run your own Optical deployment.
+
+Short version:
+
+1. Replace the placeholder Optical origin in
+   `packages/providers/optical/src/index.ts` (`apiBaseUrl` and the three
+   `oauth` URLs) with your Optical deployment, or set the
+   `API_BASE_URL_OVERRIDE` / `OAUTH_{AUTHORIZE,TOKEN,USERINFO}_URL_OVERRIDE`
+   vars per environment in `apps/optical/wrangler.jsonc`.
+2. Register a PKCE OAuth client on your Optical deployment with redirect URI
+   `https://optical.<your-subdomain>.workers.dev/callback` and scopes
+   `scheduler:read scheduler:write`.
+3. Secrets: `OPTICAL_CLIENT_ID`, `OPTICAL_CLIENT_SECRET` (any non-empty
+   string; the PKCE flow ignores it), `COOKIE_ENCRYPTION_KEY`.
+4. `pnpm --filter @apps/optical deploy`, or run
+   [`scripts/bootstrap-optical.sh`](./scripts/bootstrap-optical.sh) to do the
+   Tofu apply, KV-id paste, secrets, and deploy for prod + dev in one go.
+
 ### Deploying a dev variant
 
-Each provider Worker has a paired `-dev` deployment (`gmail-dev`, `xero-dev`)
-that points at a different upstream tenant and a different Cloudflare Access
+Each provider Worker has a paired `-dev` deployment (`gmail-dev`, `xero-dev`,
+`optical-dev`) that points at a different upstream tenant and a different Cloudflare Access
 application, so you can connect Claude.ai to a dev MCP connector without
 disturbing the prod connector. The same `src/index.ts` deploys to both
 environments; isolation is achieved entirely via Wrangler's `env.dev` override
@@ -234,7 +263,7 @@ One-time setup (per provider):
    op run --env-file=.env -- tofu -chdir=infra apply
    ```
 
-   This adds the `gmail-dev` / `xero-dev` resources alongside prod; existing
+   This adds the `gmail-dev` / `xero-dev` / `optical-dev` resources alongside prod; existing
    prod state is unchanged.
 
 2. **Paste the dev KV id.** Run:
@@ -243,13 +272,16 @@ One-time setup (per provider):
    tofu -chdir=infra output -raw gmail_dev_oauth_kv_id
    # and
    tofu -chdir=infra output -raw xero_dev_oauth_kv_id
+   # and
+   tofu -chdir=infra output -raw optical_dev_oauth_kv_id
    ```
 
    Paste each value into the corresponding
    `apps/<provider>/wrangler.jsonc` at `env.dev.kv_namespaces[0].id`,
    replacing the `PASTE_FROM_tofu_output_*` placeholder.
 
-3. **Register a separate OAuth app** at Google / Xero with redirect URI
+3. **Register a separate OAuth app** at Google / Xero (or a separate PKCE
+   client on your Optical dev deployment) with redirect URI
    `https://<provider>-dev.<your-subdomain>.workers.dev/callback`. This must
    be a different client from the prod one — Google rejects mismatched
    redirect URIs, and you want a distinct consent screen anyway.
@@ -277,6 +309,8 @@ One-time setup (per provider):
    pnpm deploy:gmail:dev
    # or
    pnpm deploy:xero:dev
+   # or
+   pnpm deploy:optical:dev
    ```
 
 6. **Connect from Claude.ai** → Settings → Connectors → Add custom MCP:
@@ -285,7 +319,7 @@ One-time setup (per provider):
    hostname (separate Access app, separate cookie) — this is expected.
 
 The prod and dev Workers share the same Durable Object class names
-(`GmailMCP`, `XeroMCP`), but Wrangler scopes DO namespaces
+(`GmailMCP`, `XeroMCP`, `OpticalMCP`), but Wrangler scopes DO namespaces
 per-environment, so dev grant state is fully isolated from prod.
 
 ## Development
@@ -327,7 +361,7 @@ Access policy by hitting the deployed `/authorize` URL.
   Durable Object (`packages/scaffold/src/token-broker.ts`) which serialises
   refresh + slot persistence; the underlying rotation logic lives in
   `packages/scaffold/src/refresh.ts`. Xero rotates on every use (60-day
-  idle expiry); Google's are long-lived.
+  idle expiry), as does Optical (90-day idle expiry); Google's are long-lived.
 - **Attachment staging** (optional): provider apps that bind R2 + D1 +
   `STAGING_*` vars expose a `register_file_handle` MCP tool, a
   `POST /staging/upload` + `GET /staging/fetch/<handle>` HTTP surface, and
@@ -337,7 +371,7 @@ Access policy by hitting the deployed `/authorize` URL.
 
 ## Adding a new provider
 
-1. Create `packages/providers/<name>/` mirroring `gmail` or `xero`:
+1. Create `packages/providers/<name>/` mirroring `gmail`, `xero`, or `optical`:
    `index.ts` (the `ApiProvider` value), `surface-review.ts`, `spec.json`,
    `elicit-renderers.ts`.
 2. Add a spec loader under `packages/spec-loaders/` if the spec needs
@@ -353,5 +387,6 @@ Access policy by hitting the deployed `/authorize` URL.
 
 - `docs/cloudflare-getting-started.md` — onboarding for Cloudflare newcomers.
 - `apps/xero/README.md` — worked example of per-app setup.
+- `apps/optical/README.md` — Optical setup against your own Optical deployment.
 - `infra/README.md` — OpenTofu stack detail.
 - `packages/scaffold/SECURITY.md` — security model + the audit/redaction defaults.

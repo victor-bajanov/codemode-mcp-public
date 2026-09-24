@@ -32,7 +32,7 @@ const XERO_SUMMARY = "Retrieves the full chart of accounts";
  * field shapes the real specs actually use:
  *   - description only          → every Gmail op (79/79, zero summaries)
  *   - summary only              → 260 of Xero's 283 ops
- *   - both                      → 19 Xero ops
+ *   - both                      → 19 Xero ops, and all 33 optical ops
  *   - neither                   → 4 Xero ops
  * The ACCESS text has to be reachable whichever field the client's search code
  * reads, so every state below is exercised in the summary-bearing shape too.
@@ -62,7 +62,7 @@ function makeSpec() {
         post: { operationId: "sum.elicitedInspected", summary: XERO_SUMMARY },
       },
       "/sumUnlisted": { post: { operationId: "sum.unlisted", summary: XERO_SUMMARY } },
-      // both (the 19 Xero ops)
+      // both (optical / the 19 Xero ops)
       "/both": { post: { operationId: "op.both", summary: XERO_SUMMARY, description: GOOGLE_TEXT } },
       // neither (the 4 Xero ops)
       "/neither": { post: { operationId: "op.neither" } },
@@ -347,7 +347,7 @@ describe("annotateSpecWithSurfaceReview — the summary marker", () => {
     }
   });
 
-  it("annotates BOTH fields when the operation has both (19 Xero ops)", () => {
+  it("annotates BOTH fields when the operation has both (optical, 19 Xero ops)", () => {
     expect(descOf(out, "/both", "post").startsWith(GOOGLE_TEXT)).toBe(true);
     expect(annotationOf(out, "/both", "post")).toContain("NOTE-BOTH-FIELDS");
     expect(summaryOf(out, "/both", "post").startsWith(XERO_SUMMARY)).toBe(true);

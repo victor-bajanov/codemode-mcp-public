@@ -19,7 +19,7 @@ variable "allowed_emails" {
 # infra you pay for. This map keeps such grants scoped to the worker that
 # needs them.
 #
-# Keys are `worker_name` as passed to the module ("gmail", "xero-dev", …),
+# Keys are `worker_name` as passed to the module ("gmail", "optical-dev", …),
 # NOT the module label — those differ for the dev deployments. An unknown key
 # is silently ignored rather than erroring, so a typo shows up as a missing
 # grant at the Access challenge; grep the plan output if a grant seems absent.
@@ -28,7 +28,7 @@ variable "allowed_emails" {
 # the release denylist) rather than being written literally here — the tracked
 # tree stays free of addresses that would need their own redaction rules.
 variable "extra_allowed_emails" {
-  description = "Per-worker additional Access emails, keyed by worker_name (e.g. {\"gmail-tester\" = [\"tester@example.com\"]}). Merged on top of allowed_emails for that worker only. Set via TF_VAR_extra_allowed_emails."
+  description = "Per-worker additional Access emails, keyed by worker_name (e.g. {\"optical\" = [\"tester@example.com\"]}). Merged on top of allowed_emails for that worker only. Set via TF_VAR_extra_allowed_emails."
   type        = map(list(string))
   default     = {}
 }

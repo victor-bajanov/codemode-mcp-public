@@ -36,9 +36,10 @@ function base64UrlDecode(s: string): string {
  * other charset (or a malformed word) is left verbatim. Used for the
  * human-facing elicit summary so a correctly-encoded non-ASCII Subject shows
  * its real text instead of the raw encoded-word. Display-only — never feeds a
- * security decision.
+ * security decision. Also reused by the send normalizer (normalize-subject.ts)
+ * to recover the logical subject text before mojibake repair.
  */
-function decodeEncodedWords(value: string): string {
+export function decodeEncodedWords(value: string): string {
   return value.replace(
     /=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g,
     (whole, charset: string, enc: string, text: string) => {

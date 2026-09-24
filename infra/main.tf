@@ -37,6 +37,15 @@ module "xero" {
   access_allowed_idp_ids       = var.access_allowed_idp_ids
 }
 
+module "optical" {
+  source                       = "./modules/worker"
+  cloudflare_account_id        = var.cloudflare_account_id
+  cloudflare_workers_subdomain = var.cloudflare_workers_subdomain
+  worker_name                  = "optical"
+  worker_display_name          = "Optical MCP"
+  allowed_emails               = concat(var.allowed_emails, lookup(var.extra_allowed_emails, "optical", []))
+  access_allowed_idp_ids       = var.access_allowed_idp_ids
+}
 
 module "gmail_dev" {
   source                       = "./modules/worker"
@@ -71,6 +80,15 @@ module "xero_dev" {
   access_allowed_idp_ids       = var.access_allowed_idp_ids
 }
 
+module "optical_dev" {
+  source                       = "./modules/worker"
+  cloudflare_account_id        = var.cloudflare_account_id
+  cloudflare_workers_subdomain = var.cloudflare_workers_subdomain
+  worker_name                  = "optical-dev"
+  worker_display_name          = "Optical MCP (dev)"
+  allowed_emails               = concat(var.allowed_emails, lookup(var.extra_allowed_emails, "optical-dev", []))
+  access_allowed_idp_ids       = var.access_allowed_idp_ids
+}
 
 # State migration from the previous app naming (`gmail` /
 # `xero`). The 1.1+ `moved` block re-anchors existing resources

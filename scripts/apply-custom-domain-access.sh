@@ -34,7 +34,7 @@ CUSTOM_DOMAIN="$(
 }
 
 # 1. Init + plan. The plan is written to disk and reviewed interactively before
-#    apply, so drift on the shared worker module (xero, *-dev all use
+#    apply, so drift on the shared worker module (xero, optical, *-dev all use
 #    it) is visible before anything touches Cloudflare. Expect exactly two
 #    resources to be added and zero changed/destroyed.
 op run --env-file="$REPO/infra/.env" -- \

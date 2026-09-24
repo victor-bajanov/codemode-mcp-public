@@ -101,6 +101,19 @@ export interface SurfaceReviewEntry {
    *  missing var the same as an empty policy, never fall back to a permissive
    *  default. */
   inspect?: (req: InspectRequest, env?: InspectEnv) => InspectResult;
+  /** Best-effort JSON-body normalizer, applied by the request handler BEFORE
+   *  the effective payload is resolved — so inspection, the elicit dialog, and
+   *  the upstream send all see the same normalized payload (the inspected ==
+   *  approved == sent invariant holds over the normalized bytes). Return the
+   *  replacement body, or `undefined` to leave the payload unchanged.
+   *
+   *  Scope: presentation-layer repair only (e.g. Gmail rewriting a mojibake'd
+   *  Subject header into a proper RFC 2047 encoded-word). It must never change
+   *  the semantics an inspector rules on — recipients, ids, amounts. Fail-open
+   *  by contract: a throw is treated as "no change"; repair never blocks a
+   *  request it cannot confidently improve. Only the parsed JSON channel is
+   *  normalized — rawBody/bodyBase64/multipart payloads pass through untouched. */
+  normalizeBody?: (body: unknown) => unknown;
   /** Per-op override; runs ahead of `provider.elicitRenderers[category]`. */
   elicit?: ElicitRenderer;
 }
