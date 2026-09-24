@@ -157,7 +157,7 @@ function fitCount(rows: unknown[]): number {
  * Scan-then-drill guidance, with THIS spec's real sizes measured at build time.
  *
  * The numbers are computed, never hardcoded: they differ per provider (Xero 283
- * operations, Gmail 116) and would rot as specs are regenerated.
+ * operations, Gmail 116, optical 33) and would rot as specs are regenerated.
  * Computed once per Durable Object in `init()`, not per request.
  */
 export function buildSearchStrategyBlock(annotatedSpec: unknown): string {

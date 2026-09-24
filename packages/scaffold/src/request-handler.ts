@@ -461,17 +461,36 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // `reason` stays the terse audit code; `denyMessage` is the caller-facing prose.
   let denyMessage: string | undefined;
 
+  // Provider-declared payload normalization (SurfaceReviewEntry.normalizeBody):
+  // best-effort repair of the parsed JSON body (e.g. Gmail rewriting a
+  // mojibake'd Subject into a proper RFC 2047 encoded-word), applied BEFORE the
+  // effective payload is resolved so inspection, the elicit dialog, and the
+  // upstream send all see the same normalized payload. Fail-open by contract:
+  // a normalizer that throws or returns undefined leaves the payload untouched
+  // — repair must never block a request it cannot confidently improve.
+  let nctx = ctx;
+  if (review.normalizeBody && ctx.body !== undefined && ctx.body !== null) {
+    try {
+      const replaced = review.normalizeBody(ctx.body);
+      if (replaced !== undefined) {
+        nctx = { ...ctx, body: deepFreeze(replaced) };
+      }
+    } catch {
+      /* keep the original payload */
+    }
+  }
+
   // Resolve the single effective outbound payload ONCE, before inspection, and
   // reuse it for marshalling below — so the bytes inspected and the bytes sent
   // are one and the same. Can throw ToolError (rawBody + non-string body); that
   // propagation is correct, mirroring the other deny paths.
-  const eff = resolveEffective(ctx);
+  const eff = resolveEffective(nctx);
 
   let inspectResult: InspectResult | undefined;
   if (review.inspect) {
     // One-channel guard: a legitimate caller uses exactly one body channel.
     // Supplying two is the decoy-bypass primitive (inspect one, send another) → deny.
-    if (bodyChannelCount(ctx) > 1) {
+    if (bodyChannelCount(nctx) > 1) {
       emitAudit(args, {
         deployment: args.deploymentName,
         method: ctx.method,
@@ -484,7 +503,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       });
       throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
     }
-    const derived = deriveInspectRequest(ctx, eff, INSPECT_JSON_MAX_BYTES);
+    const derived = deriveInspectRequest(nctx, eff, INSPECT_JSON_MAX_BYTES);
     if (derived.oversize) {
       emitAudit(args, {
         deployment: args.deploymentName,
@@ -543,7 +562,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       operationId: op.operationId,
       method: ctx.method,
       path: ctx.path,
-      body: ctx.body,
+      body: nctx.body,
       env: args.env,
       ...(args.relatedRequestId !== undefined ? { relatedRequestId: args.relatedRequestId } : {}),
       ...(ctx.query !== undefined ? { query: ctx.query } : {}),
@@ -617,7 +636,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
 
   // Marshal the SAME effective payload resolved before inspection, so the bytes
   // inspected and the bytes sent are one and the same.
-  const { bodyToSend, contentType: outboundContentType } = marshalBody(ctx, eff);
+  const { bodyToSend, contentType: outboundContentType } = marshalBody(nctx, eff);
   if (outboundContentType) {
     setHeader("content-type", outboundContentType);
   }

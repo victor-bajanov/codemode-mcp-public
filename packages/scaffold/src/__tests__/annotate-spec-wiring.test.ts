@@ -84,7 +84,7 @@ const descriptionOf = (spec: any, operationId: string): string => {
 // at boot is still an outage — so pin the invariant here, where a spec
 // regeneration that introduces the marker fails in CI instead.
 describe("no bundled provider spec contains the reserved marker", () => {
-  const specs = ["gmail/src/spec.json", "gmail/src/calendar.spec.json", "xero/src/spec.json"];
+  const specs = ["gmail/src/spec.json", "gmail/src/calendar.spec.json", "xero/src/spec.json", "optical/src/spec.json"];
   for (const rel of specs) {
     it(`${rel} is marker-free`, () => {
       const raw = readFileSync(`${repoRoot}/packages/providers/${rel}`, "utf-8");

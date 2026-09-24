@@ -451,7 +451,7 @@ describe("buildExecuteAddendum", () => {
   it("explains the ACCESS convention even for a provider with NO executeHint", () => {
     // Every provider's spec is annotated, so every provider's client sees
     // `[ACCESS: …]` markers. Only Gmail had a hand-written hint explaining what
-    // they mean — and, critically, what their ABSENCE means. Xero
+    // they mean — and, critically, what their ABSENCE means. Xero and optical
     // clients were shown the markers with no key.
     const addendum = buildExecuteAddendum(
       { ...dummyProvider, executeHint: undefined } as unknown as ApiProvider,

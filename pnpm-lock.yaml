@@ -73,6 +73,55 @@ importers:
         specifier: ^4.87.0
         version: 4.87.0(@cloudflare/workers-types@4.20260504.1)
 
+  apps/optical:
+    dependencies:
+      '@cloudflare/codemode':
+        specifier: 0.4.2
+        version: 0.4.2(@modelcontextprotocol/sdk@1.29.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(ai@6.0.174(zod@4.4.3))(zod@4.4.3)
+      '@cloudflare/workers-oauth-provider':
+        specifier: ^0.4.0
+        version: 0.4.0
+      '@local/providers-optical':
+        specifier: workspace:*
+        version: link:../../packages/providers/optical
+      '@local/scaffold':
+        specifier: workspace:*
+        version: link:../../packages/scaffold
+      '@local/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.29.0
+        version: 1.29.0(@cfworker/json-schema@4.1.1)(zod@4.4.3)
+      agents:
+        specifier: 0.17.1
+        version: 0.17.1(@babel/core@7.29.0)(@babel/runtime@7.29.2)(@cloudflare/workers-types@4.20260504.1)(ai@6.0.174(zod@4.4.3))(react@19.2.5)(rolldown@1.0.0-rc.18)(vite@5.4.21(@types/node@22.19.17))(zod@4.4.3)
+      hono:
+        specifier: ^4.5.0
+        version: 4.12.16
+      zod:
+        specifier: ^4.0.0
+        version: 4.4.3
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: ^0.12.21
+        version: 0.12.21(@cloudflare/workers-types@4.20260504.1)(@vitest/runner@4.1.5)(@vitest/snapshot@4.1.5)(vitest@3.2.4(@types/node@22.19.17))
+      '@cloudflare/workers-types':
+        specifier: ^4.20260504.0
+        version: 4.20260504.1
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.17
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.4(@types/node@22.19.17)
+      wrangler:
+        specifier: ^4.87.0
+        version: 4.87.0(@cloudflare/workers-types@4.20260504.1)
+
   apps/xero:
     dependencies:
       '@cloudflare/codemode':
@@ -123,6 +172,25 @@ importers:
         version: 4.87.0(@cloudflare/workers-types@4.20260504.1)
 
   packages/providers/gmail:
+    dependencies:
+      '@local/scaffold':
+        specifier: workspace:*
+        version: link:../../scaffold
+      '@local/shared':
+        specifier: workspace:*
+        version: link:../../shared
+      '@local/spec-loaders-google-discovery':
+        specifier: workspace:*
+        version: link:../../spec-loaders/google-discovery
+    devDependencies:
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.4(@types/node@22.19.17)
+
+  packages/providers/optical:
     dependencies:
       '@local/scaffold':
         specifier: workspace:*

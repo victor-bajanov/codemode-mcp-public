@@ -1,0 +1,93 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { handleUpstreamRequest, getOrRefreshAccessToken } from "@local/scaffold";
+import { spec, surfaceReview } from "@local/providers-optical";
+
+function makeFakeBroker() {
+  const data = new Map<string, unknown>();
+  const storage = {
+    get: async <T>(k: string) => data.get(k) as T | undefined,
+    put: async <T>(k: string, v: T) => { data.set(k, v); },
+  };
+  return {
+    async getOrRefreshAccessToken(args: { userId: string; refreshToken: string }) {
+      return getOrRefreshAccessToken({
+        storage,
+        rotation: "rotating",
+        refreshToken: args.refreshToken,
+        clientId: "CID",
+        clientSecret: "CSEC",
+        tokenUrl: "https://scheduler.example.com/oauth/token",
+      });
+    },
+  };
+}
+
+const baseProps = {
+  refreshToken: "RT-fake",
+  userId: "operator",
+  email: "operator@example.com",
+};
+
+const baseScaffoldArgs = {
+  spec,
+  surfaceReview,
+  props: baseProps,
+  apiBaseUrl: "https://scheduler.example.com",
+  deploymentName: "optical-test",
+  server: {} as never,
+  oauth: {
+    refreshTokenAccessor: (p: typeof baseProps) => p.refreshToken,
+    userIdAccessor: (p: typeof baseProps) => p.userId,
+    broker: makeFakeBroker(),
+  },
+  audit: {},
+  env: {} as { ALLOW_PII_IN_LOGS?: string },
+};
+
+describe("optical adversarial: surface-review enforcement", () => {
+  beforeEach(() => {
+    // Default mock: any token-exchange call returns a fresh pair; any API call returns 200 {}.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/oauth/token")) {
+        return new Response(
+          JSON.stringify({
+            access_token: "AT-fake",
+            refresh_token: "RT-fake-rotated",
+            expires_in: 3600,
+            token_type: "Bearer",
+            scope: "read write",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("denies unrecognised paths before any fetch", async () => {
+    await expect(
+      handleUpstreamRequest({
+        ...baseScaffoldArgs,
+        ctx: { method: "GET", path: "/v1/not-a-real-endpoint" },
+      }),
+    ).rejects.toThrow(/No operation found/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("allows listTasks through to the upstream Bearer-protected endpoint", async () => {
+    await handleUpstreamRequest({
+      ...baseScaffoldArgs,
+      ctx: { method: "GET", path: "/v1/tasks" },
+    });
+    // The first fetch is the /oauth/token exchange (fake broker mints on first use),
+    // the second is the upstream /v1/tasks call.
+    const calls = (globalThis.fetch as unknown as { mock: { calls: [string | URL][] } }).mock.calls;
+    const apiCall = calls.find(([u]) => String(u).includes("/v1/tasks"));
+    expect(apiCall, "expected an outbound /v1/tasks call").toBeDefined();
+  });
+});
