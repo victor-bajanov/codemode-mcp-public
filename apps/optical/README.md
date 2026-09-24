@@ -2,8 +2,7 @@
 
 Cloudflare Worker MCP server that fronts the externally-deployed
 `weekly-scheduling-assistant` API (`scheduler.example.com`) as a
-codemode-mcp provider. See the design at
-[`docs/superpowers/specs/2026-05-23-optical-provider-design.md`](../../docs/superpowers/specs/2026-05-23-optical-provider-design.md).
+codemode-mcp provider. 
 
 ## Setup
 
