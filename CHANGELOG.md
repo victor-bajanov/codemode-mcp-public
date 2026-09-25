@@ -2,6 +2,10 @@
 
 Curated notes for each public release. Newest first. (The auto-generated commit list for a release lives in that release's PR on the public mirror; this file is the readable summary.)
 
+## v1.0.2 — 2026-09-25
+
+**License scope.** The `LICENSE` Licensed Work parameter now reads "Codemode MCP Scaffold 0.1 or later", so the Business Source License terms explicitly cover the 1.x releases rather than naming only 0.1. The terms themselves are unchanged.
+
 ## v1.0.1 — 2026-09-25
 
 **Optical: self-contained README.** `apps/optical/README.md` no longer links to internal design and planning docs that are not in the public repo. The setup prerequisites are now written out in full: where to set your deployment's endpoints, why it must be on a Custom Domain, and two `curl` checks (`/v1/tasks` and `/oauth/userinfo`) that confirm it serves the API the vendored spec expects. The example PKCE client registration now uses the scopes the provider actually requests (`scheduler:read scheduler:write`). The old `read write` value would have failed at `/oauth/authorize` with `invalid_scope`.
