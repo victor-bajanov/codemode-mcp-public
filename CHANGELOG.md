@@ -2,6 +2,10 @@
 
 Curated notes for each public release. Newest first. (The auto-generated commit list for a release lives in that release's PR on the public mirror; this file is the readable summary.)
 
+## v1.0.1 — 2026-09-25
+
+**Optical: self-contained README.** `apps/optical/README.md` no longer links to internal design and planning docs that are not in the public repo. The setup prerequisites are now written out in full: where to set your deployment's endpoints, why it must be on a Custom Domain, and two `curl` checks (`/v1/tasks` and `/oauth/userinfo`) that confirm it serves the API the vendored spec expects. The example PKCE client registration now uses the scopes the provider actually requests (`scheduler:read scheduler:write`). The old `read write` value would have failed at `/oauth/authorize` with `invalid_scope`.
+
 ## v1.0.0 — 2026-09-24
 
 **Optical provider ships publicly.** This is the headline change, and the reason for the 1.0 version: it is the first public release with all three providers (Gmail + Calendar, Xero, Optical). Optical is a separate, self-hosted scheduling backend. You describe work as tasks with timing constraints, grouped into projects or generated from recurring templates, and a solver packs them into a week that you preview, accept, and commit to Google Calendar. The codemode-mcp provider (`packages/providers/optical`, app `apps/optical`) is published as a reference: it does not come with a hosted backend, and its endpoints ship as `example.com` placeholders. Point it at your own Optical deployment by editing the provider's `apiBaseUrl` and OAuth URLs, or per environment with the `API_BASE_URL_OVERRIDE` / `OAUTH_{AUTHORIZE,TOKEN,USERINFO}_URL_OVERRIDE` Wrangler vars. The app ships with `prod` and `dev` environments, OpenTofu modules for both, and a `scripts/bootstrap-optical.sh` that runs the Tofu apply, KV-id paste, secrets, and deploy in one pass.

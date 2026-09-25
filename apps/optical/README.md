@@ -1,8 +1,8 @@
 # `apps/optical`
 
-Cloudflare Worker MCP server that fronts the externally-deployed
-`weekly-scheduling-assistant` API (`scheduler.example.com`) as a
-codemode-mcp provider. 
+Cloudflare Worker MCP server that fronts an externally-deployed Optical
+(`weekly-scheduling-assistant`) API as a codemode-mcp provider. Optical itself
+lives in a separate repo; point this provider at your own deployment.
 
 ## Setup
 
@@ -12,9 +12,36 @@ once. Before doing so, complete the **prerequisites** below.
 
 ### Prerequisites
 
-1. **Optical-side changes have landed.** Verify by running the Task 0 checks
-   in
-   [`docs/superpowers/plans/2026-05-23-optical-provider.md`](../../docs/superpowers/plans/2026-05-23-optical-provider.md).
+1. **Your Optical deployment is reachable and serves the vendored API.**
+   Set the prod endpoints in `packages/providers/optical/src/index.ts`
+   (`apiBaseUrl`, `oauth.authorizeUrl`, `oauth.tokenUrl`,
+   `oauth.userInfoUrl`). The dev env repoints them through the
+   `API_BASE_URL_OVERRIDE` / `OAUTH_{AUTHORIZE,TOKEN,USERINFO}_URL_OVERRIDE`
+   vars in `wrangler.jsonc`. Serve Optical on a Custom Domain, not
+   `workers.dev`: Cloudflare refuses same-account Worker to `workers.dev`
+   fetches (error 1042), which breaks the `/callback` token exchange.
+
+   Then check the deployment with a bearer token from Optical's own login
+   flow (for example its device-code flow):
+
+   ```bash
+   OPTICAL=https://scheduler.example.com   # your deployment
+
+   # The provider calls /v1/* paths from the vendored spec — expect 200
+   curl -sS -o /dev/null -w '%{http_code}
+' 
+     -H "Authorization: Bearer " "/v1/tasks"
+
+   # The OAuth flow reads the user identity here — expect 200 and JSON
+   # with at least `sub` (`email` is optional)
+   curl -sS -H "Authorization: Bearer " "/oauth/userinfo"
+   ```
+
+   If `/v1/tasks` returns 404, your deployment's API differs from the
+   vendored spec; re-vendor from your Optical checkout (see
+   [Spec re-sync](#spec-re-sync)). Optical's `/oauth/token` must also accept
+   (and ignore) the `client_secret` form field the provider sends. Stock
+   Optical does, and first-time consent exercises it.
 
 2. **PKCE client registered in optical's `oauth_clients` D1 table** —
    one row per environment (prod + dev). From the **optical** repo
@@ -26,7 +53,7 @@ once. Before doing so, complete the **prerequisites** below.
      INSERT INTO oauth_clients (id, name, type, redirect_uris, scopes, created_at)
      VALUES ('codemode-mcp-optical', 'codemode-mcp (optical prod)', 'pkce',
              '[\"https://optical.<your-subdomain>.workers.dev/callback\"]',
-             'read write', datetime('now'))
+             'scheduler:read scheduler:write', datetime('now'))
      ON CONFLICT(id) DO UPDATE SET redirect_uris=excluded.redirect_uris;
    "
 
@@ -35,10 +62,14 @@ once. Before doing so, complete the **prerequisites** below.
      INSERT INTO oauth_clients (id, name, type, redirect_uris, scopes, created_at)
      VALUES ('codemode-mcp-optical-dev', 'codemode-mcp (optical dev)', 'pkce',
              '[\"https://optical-dev.<your-subdomain>.workers.dev/callback\"]',
-             'read write', datetime('now'))
+             'scheduler:read scheduler:write', datetime('now'))
      ON CONFLICT(id) DO UPDATE SET redirect_uris=excluded.redirect_uris;
    "
    ```
+
+   The `scopes` column must list exactly the scopes the provider requests
+   (`scheduler:read scheduler:write`). Optical's `/oauth/authorize` rejects
+   anything outside it with `error=invalid_scope`.
 
    Capture the client id values; they go into the prod and dev 1Password
    items referenced by `scripts/bootstrap-optical.sh`. `client_secret` can be
@@ -87,8 +118,8 @@ secrets to both environments, and deploys.
   consent flow. Not a code path codemode-mcp can recover from; sign in to
   the IdP and retry.
 - **No file attachments / no staging bindings.** Unlike Gmail/Xero,
-  `apps/optical/wrangler.jsonc` has no R2/D1/STAGING_* bindings and no
-  `triggers.crons`. Optical's API is pure JSON.
+  `apps/optical/wrangler.jsonc` has no R2/D1/STAGING_* bindings. Optical's API is pure JSON. (Its
+  `*/5` cron only drives the shared OAuth inactive-client sweep.)
 
 ## Spec re-sync
 
