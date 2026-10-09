@@ -96,11 +96,19 @@ describe("calendar attendee note states what inspectEventAttendees does", () => 
     }
   });
 
-  it("resource attendees are exempt, as the note claims", () => {
+  it("only Google room/equipment calendars are exempt, as the note claims", () => {
+    const ROOM = "room-101@resource.calendar.google.com";
     for (const op of OPS) {
-      const result = run(op, { body: { attendees: [{ email: OFF_LIST, resource: true }] } }, ENV);
-      expect(result.decision, `${op} resource attendee`).toBe("allow");
-      expect(noteOf(op), `${op} note`).toMatch(/resource.*exempt/is);
+      // A real Workspace room: flagged AND at the resource-calendar domain.
+      const room = run(op, { body: { attendees: [{ email: ROOM, resource: true }] } }, ENV);
+      expect(room.decision, `${op} room`).toBe("allow");
+      // The flag alone exempts nothing (F-9)...
+      const flagged = run(op, { body: { attendees: [{ email: OFF_LIST, resource: true }] } }, ENV);
+      expect(flagged.decision, `${op} flagged external`).toBe("deny");
+      // ...and nor does the domain without the flag.
+      const unflagged = run(op, { body: { attendees: [{ email: ROOM }] } }, ENV);
+      expect(unflagged.decision, `${op} unflagged room address`).toBe("deny");
+      expect(noteOf(op), `${op} note`).toMatch(/only google rooms\/equipment.*resource: true.*resource\.calendar\.google\.com.*exempt/is);
     }
   });
 
@@ -180,18 +188,26 @@ describe("filters.create note states what inspectFilterCreate does", () => {
   const OP = "gmail.users.settings.filters.create";
 
   it("each action branch behaves as the note claims", () => {
-    expect(run(OP, { body: { action: { delete: true } } }).decision).toBe("deny");
     expect(run(OP, { body: { action: { forward: "x@y.test" } } }).decision).toBe("deny");
     expect(run(OP, { body: { action: { forwardingEmail: "x@y.test" } } }).decision).toBe("deny");
+    expect(run(OP, { body: { action: { addLabelIds: ["TRASH"] } } }).decision).toBe("elicit");
+    expect(run(OP, { body: { action: { addLabelIds: ["SPAM"] } } }).decision).toBe("elicit");
     expect(run(OP, { body: { action: { removeLabelIds: ["INBOX"] } } }).decision).toBe("elicit");
     expect(run(OP, { body: { action: { addLabelIds: ["Label_1"] } } }).decision).toBe("allow");
     expect(run(OP, { body: {} }).decision).toBe("deny");
+    expect(run(OP, { body: { action: { add_label_ids: ["TRASH"] } } }).decision).toBe("elicit");
+    expect(run(OP, { body: { action: { remove_label_ids: ["INBOX"] } } }).decision).toBe("elicit");
+    expect(run(OP, { body: { action: { delete: true } } }).decision).toBe("deny");
 
     const note = noteOf(OP);
-    expect(note).toMatch(/`?delete: true`? is denied/i);
+    // `delete` is not a FilterAction field (F-8); it is refused only by the
+    // generic unknown-key rule, so the note must not single it out.
+    expect(note).not.toMatch(/delete: true/i);
     expect(note).toMatch(/forward.*denied/i);
+    expect(note).toMatch(/TRASH.*SPAM.*needs interactive approval/is);
     expect(note).toMatch(/INBOX.*needs interactive approval/is);
-    expect(note).toMatch(/no `?action`? object is denied/i);
+    expect(note).toMatch(/action` key other than.*denied/is);
+    expect(note).toMatch(/no `?action`? object.*denied/is);
     // The one branch that passes must not be described as blocked.
     expect(note).toMatch(/label-only actions pass/i);
   });

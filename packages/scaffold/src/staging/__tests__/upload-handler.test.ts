@@ -132,4 +132,78 @@ describe("handleUpload", () => {
     });
     expect(res.status).toBe(410);
   });
+
+  // F-13: the size cap is enforced while streaming, so a body with no
+  // Content-Length cannot make the worker buffer more than maxBytes + one chunk.
+  function countingStream(totalBytes: number, chunk: number) {
+    const state = { pulled: 0 };
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (state.pulled >= totalBytes) { c.close(); return; }
+        const n = Math.min(chunk, totalBytes - state.pulled);
+        state.pulled += n;
+        c.enqueue(new Uint8Array(n).fill(7));
+      },
+      // No read-ahead: a chunk is produced only when the consumer asks for it,
+      // so `pulled` measures what the handler consumed.
+    }, { highWaterMark: 0 });
+    return { stream, state };
+  }
+
+  it("413 and stream cancelled once a chunked body passes maxBytes; nothing persisted", async () => {
+    const now = nowSec();
+    const { d1, r2, token } = await seedPending(now, now + 300);
+    const small: StagingConfig = { ...CFG, maxBytes: 256 };
+    const { stream, state } = countingStream(64 * 1024, 64);
+    const req = new Request("https://example.test/staging/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+      body: stream,
+      // @ts-expect-error — Node fetch needs duplex for stream bodies
+      duplex: "half",
+    });
+    expect(req.headers.get("Content-Length")).toBeNull();
+    const res = await handleUpload(req, {
+      STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: small, now: () => now + 1,
+    });
+    expect(res.status).toBe(413);
+    // At most one chunk past the cap is ever pulled.
+    expect(state.pulled).toBeLessThanOrEqual(small.maxBytes + 64);
+    expect(r2.store.size).toBe(0);
+    const row = [...d1.rows.values()][0]!;
+    expect(row.state).toBe("pending");
+  });
+
+  it("a chunked body within maxBytes still uploads (204) with the right length", async () => {
+    const now = nowSec();
+    const { d1, r2, token } = await seedPending(now, now + 300);
+    const { stream } = countingStream(1000, 64);
+    const req = new Request("https://example.test/staging/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+      body: stream,
+      // @ts-expect-error — Node fetch needs duplex for stream bodies
+      duplex: "half",
+    });
+    const res = await handleUpload(req, {
+      STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => now + 1,
+    });
+    expect(res.status).toBe(204);
+    expect(r2.store.size).toBe(1);
+    expect([...r2.store.values()][0]!.byteLength).toBe(1000 + 16); // GCM tag
+  });
+
+  it("a request with no body is a zero-byte upload", async () => {
+    const now = nowSec();
+    const { d1, r2, token } = await seedPending(now, now + 300);
+    const req = new Request("https://example.test/staging/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+    });
+    const res = await handleUpload(req, {
+      STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => now + 1,
+    });
+    expect(res.status).toBe(204);
+    expect([...r2.store.values()][0]!.byteLength).toBe(16);
+  });
 });

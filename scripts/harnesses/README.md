@@ -4,7 +4,9 @@ Operator-runnable harnesses for the security-review remediations on this
 branch. They drive `wrangler dev` plus a real MCP client to exercise the
 parts that unit tests can't reach: the actual OAuth/PKCE round-trip, the
 audit-log emission shape under both `ALLOW_PII_IN_LOGS` settings, and the
-boot-time `COOKIE_ENCRYPTION_KEY` assertion.
+boot-time `COOKIE_ENCRYPTION_KEY` assertion. The key is no longer only
+asserted: since the 2026-10-07 security review it signs the `/authorize`
+consent form tokens, so a missing or short key also breaks sign-in.
 
 The harnesses are **not** run in CI. They require operator-supplied
 credentials and a browser. Use them when you want a live check before a
@@ -22,7 +24,7 @@ paths.
    ```
    GOOGLE_CLIENT_ID=...
    GOOGLE_CLIENT_SECRET=...
-   COOKIE_ENCRYPTION_KEY=...            # >=32 chars; openssl rand -base64 32
+   COOKIE_ENCRYPTION_KEY=...            # >=32 chars; signs the consent form; openssl rand -base64 32
    ```
 
 4. **`pnpm install`** at the repo root has been run at least once. The
@@ -42,8 +44,15 @@ What happens:
   `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport` with a
   custom `OAuthClientProvider`.
 - When the MCP transport throws `UnauthorizedError`, the harness opens
-  the browser to the worker's `/authorize` URL (which then redirects to
-  Google with `code_challenge` + `code_challenge_method=S256`).
+  the browser to the worker's `/authorize` URL. The worker shows its
+  consent page (client name, redirect URI, scopes); click **Approve**
+  within five minutes, and the worker then redirects to Google with
+  `code_challenge` + `code_challenge_method=S256`. The consent and
+  browser-binding cookies are `__Host-` (Secure) cookies, so use a
+  browser that treats `http://localhost` as a secure context (current
+  Chrome and Firefox do); otherwise the approval is refused as expired.
+- The harness's own client registers a loopback `http://` redirect URI
+  and sends PKCE S256, which `/register` and `/authorize` now require.
 - After you complete consent, Google redirects back to
   `http://localhost:8787/callback`, which exchanges the code (with the
   PKCE `code_verifier` from the KV state envelope) for tokens.

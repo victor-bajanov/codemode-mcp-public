@@ -25,6 +25,33 @@ export interface RefreshArgs {
 
 const SKEW_MS = 30_000;
 
+/** Shape an OAuth `error` code must have to be echoed in errors and logs. */
+const OAUTH_ERROR_CODE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/**
+ * Extract the RFC 6749 §5.2 `error` code from a token-endpoint error body, or
+ * `undefined` when the body is not JSON, has no string `error`, or the code is
+ * not a short token-shaped string. Only this code is ever surfaced: the rest
+ * of the body is upstream-controlled text (and, from a misconfigured echoing
+ * endpoint, could contain the request's own credentials).
+ */
+export function oauthErrorCode(body: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const code = (parsed as { error?: unknown }).error;
+    return typeof code === "string" && OAUTH_ERROR_CODE_RE.test(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `Refresh failed <status>` plus ` (<error>)` when the body names a qualifying code. */
+function refreshFailureMessage(status: number, body: string): string {
+  const code = oauthErrorCode(body);
+  return code ? `Refresh failed ${status} (${code})` : `Refresh failed ${status}`;
+}
+
 export async function hashRefreshToken(token: string): Promise<string> {
   const bytes = new TextEncoder().encode(token);
   const buf = await crypto.subtle.digest("SHA-256", bytes);
@@ -33,6 +60,16 @@ export async function hashRefreshToken(token: string): Promise<string> {
     .join("");
 }
 
+/**
+ * Return a valid upstream access token for the grant seeded by
+ * `args.refreshToken`, refreshing it upstream when the cached one is missing
+ * or within {@link SKEW_MS} of expiry.
+ *
+ * A non-2xx refresh throws `Error("Refresh failed <status>")`, with
+ * ` (<error>)` appended when the token endpoint returned JSON carrying a
+ * token-shaped OAuth `error` code (F-21). The response body itself is neither
+ * included in the error (which reaches the sandbox and the model) nor logged.
+ */
 export async function getOrRefreshAccessToken(args: RefreshArgs): Promise<string> {
   const f = args.fetcher ?? fetch;
   const seedKey = await hashRefreshToken(args.refreshToken);
@@ -71,7 +108,7 @@ export async function getOrRefreshAccessToken(args: RefreshArgs): Promise<string
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`Refresh failed ${res.status}: ${text}`);
+    throw new Error(refreshFailureMessage(res.status, text));
   }
   const json = JSON.parse(text) as {
     access_token: string;

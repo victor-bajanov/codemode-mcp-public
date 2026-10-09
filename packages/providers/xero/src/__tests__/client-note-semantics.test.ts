@@ -152,6 +152,64 @@ describe("bank-transaction notes state what inspectBankTxCreate does", () => {
   });
 });
 
+// F-10: Xero's deserialiser matches property names case-insensitively and
+// coerces "true", so a note's "is denied" claim must hold however the gated key
+// is spelt and whichever lenient truthy value it carries, not only for the
+// exact spelling the note uses.
+describe("the notes' denial claims survive Xero's lenient parsing", () => {
+  const draftCases = [
+    { ops: INVOICE_OPS, arrayKey: "Invoices", idField: "InvoiceID" },
+    { ops: CREDIT_NOTE_OPS, arrayKey: "CreditNotes", idField: "CreditNoteID" },
+  ];
+
+  it("a Status the note omits is denied under any key casing, wrapper casing included", () => {
+    for (const { ops, arrayKey, idField } of draftCases) {
+      for (const op of ops) {
+        const advertised = new Set(advertisedValues(noteOf(op), "Status"));
+        for (const status of ALL_STATUSES.filter((s) => !advertised.has(s))) {
+          for (const statusKey of ["status", "STATUS"]) {
+            for (const wrapper of [arrayKey, arrayKey.toLowerCase()]) {
+              const decision = run(op, { body: { [wrapper]: [{ [statusKey]: status, [idField]: "id-1" }] } }).decision;
+              expect(decision, `${op} ${wrapper}[].${statusKey}=${status}`).toBe("deny");
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it("SentToContact is denied for every lenient truthy spelling", () => {
+    for (const { ops, arrayKey, idField } of draftCases) {
+      for (const op of ops) {
+        for (const [key, value] of [["SentToContact", "true"], ["SentToContact", 1], ["sentToContact", true]] as const) {
+          const result = run(op, { body: { [arrayKey]: [{ Status: "DRAFT", [idField]: "id-1", [key]: value }] } });
+          expect(result.decision, `${op} ${key}=${JSON.stringify(value)}`).toBe("deny");
+        }
+      }
+    }
+  });
+
+  it("a Type or Status the bank-transaction note omits is denied under any key casing", () => {
+    for (const op of BANK_TX_OPS) {
+      expect(run(op, { body: { BankTransactions: [{ type: "TRANSFER" }] } }).decision, op).toBe("deny");
+      const advertised = new Set(advertisedValues(noteOf(op), "Status"));
+      for (const status of ALL_STATUSES.filter((s) => !advertised.has(s))) {
+        const decision = run(op, { body: { banktransactions: [{ Type: "SPEND", status }] } }).decision;
+        expect(decision, `${op} status=${status}`).toBe("deny");
+      }
+    }
+  });
+
+  it("IsReconciled is denied for every lenient truthy spelling", () => {
+    for (const op of BANK_TX_OPS) {
+      for (const [key, value] of [["IsReconciled", "true"], ["IsReconciled", 1], ["isReconciled", true]] as const) {
+        const result = run(op, { body: { BankTransactions: [{ Type: "SPEND", [key]: value }] } });
+        expect(result.decision, `${op} ${key}=${JSON.stringify(value)}`).toBe("deny");
+      }
+    }
+  });
+});
+
 // MUST-FIX A: the journals note previously called `/Journals` "the manual-journals
 // ledger" and steered the model away from it. `/Journals` is the general-ledger
 // journal-lines endpoint (accounting.journals.read, ungranted); ManualJournals is

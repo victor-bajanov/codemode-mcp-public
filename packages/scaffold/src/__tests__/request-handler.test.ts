@@ -9,6 +9,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleUpstreamRequest, type UpstreamCtx } from "../request-handler";
 import { getOrRefreshAccessToken } from "../refresh";
+import { ToolError } from "../elicit";
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { SurfaceReview } from "@local/shared";
 
@@ -1206,5 +1207,519 @@ describe("inspection operates on the effective payload", () => {
         ),
       ).resolves.toBeDefined();
     });
+  });
+});
+
+describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  const HARD_SPEC: OpenApiSpec = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/things/{id}": {
+        get: { operationId: "getThing", responses: { "200": { description: "OK" } } },
+        delete: { operationId: "deleteThing", responses: { "200": { description: "OK" } } },
+      },
+      // Listed first so the WIRE path "/items/labels/1" resolves here, while the
+      // raw path "/items/lab%65ls/1" skips it (literal mismatch) and matches below.
+      "/items/labels/{id}": {
+        get: { operationId: "getLabelItem", responses: { "200": { description: "OK" } } },
+      },
+      "/items/{kind}/{id}": {
+        get: { operationId: "getItem", responses: { "200": { description: "OK" } } },
+      },
+      "/send": { post: { operationId: "send", responses: { "200": { description: "OK" } } } },
+      "/plain": { post: { operationId: "plain", responses: { "200": { description: "OK" } } } },
+    },
+    components: { schemas: {} },
+  };
+  const inspectSpy = vi.fn((_req: unknown) => ({ decision: "allow" as const }));
+  const HARD_SR: SurfaceReview = {
+    getThing: { decision: "allow", category: "standard_read" },
+    deleteThing: { decision: "elicit", category: "irreversible" },
+    getLabelItem: { decision: "allow", category: "standard_read" },
+    getItem: { decision: "allow", category: "standard_read" },
+    send: { decision: "allow", inspect: (req) => inspectSpy(req) },
+    plain: { decision: "allow" },
+  };
+
+  function hardArgs(ctx: UpstreamCtx, fetchImpl?: typeof fetch) {
+    const fetchSpy = fetchImpl ? vi.fn(fetchImpl) : makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+    const audit = captureAudit();
+    const elicitInput = vi.fn(async () => ({ action: "accept", content: {} }));
+    const putFile = vi.fn(async () => ({
+      ok: true as const, file_handle: "fh", token: "t", fetch_url: "https://x/f", expires_at: 1, byte_length: 1,
+    }));
+    return {
+      fetchSpy,
+      audit,
+      elicitInput,
+      putFile,
+      args: {
+        ctx,
+        spec: HARD_SPEC,
+        surfaceReview: HARD_SR,
+        apiBaseUrl: "https://api.example.com",
+        deploymentName: "test",
+        props: { refreshToken: "RT-1", userId: "test-user" },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        server: { getClientCapabilities: () => ({ elicitation: {} }), elicitInput } as any,
+        env: {} as { ALLOW_PII_IN_LOGS?: string },
+        audit: {},
+        oauth: {
+          refreshTokenAccessor: (p: Record<string, unknown>) => p.refreshToken as string,
+          userIdAccessor: (p: Record<string, unknown>) => p.userId as string | undefined,
+          broker: makeFakeBroker(),
+        },
+        putFile,
+      },
+    };
+  }
+
+  function upstreamCalls(fetchSpy: ReturnType<typeof vi.fn>) {
+    return fetchSpy.mock.calls.filter((c) => !String(c[0]).includes("/token"));
+  }
+
+  function sentBody(fetchSpy: ReturnType<typeof vi.fn>): string {
+    const call = upstreamCalls(fetchSpy)[0]!;
+    const body = (call[1] as RequestInit).body;
+    return typeof body === "string" ? body : new TextDecoder().decode(body as Uint8Array);
+  }
+
+  describe("unsafe path segments are refused before anything else (F-1, F-6)", () => {
+    const UNSAFE_PATHS = [
+      "/things/..",
+      "/things/.",
+      "/things/%2e%2E",
+      "/things/a\\b",
+      "/things/a?trash=true",
+      "/things/a#frag",
+      "/things/a%2Fb",
+      "/things/a%00b",
+      "/things/a\tb",
+      "/things/100%",
+      "/items/labels/..\\things\\abc",
+    ];
+    for (const path of UNSAFE_PATHS) {
+      it(`${JSON.stringify(path)} → url_safety audit, no fetch, no token mint, no elicitation`, async () => {
+        inspectSpy.mockClear();
+        const h = hardArgs({ method: "DELETE", path });
+        await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/disallowed segment/);
+        expect(h.fetchSpy).not.toHaveBeenCalled(); // token mint goes through fetch too
+        expect(h.elicitInput).not.toHaveBeenCalled();
+        expect(h.audit.read().at(-1)).toMatchObject({
+          decision: "deny",
+          category: "url_safety",
+          reason: "unsafe-path-segment",
+        });
+      });
+    }
+  });
+
+  it("re-resolving the built URL to a different operation → url_safety deny, no fetch (F-1)", async () => {
+    const h = hardArgs({ method: "GET", path: "/items/lab%65ls/1" });
+    await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/different operation/);
+    expect(h.fetchSpy).not.toHaveBeenCalled();
+    expect(h.audit.read().at(-1)).toMatchObject({
+      decision: "deny",
+      category: "url_safety",
+      reason: "operation-mismatch-after-url-build",
+      operationId: "getItem",
+    });
+  });
+
+  it("the fetch URL carries the template-built, percent-encoded wire path", async () => {
+    const h = hardArgs({ method: "GET", path: "/things/my file+v2", query: { q: "x" } });
+    await handleUpstreamRequest(h.args);
+    const url = new URL(String(upstreamCalls(h.fetchSpy)[0]![0]));
+    expect(url.pathname).toBe("/things/my%20file%2Bv2");
+    expect(url.searchParams.get("q")).toBe("x");
+
+    const h2 = hardArgs({ method: "GET", path: "/things/user%40example.com" });
+    await handleUpstreamRequest(h2.args);
+    expect(String(upstreamCalls(h2.fetchSpy)[0]![0])).toBe("https://api.example.com/things/user%40example.com");
+  });
+
+  describe("inspected raw JSON is sent canonically (F-7)", () => {
+    it("duplicate keys: the inspector's view (last key wins) is what goes upstream", async () => {
+      inspectSpy.mockClear();
+      const raw = '{"to":"evil@attacker","to":"ok@allow"}';
+      const h = hardArgs({
+        method: "POST", path: "/send",
+        bodyBase64: Buffer.from(raw, "utf8").toString("base64"),
+        contentType: "application/json",
+      });
+      await handleUpstreamRequest(h.args);
+      const seen = (inspectSpy.mock.calls[0]![0] as { body: unknown }).body;
+      expect(seen).toEqual({ to: "ok@allow" });
+      expect(sentBody(h.fetchSpy)).toBe(JSON.stringify(seen));
+      expect(sentBody(h.fetchSpy)).not.toContain("evil");
+      const headers = (upstreamCalls(h.fetchSpy)[0]![1] as RequestInit).headers as Record<string, string>;
+      expect(headers["content-type"]).toBe("application/json");
+    });
+
+    it("BOM-prefixed bytes go out as the BOM-less canonical JSON", async () => {
+      inspectSpy.mockClear();
+      const raw = '﻿{"to":"ok@allow"}';
+      const h = hardArgs({
+        method: "POST", path: "/send",
+        bodyBase64: Buffer.from(raw, "utf8").toString("base64"),
+        contentType: "application/json; charset=utf-8",
+      });
+      await handleUpstreamRequest(h.args);
+      expect(sentBody(h.fetchSpy)).toBe('{"to":"ok@allow"}');
+      const headers = (upstreamCalls(h.fetchSpy)[0]![1] as RequestInit).headers as Record<string, string>;
+      expect(headers["content-type"]).toBe("application/json; charset=utf-8");
+    });
+
+    it("non-inspected operations still send raw JSON bytes verbatim", async () => {
+      const raw = '{"a":1,"a":2}';
+      const h = hardArgs({
+        method: "POST", path: "/plain",
+        bodyBase64: Buffer.from(raw, "utf8").toString("base64"),
+        contentType: "application/json",
+      });
+      await handleUpstreamRequest(h.args);
+      expect(sentBody(h.fetchSpy)).toBe(raw);
+    });
+  });
+
+  describe("multipart header injection is refused at entry (F-11)", () => {
+    const CASES: Array<[string, Record<string, string>]> = [
+      ["name CRLF", { name: 'f"\r\nX-Injected: 1' }],
+      ["name LF", { name: "f\nx" }],
+      ["filename CR", { name: "f", filename: "a.pdf\rX: 1" }],
+      ["filename NUL", { name: "f", filename: "a\0.pdf" }],
+      ["contentType CRLF", { name: "f", contentType: "text/plain\r\n\r\n--boundary" }],
+    ];
+    for (const [label, part] of CASES) {
+      it(`${label} → malformed audit + ToolError, no fetch`, async () => {
+        const h = hardArgs({ method: "POST", path: "/plain", multipart: [{ value: "v", ...part } as never] });
+        await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/may not contain CR, LF or NUL/);
+        expect(h.fetchSpy).not.toHaveBeenCalled();
+        expect(h.audit.read().at(-1)).toMatchObject({
+          decision: "deny",
+          category: "malformed",
+          reason: "multipart-header-injection",
+        });
+      });
+    }
+  });
+
+  describe("malformed multipart parts are refused at entry (F-11)", () => {
+    // The sandbox RPC carries arbitrary JSON: a non-string field would be
+    // stringified into the part header (an array `contentType` smuggles CRLF
+    // past a string-only check) or throw a raw TypeError after inspection.
+    const CASES: Array<[string, unknown, RegExp]> = [
+      [
+        "array contentType carrying CRLF",
+        { name: "file", filename: "a.txt", contentType: ["text/plain\r\nX-Injected: yes"], value: "hi" },
+        /multipart part 0: `contentType` must be a string when present/,
+      ],
+      ["number name", { name: 42, value: "hi" }, /multipart part 0: `name` must be a non-empty string/],
+      ["missing name", { value: "hi" }, /multipart part 0: `name` must be a non-empty string/],
+      ["empty name", { name: "", value: "hi" }, /multipart part 0: `name` must be a non-empty string/],
+      [
+        "array filename",
+        { name: "file", filename: ["a\r\nX: 1"], value: "hi" },
+        /multipart part 0: `filename` must be a string when present/,
+      ],
+      ["object filename", { name: "file", filename: { a: 1 }, value: "hi" }, /`filename` must be a string when present/],
+      ["number value", { name: "f", value: 7 }, /multipart part 0: `value` must be a string when present/],
+      ["array bodyBase64", { name: "f", bodyBase64: ["aGk="] }, /`bodyBase64` must be a string when present/],
+      ["null part", null, /multipart part 0: must be an object/],
+      ["string part", "name=f", /multipart part 0: must be an object/],
+      ["array part", [{ name: "f", value: "v" }], /multipart part 0: must be an object/],
+    ];
+    for (const [label, part, message] of CASES) {
+      it(`${label} → malformed audit + ToolError, no fetch`, async () => {
+        const h = hardArgs({ method: "POST", path: "/plain", multipart: [part as never] });
+        const err = await handleUpstreamRequest(h.args).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ToolError);
+        expect((err as Error).message).toMatch(message);
+        expect((err as Error).message).not.toContain("X-Injected");
+        expect(h.fetchSpy).not.toHaveBeenCalled();
+        expect(h.audit.read().at(-1)).toMatchObject({
+          decision: "deny",
+          category: "malformed",
+          reason: "multipart-part-malformed",
+        });
+      });
+    }
+
+    it("names the offending part index", async () => {
+      const h = hardArgs({
+        method: "POST",
+        path: "/plain",
+        multipart: [{ name: "ok", value: "v" }, { name: "f", contentType: ["x"] as never, value: "v" }],
+      });
+      await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/multipart part 1: `contentType`/);
+      expect(h.fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("typed arrays in body, query or multipart are refused at entry (F-19)", () => {
+    const CASES: Array<[string, Partial<UpstreamCtx>]> = [
+      ["body Uint8Array", { body: new Uint8Array([104, 105]) }],
+      ["body ArrayBuffer", { body: new ArrayBuffer(2) }],
+      ["nested body view", { body: { raw: [{ x: new DataView(new ArrayBuffer(1)) }] } }],
+      ["rawBody Uint8Array", { body: new Uint8Array([1]), rawBody: true }],
+      ["query value", { query: { q: new Uint8Array([1]) as never } }],
+      ["multipart value", { multipart: [{ name: "f", value: new Uint8Array([1]) as never }] }],
+    ];
+    for (const [label, extra] of CASES) {
+      it(`${label} → malformed audit + ToolError, no fetch`, async () => {
+        const h = hardArgs({ method: "POST", path: "/plain", ...extra });
+        await expect(handleUpstreamRequest(h.args)).rejects.toThrow(
+          "Binary values (Uint8Array/ArrayBuffer) are not accepted in body, query or multipart; send bytes with bodyBase64 or multipart[].bodyBase64",
+        );
+        expect(h.fetchSpy).not.toHaveBeenCalled();
+        expect(h.audit.read().at(-1)).toMatchObject({
+          decision: "deny",
+          category: "malformed",
+          reason: "binary-value-in-request",
+        });
+      });
+    }
+
+    it("a cyclic plain body does not hang the binary walker", async () => {
+      const cyclic: Record<string, unknown> = { a: 1 };
+      cyclic.self = cyclic;
+      const h = hardArgs({ method: "GET", path: "/things/x", body: cyclic });
+      // Passes the walker; fails later only at JSON.stringify (not our concern here).
+      await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/circular/i);
+      expect(h.audit.read().some((l) => l.reason === "binary-value-in-request")).toBe(false);
+    });
+  });
+
+  it("non-string method or path → malformed audit + ToolError, no fetch (F-24)", async () => {
+    for (const ctx of [
+      { method: 42, path: "/things/x" },
+      { method: "GET", path: ["/things/x"] },
+      { method: undefined, path: undefined },
+    ]) {
+      const h = hardArgs(ctx as unknown as UpstreamCtx);
+      await expect(handleUpstreamRequest(h.args)).rejects.toThrow(
+        "codemode.request needs string `method` and `path`",
+      );
+      expect(h.fetchSpy).not.toHaveBeenCalled();
+      expect(h.audit.read().at(-1)).toMatchObject({
+        decision: "deny",
+        category: "malformed",
+        reason: "invalid-method-or-path",
+      });
+    }
+  });
+
+  describe("redirects are not followed (F-17)", () => {
+    function upstream(res: () => Response): typeof fetch {
+      return async (url: RequestInfo | URL) => {
+        const u = typeof url === "string" ? url : url.toString();
+        if (u.includes("/token")) {
+          return new Response(JSON.stringify({ access_token: "AT-x", expires_in: 3600 }), { status: 200 });
+        }
+        return res();
+      };
+    }
+
+    it("302 → upstream_redirect envelope, redirect: manual, Location not echoed, no staging", async () => {
+      const h = hardArgs(
+        { method: "GET", path: "/things/x", returnAs: "stage" },
+        upstream(() => new Response("moved", {
+          status: 302,
+          headers: { location: "https://evil.example/steal?code=SECRET" },
+        })),
+      );
+      const res = (await handleUpstreamRequest(h.args)) as Record<string, unknown>;
+      expect(res).toEqual({
+        success: false,
+        status: 302,
+        result: { error: "upstream_redirect" },
+        errors: [{ code: 302, message: "Upstream answered with a redirect (HTTP 302); redirects are not followed" }],
+      });
+      expect(JSON.stringify(res)).not.toContain("evil.example");
+      expect(h.putFile).not.toHaveBeenCalled();
+      const calls = upstreamCalls(h.fetchSpy);
+      expect(calls).toHaveLength(1);
+      expect((calls[0]![1] as RequestInit).redirect).toBe("manual");
+      expect(h.audit.read().at(-1)).toMatchObject({ decision: "allow", upstreamStatus: 302, operationId: "getThing" });
+    });
+
+    it("every outbound fetch carries redirect: manual", async () => {
+      const h = hardArgs({ method: "GET", path: "/things/x" });
+      await handleUpstreamRequest(h.args);
+      expect((upstreamCalls(h.fetchSpy)[0]![1] as RequestInit).redirect).toBe("manual");
+    });
+
+    it("304 passes through as a normal non-2xx envelope", async () => {
+      const h = hardArgs(
+        { method: "GET", path: "/things/x" },
+        upstream(() => new Response(null, { status: 304 })),
+      );
+      const res = (await handleUpstreamRequest(h.args)) as Record<string, unknown>;
+      expect(res.success).toBe(false);
+      expect(res.status).toBe(304);
+      expect(res.result).not.toEqual({ error: "upstream_redirect" });
+    });
+  });
+});
+
+describe("approval-only operations are judged on the payload that is sent", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  const APPROVE_SPEC: OpenApiSpec = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/payruns/{id}": {
+        post: {
+          operationId: "updatePayRun",
+          requestBody: {
+            content: { "application/json": { schema: { type: "object", properties: { Amount: { type: "number" } } } } },
+          },
+          responses: { "200": { description: "OK" } },
+        },
+      },
+      "/calendars/{calendarId}/events": {
+        get: { operationId: "listEvents", responses: { "200": { description: "OK" } } },
+      },
+    },
+    components: { schemas: {} },
+  };
+  const APPROVE_SR: SurfaceReview = {
+    updatePayRun: { decision: "elicit", category: "financial_legal" },
+    listEvents: { decision: "allow", category: "standard_read" },
+  };
+
+  function approveArgs(ctx: UpstreamCtx) {
+    const fetchSpy = makeFetchSpy();
+    vi.stubGlobal("fetch", fetchSpy);
+    const audit = captureAudit();
+    // Accept with a value of the right type for every requested field.
+    const elicitInput = vi.fn(async (params: unknown) => {
+      const props = (params as { requestedSchema: { properties: Record<string, { type: string }> } })
+        .requestedSchema.properties;
+      const content: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(props)) {
+        content[k] = v.type === "number" ? 0 : v.type === "boolean" ? true : "";
+      }
+      return { action: "accept", content };
+    });
+    return {
+      fetchSpy,
+      audit,
+      elicitInput,
+      args: {
+        ctx,
+        spec: APPROVE_SPEC,
+        surfaceReview: APPROVE_SR,
+        apiBaseUrl: "https://api.example.com",
+        deploymentName: "test",
+        props: { refreshToken: "RT-1", userId: "test-user" },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        server: { server: { getClientCapabilities: () => ({ elicitation: {} }), elicitInput } } as any,
+        env: {} as { ALLOW_PII_IN_LOGS?: string },
+        audit: {},
+        oauth: {
+          refreshTokenAccessor: (p: Record<string, unknown>) => p.refreshToken as string,
+          userIdAccessor: (p: Record<string, unknown>) => p.userId as string | undefined,
+          broker: makeFakeBroker(),
+        },
+      },
+    };
+  }
+
+  function upstreamInit(fetchSpy: ReturnType<typeof vi.fn>): RequestInit {
+    const call = fetchSpy.mock.calls.find((c) => !String(c[0]).includes("/token"))!;
+    return call[1] as RequestInit;
+  }
+
+  it("a body + bodyBase64 decoy is refused before the dialog, nothing is sent", async () => {
+    const real = JSON.stringify({ PayRuns: [{ PayRunStatus: "POSTED", Amount: 999999 }, { Amount: 5 }] });
+    const h = approveArgs({
+      method: "POST",
+      path: "/payruns/1",
+      body: { PayRuns: [{ Amount: 1 }] },
+      bodyBase64: Buffer.from(real, "utf8").toString("base64"),
+      contentType: "application/json",
+    });
+    await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/denied by surface review/);
+    expect(h.elicitInput).not.toHaveBeenCalled();
+    expect(h.fetchSpy).not.toHaveBeenCalled();
+    expect(h.audit.read().at(-1)).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "multiple-body-channels",
+      operationId: "updatePayRun",
+    });
+  });
+
+  it("raw JSON is shown parsed in the dialog and sent as that same canonical document", async () => {
+    const raw = '{"Amount":1,"Amount":250}';
+    const h = approveArgs({
+      method: "POST",
+      path: "/payruns/1",
+      bodyBase64: Buffer.from(raw, "utf8").toString("base64"),
+      contentType: " application/json",
+    });
+    await handleUpstreamRequest(h.args);
+    const params = h.elicitInput.mock.calls[0]![0] as { requestedSchema: { properties: Record<string, unknown> } };
+    expect(Object.keys(params.requestedSchema.properties)).toContain("Amount");
+    const init = upstreamInit(h.fetchSpy);
+    expect(init.body).toBe('{"Amount":250}');
+    expect((init.headers as Record<string, string>)["content-type"]).toBe("application/json");
+  });
+
+  it("an uninspected raw non-JSON payload is approved as opaque, never rendered as an empty request", async () => {
+    const h = approveArgs({
+      method: "POST",
+      path: "/payruns/1",
+      bodyBase64: Buffer.from("<PayRuns/>", "utf8").toString("base64"),
+      contentType: "application/xml",
+    });
+    await handleUpstreamRequest(h.args);
+    const params = h.elicitInput.mock.calls[0]![0] as { message: string; requestedSchema: { properties: Record<string, unknown> } };
+    expect(params.message).toMatch(/application\/xml, 10 bytes\) cannot be shown/);
+    expect(Object.keys(params.requestedSchema.properties)).toEqual(["confirm"]);
+  });
+
+  it("JSON-typed bytes that do not parse are refused before the dialog", async () => {
+    const h = approveArgs({
+      method: "POST",
+      path: "/payruns/1",
+      bodyBase64: Buffer.from('{"Amount":', "utf8").toString("base64"),
+      contentType: "text/json",
+    });
+    await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/denied by surface review/);
+    expect(h.elicitInput).not.toHaveBeenCalled();
+    expect(h.audit.read().at(-1)).toMatchObject({ reason: "unparseable-json-body" });
+  });
+
+  it("a non-string contentType is refused at entry with an audit line", async () => {
+    const h = approveArgs({
+      method: "POST",
+      path: "/payruns/1",
+      body: { Amount: 1 },
+      contentType: ["application/json"] as unknown as string,
+    });
+    await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/contentType` must be a string/);
+    expect(h.fetchSpy).not.toHaveBeenCalled();
+    expect(h.audit.read().at(-1)).toMatchObject({ decision: "deny", reason: "invalid-content-type" });
+  });
+
+  it("an encoded # or ? inside a path value reaches the upstream re-encoded (F-1 regression)", async () => {
+    const h = approveArgs({
+      method: "GET",
+      path: "/calendars/en.australian%23holiday%40group.v.calendar.google.com/events",
+    });
+    await handleUpstreamRequest(h.args);
+    const url = String(h.fetchSpy.mock.calls.find((c) => !String(c[0]).includes("/token"))![0]);
+    expect(url).toBe("https://api.example.com/calendars/en.australian%23holiday%40group.v.calendar.google.com/events");
+    expect(new URL(url).hash).toBe("");
+    expect(new URL(url).search).toBe("");
   });
 });

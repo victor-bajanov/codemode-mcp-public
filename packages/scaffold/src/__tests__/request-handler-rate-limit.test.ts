@@ -250,4 +250,18 @@ describe("handleUpstreamRequest — upstream rate limits", () => {
     const entry = audit.read().find((e) => e.upstreamStatus === 200)!;
     expect(entry.rateLimit).toBeUndefined();
   });
+
+  it("redirect envelopes (F-17) carry the rate limit too", async () => {
+    vi.stubGlobal("fetch", makeFetchSpy(new Response(null, {
+      status: 307,
+      headers: { location: "https://elsewhere.example/x", "X-Min-Remaining": "40" },
+    })));
+    captureAudit();
+
+    const env = (await handleUpstreamRequest({ ...baseArgs, readRateLimit: reader })) as Envelope;
+
+    expect(env.success).toBe(false);
+    expect(env.result).toEqual({ error: "upstream_redirect" });
+    expect(env.rateLimit).toEqual({ remaining: { minute: 40 } });
+  });
 });

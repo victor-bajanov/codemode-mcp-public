@@ -1,3 +1,5 @@
+<img src="assets/codemode-lockup.svg" alt="codemode" height="40">
+
 # codemode-mcp
 
 Cloudflare Worker MCP servers that expose third-party SaaS APIs (Gmail +
@@ -121,7 +123,7 @@ This installs all workspaces.
 The flow is the same for every app:
 
 1. **Provision Cloudflare resources** (KV namespace + Access policy on
-   `/authorize`).
+   `/authorize`, which gates both the consent page and its approval).
 2. **Register the OAuth app** with the upstream provider (Google / Xero /
    your Optical deployment).
 3. **Configure the Worker** (paste the KV id; set Worker secrets).
@@ -192,7 +194,7 @@ Note the outputs — you need `*_oauth_kv_id` for the next step.
    cd apps/gmail
    npx wrangler secret put GOOGLE_CLIENT_ID
    npx wrangler secret put GOOGLE_CLIENT_SECRET
-   npx wrangler secret put COOKIE_ENCRYPTION_KEY   # any 32+ byte random string
+   npx wrangler secret put COOKIE_ENCRYPTION_KEY   # 32+ char random string; signs the /authorize consent form
    ```
 
 4. **Deploy**:
@@ -207,7 +209,11 @@ Note the outputs — you need `*_oauth_kv_id` for the next step.
    - Claude.ai → Settings → Connectors → Add custom MCP.
    - URL: `https://gmail.<your-subdomain>.workers.dev/mcp`.
    - The first `/authorize` redirect hits Cloudflare Access (must match an
-     allowed email through an allowed IdP), then Google consent.
+     allowed email through an allowed IdP), then the Worker's consent page,
+     then Google consent. The consent page names the MCP client and the
+     redirect URI access will be sent to, with its host in bold; check the
+     host (for Claude.ai it is `claude.ai`) before clicking **Approve**. The
+     page expires after five minutes; reload it from your client if it does.
 
 ### App: `xero`
 
@@ -220,7 +226,8 @@ Short version:
 1. Paste the Xero KV id into `apps/xero/wrangler.jsonc`.
 2. Register a Xero OAuth app at developer.xero.com with redirect URI
    `https://xero.<your-subdomain>.workers.dev/callback`.
-3. Secrets: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `COOKIE_ENCRYPTION_KEY`.
+3. Secrets: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `COOKIE_ENCRYPTION_KEY`
+   (32+ char random string; signs the `/authorize` consent form).
 4. `pnpm --filter @apps/xero deploy`.
 
 ### App: `optical`
@@ -241,7 +248,8 @@ Short version:
    `https://optical.<your-subdomain>.workers.dev/callback` and scopes
    `scheduler:read scheduler:write`.
 3. Secrets: `OPTICAL_CLIENT_ID`, `OPTICAL_CLIENT_SECRET` (any non-empty
-   string; the PKCE flow ignores it), `COOKIE_ENCRYPTION_KEY`.
+   string; the PKCE flow ignores it), `COOKIE_ENCRYPTION_KEY` (32+ char
+   random string; signs the `/authorize` consent form).
 4. `pnpm --filter @apps/optical deploy`, or run
    [`scripts/bootstrap-optical.sh`](./scripts/bootstrap-optical.sh) to do the
    Tofu apply, KV-id paste, secrets, and deploy for prod + dev in one go.
@@ -293,14 +301,14 @@ One-time setup (per provider):
    cd apps/gmail
    npx wrangler --env dev secret put GOOGLE_CLIENT_ID
    npx wrangler --env dev secret put GOOGLE_CLIENT_SECRET
-   npx wrangler --env dev secret put COOKIE_ENCRYPTION_KEY
+   npx wrangler --env dev secret put COOKIE_ENCRYPTION_KEY   # signs the consent form
    ```
 
    ```
    cd apps/xero
    npx wrangler --env dev secret put XERO_CLIENT_ID
    npx wrangler --env dev secret put XERO_CLIENT_SECRET
-   npx wrangler --env dev secret put COOKIE_ENCRYPTION_KEY
+   npx wrangler --env dev secret put COOKIE_ENCRYPTION_KEY   # signs the consent form
    ```
 
 5. **Deploy** from the repo root:
@@ -316,7 +324,8 @@ One-time setup (per provider):
 6. **Connect from Claude.ai** → Settings → Connectors → Add custom MCP:
    `https://<provider>-dev.<your-subdomain>.workers.dev/mcp`. The first
    `/authorize` hit prompts a fresh Cloudflare Access session for the new
-   hostname (separate Access app, separate cookie) — this is expected.
+   hostname (separate Access app, separate cookie) — this is expected —
+   followed by the same consent page as prod.
 
 The prod and dev Workers share the same Durable Object class names
 (`GmailMCP`, `XeroMCP`, `OpticalMCP`), but Wrangler scopes DO namespaces
@@ -368,6 +377,99 @@ Access policy by hitting the deployed `/authorize` URL.
   the `__stagingHost` sandbox capability. Tokens are AEAD-bound to the
   handle; expired rows are swept by the cron trigger. Apps without
   staging bindings simply don't expose any of this.
+
+## Security behaviour (2026-10-07 review)
+
+A 2026-10-07 defensive security review
+was remediated on 2026-10-08. The operator detail is in
+[`packages/scaffold/SECURITY.md`](./packages/scaffold/SECURITY.md) §7;
+what you are likely to notice is below.
+
+**Connecting.** `/authorize` shows a consent page (provider, client
+name, redirect URI with its host in bold, scopes) before handing off to
+Google, Xero or Optical. Approving submits a five-minute, single-use
+form token signed with `COOKIE_ENCRYPTION_KEY`; Cloudflare Access gates
+both the page and the approval. The page warns when the redirect is not
+`https://` to `claude.ai` or `claude.com`, or `http(s)://` to a loopback
+host. The form token is spent on the first submission, so a double click
+on **Approve** (or re-submitting after Back) can land on "Consent expired
+or invalid"; restart the connection from the client. MCP grants now
+expire 90 days after authorisation, so each client re-authorises every
+90 days (grants made before this change keep no expiry until
+re-authorised).
+
+**MCP client requirements.**
+
+- PKCE with `code_challenge_method=S256` is required on `/authorize`;
+  requests without a code challenge, or with `plain`, are refused.
+- `/register` accepts `http://` redirect URIs only for loopback hosts
+  (`localhost`, `127.0.0.1`, `[::1]`); everything else must be
+  `https://`.
+
+Clients that follow the MCP authorisation specification, such as Claude.ai
+and Claude Code, already meet both.
+
+**New optional vars** (all positive integers; omit for the default):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EXECUTE_HOST_TIMEOUT_MS` | `75000` | Host-side deadline for one sandbox run; later upstream calls from an abandoned run are refused. |
+| `EXECUTE_MAX_UPSTREAM_CALLS` | `1000` | Upstream requests one sandbox run may make. Kept below Cloudflare's 10,000 subrequests per invocation (paid plans); keep it under a quarter of `limits.subrequests` if you raise either. |
+| `STAGING_FAILURE_RATE_LIMIT` | `30` | Failed `/staging/*` requests per client per window before 429. |
+| `STAGING_FAILURE_RATE_LIMIT_WINDOW_SECONDS` | `300` | Window for the staging failure throttle. |
+
+**Behaviour changes.**
+
+- Gmail filters whose actions add the `TRASH` or `SPAM` label (Gmail's
+  "Delete it" and "Mark as spam") now need interactive approval, so
+  they fail closed on clients without elicitation support.
+- Gmail filter `action` keys outside the known set (`addLabelIds`,
+  `removeLabelIds`, `forward`, `forwardingEmail` and their snake_case
+  forms) are denied (`filter-unknown-action-field`), so
+  `action.delete: true` is still refused.
+- Calendar attendees flagged `resource: true` skip the recipient
+  allowlist only when their address is at
+  `resource.calendar.google.com`.
+- Calendar event writes (`insert`, `update`, `patch`, `import`) must
+  send the event as a JSON object in `body`; a raw or multipart
+  payload is denied (`event-body-not-object`).
+- Outbound mail with more than one `To`, `Cc` or `Bcc` header is
+  denied (`duplicate-recipient-header`). In the header block, CRLF is
+  read as LF; a lone CR, or CRLF mixed with bare LF, is denied
+  (`ambiguous-line-ending`), and so is a header name that is not RFC
+  5322 ftext (`malformed-header-name`). Addresses containing two `@`,
+  quoted or commented address forms (including common quoted display
+  names such as `"Jane Doe" <jane@example>`) and display names
+  holding `@`, `:`, `;`, `,`, `[`, `]` or `\` are refused by the
+  allowlist; write recipients as `addr@host` or `Name <addr@host>`.
+- Xero inspectors read gated keys (`Status`, `SentToContact`,
+  `IsReconciled`, `Type`, ids and wrappers) case-insensitively, deny
+  two casings of one key, and treat any gated boolean other than
+  absent, `null` or `false` as set.
+- Upstream redirects are not followed: a 3xx response (other than 304)
+  becomes an `upstream_redirect` error.
+- `codemode.request` rejects typed arrays (`Uint8Array`, `ArrayBuffer`)
+  in `body`, `query` and `multipart`; send bytes with `bodyBase64` or
+  `multipart[].bodyBase64`. A non-string `contentType` is refused, and
+  edge whitespace is trimmed from it.
+- Path parameters that are `.`/`..` (or decode to dots only), or that
+  contain a raw `\`, `?` or `#`, an encoded `/` or `\`, or a control
+  character, are refused. An encoded `?` or `#` (`%3F`, `%23`) is
+  accepted and re-encoded, so Calendar ids and file names containing
+  `#` keep working.
+- On operations that are inspected or need approval, a request using
+  more than one of `body`, `bodyBase64` and `multipart` is denied
+  (`multiple-body-channels`). Bytes sent under a JSON content-type
+  (including `text/json` and `application/x-json`) must parse
+  (`unparseable-json-body` otherwise) and are judged, shown and sent as
+  that parsed JSON. An approval for a raw non-JSON or multipart payload
+  that no inspector reads says its body cannot be shown.
+- Each sandbox run may make at most `EXECUTE_MAX_UPSTREAM_CALLS`
+  upstream calls (1,000 by default); split bulk work across runs.
+- The `search` tool is read-only: its sandbox no longer receives
+  `__stagingHost` and it carries `readOnlyHint: true`.
+- Refresh failures read `Refresh failed <status> (<error>)` with no
+  upstream body.
 
 ## Adding a new provider
 

@@ -41,6 +41,14 @@ export interface ScaffoldSecrets {
   COOKIE_ENCRYPTION_KEY?: string;
 }
 
+/**
+ * Boot-time check that `COOKIE_ENCRYPTION_KEY` is present and at least 32
+ * characters. The key signs the `/authorize` consent form tokens
+ * (`oauth-consent.ts`, F-20), so a missing key would otherwise surface as an
+ * opaque failure halfway through the consent flow; asserting it at the top of
+ * every `fetch` fails the first request after a misconfigured deploy with an
+ * actionable message instead. Rotating the key only voids consents in flight.
+ */
 export function assertSecrets(env: ScaffoldSecrets): void {
   const key = env.COOKIE_ENCRYPTION_KEY;
   if (typeof key !== "string" || key.length < 32) {
@@ -77,6 +85,35 @@ export function readStagingConfig(env: Record<string, unknown>): StagingConfig {
     uploadTtlSeconds: parsePositiveIntVar(env, "STAGING_UPLOAD_TTL_SECONDS", DEFAULT_UPLOAD_TTL_SECONDS),
     fetchTtlSeconds: parsePositiveIntVar(env, "STAGING_FETCH_TTL_SECONDS", DEFAULT_FETCH_TTL_SECONDS),
     maxBytes: parsePositiveIntVar(env, "STAGING_MAX_BYTES", DEFAULT_MAX_BYTES),
+  };
+}
+
+// --- /staging/* failure-budget throttle ---
+
+// Failed `/staging/*` requests (403: missing bearer, unknown token or wrong
+// handle) permitted per client per window before the endpoints answer 429
+// without touching D1. Generous enough that a confused-but-legitimate client
+// never trips it; tight enough to make bearer guessing pointless.
+const DEFAULT_STAGING_FAILURE_RATE_LIMIT = 30;
+const DEFAULT_STAGING_FAILURE_RATE_LIMIT_WINDOW_SECONDS = 300;
+
+/**
+ * Read the `/staging/*` failure-budget knobs (F-13):
+ * `STAGING_FAILURE_RATE_LIMIT` failures per
+ * `STAGING_FAILURE_RATE_LIMIT_WINDOW_SECONDS` per client (default 30/300 s).
+ * Each var is optional; invalid values throw like the other positive-integer
+ * vars.
+ */
+export function readStagingThrottleConfig(
+  env: Record<string, unknown>,
+): { limit: number; windowSeconds: number } {
+  return {
+    limit: parsePositiveIntVar(env, "STAGING_FAILURE_RATE_LIMIT", DEFAULT_STAGING_FAILURE_RATE_LIMIT),
+    windowSeconds: parsePositiveIntVar(
+      env,
+      "STAGING_FAILURE_RATE_LIMIT_WINDOW_SECONDS",
+      DEFAULT_STAGING_FAILURE_RATE_LIMIT_WINDOW_SECONDS,
+    ),
   };
 }
 

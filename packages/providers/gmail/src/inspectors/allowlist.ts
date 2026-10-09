@@ -77,13 +77,36 @@ export function outboundAllowlistFromEnv(
 }
 
 /**
+ * Conservative addr-spec shape: exactly one `@`, a non-empty local part and
+ * domain, and none of whitespace, control characters, angle brackets,
+ * parentheses, square brackets, double quotes, commas, semicolons, colons or
+ * backslashes on either side. Deliberately narrower than RFC 5322 — quoted
+ * local parts, comments, domain literals and group syntax are all refused.
+ */
+const ADDR_SPEC_SHAPE = /^[^\s@<>()[\]",;:\\\x00-\x1f\x7f]+@[^\s@<>()[\]",;:\\\x00-\x1f\x7f]+$/;
+
+/** True when `address` (already trimmed and lower-cased) has the plain
+ *  addr-spec shape `isAllowedRecipient` requires. */
+export function isPlainAddrSpec(address: string): boolean {
+  return ADDR_SPEC_SHAPE.test(address);
+}
+
+/**
  * Returns true iff `address` matches at least one entry in `allowlist`.
  * Comparison is case-insensitive on both sides; plus-addressing is strict;
  * subdomain match is not implied. An empty allowlist matches nothing.
+ *
+ * The address must first pass `ADDR_SPEC_SHAPE` (one `@`, non-empty local and
+ * domain, no whitespace, control characters, quotes, angle brackets, commas,
+ * semicolons, colons, brackets or backslashes). Anything else fails closed
+ * before matching, so `outsider@evil.example@allowed.example` is not read as
+ * an `allowed.example` address and a quoted local part such as
+ * `"a b"@allowed.example` is refused even though RFC 5322 permits it (F-18).
  */
 export function isAllowedRecipient(address: string, allowlist: readonly string[]): boolean {
   const norm = address.trim().toLowerCase();
   if (norm.length === 0) return false;
+  if (!isPlainAddrSpec(norm)) return false;
   for (const entry of allowlist) {
     const e = entry.toLowerCase();
     if (e.startsWith("*@")) {

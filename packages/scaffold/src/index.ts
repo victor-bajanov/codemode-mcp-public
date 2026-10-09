@@ -1,6 +1,6 @@
 export type { ApiProvider } from "./api-provider.js";
 export { hintFromSpecInfo } from "./api-provider.js";
-export { resolveOperation } from "./path-matcher.js";
+export { resolveOperation, findShadowConflicts, type ShadowConflict } from "./path-matcher.js";
 export { truncateForReturn, stringifyForMcpResult } from "./truncate.js";
 export { auditLog, type AuditEntry } from "./audit.js";
 export {

@@ -20,11 +20,12 @@ import { inspectEventAttendees } from "./inspectors/calendar-attendees.js";
 
 /** inspectEventAttendees — shared by events.insert/update/patch/import. */
 const ATTENDEE_ALLOWLIST_CLAUSE =
-  "Attendee emails must all be on this deployment's outbound allowlist " +
+  "Every attendee must be on the outbound allowlist " +
   "(OUTBOUND_RECIPIENT_ALLOWLIST; unset means an empty list, so any attendee " +
   "at all is denied). One off-allowlist attendee denies the whole write " +
-  "outright — a hard deny, not an approval prompt. `resource: true` attendees " +
-  "(rooms, equipment) are exempt and not counted.";
+  "outright — a hard deny, not an approval prompt. Only Google rooms/equipment " +
+  "(`resource: true` at resource.calendar.google.com) are exempt. Send the " +
+  "event as a JSON object in `body`; any other payload is denied.";
 
 const ATTENDEE_NOTE =
   ATTENDEE_ALLOWLIST_CLAUSE +
@@ -82,8 +83,10 @@ export const surfaceReview: SurfaceReview = {
                                                 "list, so every send is denied). One off-allowlist address denies the " +
                                                 "send. Recipients are read from `raw` or `payload.headers` (or the " +
                                                 "uploaded RFC 822 message for a media/multipart upload); a payload " +
-                                                "with no readable recipients is denied. More than 25 recipients needs " +
-                                                "interactive approval instead." },
+                                                "with no readable recipients is denied. Write each recipient as a bare " +
+                                                "addr@host or Name <addr@host>: quoted names, comments and names " +
+                                                "holding @ : ; , [ ] \\ are denied even for allowlisted addresses. " +
+                                                "More than 25 recipients needs interactive approval instead." },
   "gmail.users.drafts.send":               { decision: "allow", inspect: inspectDraftSend, normalizeBody: normalizeOutboundMessage,
                                               reasoning: "Drafts are created/updated ungated, so a stored draft's recipients are unvetted. inspectDraftSend denies a bare send-by-id (a synchronous inspector cannot read the stored draft to verify its recipients) and delegates update-and-send ({id, message}) to inspectOutboundMessage, whose carried recipients are what Gmail actually sends to.",
                                               clientNote:
@@ -94,7 +97,8 @@ export const surfaceReview: SurfaceReview = {
                                                 "recipients ride in the request. Those To/Cc/Bcc addresses must then " +
                                                 "all be on this deployment's outbound allowlist (the " +
                                                 "OUTBOUND_RECIPIENT_ALLOWLIST var; unset means every send is denied), " +
-                                                "and more than 25 of them needs interactive approval." },
+                                                "written as a bare addr@host or Name <addr@host> with no quotes or " +
+                                                "comments, and more than 25 of them needs interactive approval." },
   "gmail.users.messages.import":           { decision: "elicit", category: "external_data_flow" },
   "gmail.users.messages.delete":           { decision: "elicit", category: "irreversible" },
   "gmail.users.messages.batchDelete":      { decision: "elicit", category: "bulk_destructive",
@@ -116,11 +120,13 @@ export const surfaceReview: SurfaceReview = {
                                                       reasoning: "Removes persistent forwarding configuration; symmetric with .create at Tier-3." },
   "gmail.users.settings.filters.create":           { decision: "allow", inspect: inspectFilterCreate,
                                                       clientNote:
-                                                        "The filter's `action` block is checked: `delete: true` is denied, and so is a " +
-                                                        "non-empty `forward` or `forwardingEmail` STRING (a non-string such as " +
-                                                        "`forward: true` is not treated as forwarding). `removeLabelIds` containing \"INBOX\" " +
-                                                        "(auto-archive) needs interactive approval. A body with no `action` object is " +
-                                                        "denied. Label-only actions pass." },
+                                                        "The filter's `action` block is checked: a non-empty `forward` or " +
+                                                        "`forwardingEmail` STRING is denied (`forward: true` is not forwarding). " +
+                                                        "`addLabelIds` with \"TRASH\" or \"SPAM\", or `removeLabelIds` with \"INBOX\" " +
+                                                        "(auto-archive), needs interactive approval. A body with no `action` object, or " +
+                                                        "an `action` key other than addLabelIds, removeLabelIds, forward (or their " +
+                                                        "snake_case forms), is " +
+                                                        "denied. Other label-only actions pass." },
   "gmail.users.settings.filters.delete":           { decision: "deny", category: "persistent_state",
                                                       reasoning: "Removes user-defined filter rules; could undo legitimate spam/security filtering set by the user." },
   "gmail.users.settings.sendAs.create":            { decision: "deny", category: "capability_escalation",

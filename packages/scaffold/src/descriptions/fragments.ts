@@ -57,7 +57,7 @@ export const STAGING_BLOCK =
   "       // __stagingHost is a sandbox-scope local (NOT on codemode.*, NOT on globalThis).\n" +
   "  4. Forward `f.bytesBase64` to the upstream API per the provider-specific snippet below.\n\n" +
   "Downloading or exporting bytes FROM the upstream API is the opposite direction — skip `register_file_handle` entirely and use one of the three modes documented below instead.\n\n" +
-  "Do NOT try to read files from disk, embed bytes literally in code, fetch URLs into Uint8Array, or pass Uint8Array/ArrayBuffer through codemode.request — none of those paths reach the host as binary. The sandbox→host RPC rejects typed-array views outright: a Uint8Array/ArrayBuffer in codemode.request `body` (with or without `rawBody`) throws `Cannot freeze array buffer views with elements`. Use `register_file_handle` (above) or `bodyBase64`/`multipart` (below) instead.\n\n" +
+  "Do NOT try to read files from disk, embed bytes literally in code, fetch URLs into Uint8Array, or pass Uint8Array/ArrayBuffer through codemode.request — none of those paths reach the host as binary. A Uint8Array/ArrayBuffer anywhere in codemode.request `body`, `query` or `multipart` (with or without `rawBody`) is rejected by the host with an error. Use `register_file_handle` (above) or `bodyBase64`/`multipart` (below) instead.\n\n" +
   "## Returning large binary payloads from execute() — three modes\n\n" +
   "When upstream responses contain multi-MB binary, DO NOT return the bytes inline (`r.result.data`); they will be truncated to ~64KB by the response budget AND flood your context on the next turn. Use one of the three modes below.\n\n" +
   "**Mode A — JSON envelope with base64 field (e.g. Gmail attachments.get returns `{size, attachmentId, data: <base64url>}` — no MIME type in the envelope at all). Also callable as `__stagingHost.stageFromAttachment` — same function, task-shaped alias:**\n\n" +
@@ -95,19 +95,19 @@ export const STAGING_BLOCK =
 
 // Always-included codemode.request body-modes block. Documents the JSON / text
 // rawBody / bodyBase64 / multipart escape hatches. A Uint8Array/ArrayBuffer in
-// `body` cannot cross the sandbox→host RPC at all — it throws
-// `Cannot freeze array buffer views with elements` (with or without rawBody);
-// use bodyBase64/multipart for binary.
+// `body`, `query` or `multipart` is rejected by the host with an error (with
+// or without rawBody; see request-handler.ts); use bodyBase64/multipart.
 export const BODY_MODES_BLOCK =
   "## codemode.request body modes (binary / non-JSON)\n\n" +
-  "codemode.request marshals `options` to the host over an RPC that rejects typed-array views — a Uint8Array/ArrayBuffer in `body` throws `Cannot freeze array buffer views with elements`, so use the explicit binary modes below. " +
+  "A Uint8Array/ArrayBuffer in codemode.request `body`, `query` or `multipart` is rejected by the host with an error, so use the explicit binary modes below. " +
   "`rawBody: true` only suppresses JSON serialisation of `body` — it does NOT enable Uint8Array/ArrayBuffer passthrough. " +
   "The host-side modes (handled by this server, forwarded verbatim upstream):\n\n" +
   "  • Default (JSON):       `body: {...}` → serialised; Content-Type defaults to application/json.\n" +
   "  • Text body:            `body: \"…\", rawBody: true, contentType: \"…\"` (e.g. application/xml). Do NOT use rawBody with binary.\n" +
   "  • Binary octet-stream:  `bodyBase64: \"<base64>\", contentType: \"…\"` — host decodes base64 before fetching.\n" +
   "  • multipart/form-data:  `multipart: [{ name, filename?, contentType?, value? | bodyBase64? }, …]` — host generates the boundary and Content-Type; do NOT set `contentType` yourself.\n" +
-  "  • contentType is forwarded as-is for body / bodyBase64 / rawBody; only `multipart` overrides it.\n\n";
+  "  • contentType is forwarded (edge whitespace trimmed) for body / bodyBase64 / rawBody; only `multipart` overrides it.\n" +
+  "  • Use exactly one of `body`, `bodyBase64` and `multipart`. On operations that are inspected or need approval, two are refused, and bytes under a JSON content-type (including text/json) must parse: they are judged and sent as that parsed JSON.\n\n";
 
 /**
  * codemode truncates every `search` / `execute` result at this many characters

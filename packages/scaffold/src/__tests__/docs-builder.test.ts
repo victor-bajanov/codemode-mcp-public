@@ -62,7 +62,7 @@ const SECTION_ANCHORS: Record<DocSection, string> = {
   downloads: "Download-specific guidance goes here.",
   "search-strategy": "interface OpenApiSpec {",
   access: "ACCESS: ",
-  "body-modes": "Cannot freeze array buffer views",
+  "body-modes": "is rejected by the host with an error, so use the explicit binary modes",
   "rate-limit": "rateLimit",
   provider: "FLOW: do A then B.",
 };

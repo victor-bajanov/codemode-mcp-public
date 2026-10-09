@@ -24,6 +24,7 @@ describe("optical surface-review entries", () => {
     "getWeights", "updateWeights", "resetWeights",
     "updateContext", "resetContext",
     "subscribeWebhook",
+    "getTimezone", "setTimezone", "resetTimezone",
   ];
 
   // getCalendarAccessToken mints the caller's raw Google credential and needs a
@@ -32,12 +33,12 @@ describe("optical surface-review entries", () => {
   // (X-Goog-Channel-Token auth, "Not for end-user clients") — denied.
   const EXPECTED_DENY_OPS = ["getCalendarAccessToken", "googleCalendarWebhook"];
 
-  it("all 44 expected allow operationIds are present in the surface review", () => {
+  it("all 47 expected allow operationIds are present in the surface review", () => {
     const missing = EXPECTED_ALLOW_OPS.filter((id) => surfaceReview[id] === undefined);
     expect(missing).toEqual([]);
   });
 
-  it("all 44 expected allow operationIds are categorised `allow`", () => {
+  it("all 47 expected allow operationIds are categorised `allow`", () => {
     const notAllow = EXPECTED_ALLOW_OPS
       .filter((id) => surfaceReview[id])
       .filter((id) => surfaceReview[id]!.decision !== "allow")

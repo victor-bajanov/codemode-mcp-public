@@ -9,7 +9,9 @@
 //   - Status omitted + InvoiceID present → allow (update preserving existing state).
 //   - Status omitted + no InvoiceID → deny (would be a create with no explicit state).
 //   - any other Status (AUTHORISED, PAID, VOIDED, DELETED) → deny.
-//   - SentToContact === true → deny regardless of Status.
+//   - SentToContact set (anything but absent/null/false) → deny regardless of Status.
+//   - Gated keys (wrapper, Status, InvoiceID, SentToContact) are read case-insensitively,
+//     as Xero does; two spellings of one gated key → deny invoice-ambiguous-key (F-10).
 
 import { describe, it, expect } from "vitest";
 import { inspectInvoiceDraft } from "../inspectors/drafts";
@@ -181,5 +183,120 @@ describe("inspectInvoiceDraft", () => {
     expect(inspectInvoiceDraft({
       body: { Type: "ACCREC", InvoiceID: "8576f4cf-e24d-4e3a-83ff-c6f30418a7de", Status: "AUTHORISED" },
     })).toMatchObject({ decision: "deny", category: "irreversible", reason: "invoice-not-draft" });
+  });
+
+  // === F-10: Xero reads property names case-insensitively and coerces "true" ===
+
+  const ID = "8576f4cf-e24d-4e3a-83ff-c6f30418a7de";
+
+  it.each(["status", "STATUS", "sTaTuS"])("reads a %s key as Status (AUTHORISED on an update is denied)", (key) => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, [key]: "AUTHORISED" }] },
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "invoice-not-draft" });
+  });
+
+  it("reads a lower-case status key on a flat by-ID body", () => {
+    expect(inspectInvoiceDraft({
+      body: { InvoiceID: ID, status: "AUTHORISED" },
+    })).toMatchObject({ decision: "deny", reason: "invoice-not-draft" });
+  });
+
+  it("allows a create whose Status is spelt status: DRAFT", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ Type: "ACCREC", status: "DRAFT" }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies two spellings of Status as ambiguous, naming the key", () => {
+    const res = inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, Status: "DRAFT", status: "AUTHORISED" }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "invoice-ambiguous-key" });
+    expect(res.message).toContain('"Status"');
+  });
+
+  it("denies a non-ASCII lookalike of Status as ambiguous (U+017F long s)", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, "\u017Ftatus": "AUTHORISED" }] },
+    })).toMatchObject({ decision: "deny", reason: "invoice-ambiguous-key" });
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ Status: "DRAFT", "\uFB06atus": "AUTHORISED" }] },
+    })).toMatchObject({ decision: "deny", reason: "invoice-ambiguous-key" });
+  });
+
+  it("treats a null Status like an absent one (id → allow, no id → deny)", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, Status: null }] },
+    })).toEqual({ decision: "allow" });
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ Type: "ACCREC", Status: null }] },
+    })).toMatchObject({ decision: "deny", reason: "invoice-not-draft" });
+  });
+
+  it("reads the id field case-insensitively", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ invoiceid: ID }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies two spellings of InvoiceID as ambiguous", () => {
+    const res = inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, invoiceID: "other" }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", reason: "invoice-ambiguous-key" });
+    expect(res.message).toContain('"InvoiceID"');
+  });
+
+  it.each([["the string \"true\"", "true"], ["1", 1], ["the string \"false\"", "false"], ["an object", {}]])(
+    "denies SentToContact given as %s (lenient boolean, fail closed)",
+    (_label, value) => {
+      expect(inspectInvoiceDraft({
+        body: { Invoices: [{ InvoiceID: ID, Status: "DRAFT", SentToContact: value }] },
+      })).toMatchObject({ decision: "deny", category: "external_data_flow", reason: "invoice-sent-to-contact" });
+    },
+  );
+
+  it.each([["false", false], ["null", null]])("allows SentToContact: %s", (_label, value) => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, Status: "DRAFT", SentToContact: value }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies a lower-case sentToContact: true", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, Status: "DRAFT", sentToContact: true }] },
+    })).toMatchObject({ decision: "deny", reason: "invoice-sent-to-contact" });
+  });
+
+  it("denies two spellings of SentToContact as ambiguous", () => {
+    expect(inspectInvoiceDraft({
+      body: { Invoices: [{ InvoiceID: ID, Status: "DRAFT", SentToContact: false, senttocontact: true }] },
+    })).toMatchObject({ decision: "deny", reason: "invoice-ambiguous-key" });
+  });
+
+  it("treats a lower-case invoices wrapper as bulk (not as a flat by-ID update)", () => {
+    expect(inspectInvoiceDraft({
+      body: { invoices: [{ Status: "AUTHORISED" }], InvoiceID: "x" },
+    })).toMatchObject({ decision: "deny", reason: "invoice-not-draft" });
+    expect(inspectInvoiceDraft({
+      body: { INVOICES: [{ Status: "DRAFT" }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies an empty or non-array wrapper under any casing as no payload", () => {
+    expect(inspectInvoiceDraft({ body: { invoices: [] } })).toMatchObject({
+      decision: "deny", category: "malformed", reason: "invoice-no-payload",
+    });
+    expect(inspectInvoiceDraft({
+      body: { invoices: { Status: "AUTHORISED" }, InvoiceID: "x" },
+    })).toMatchObject({ decision: "deny", reason: "invoice-no-payload" });
+  });
+
+  it("denies two spellings of the Invoices wrapper as ambiguous", () => {
+    const res = inspectInvoiceDraft({
+      body: { Invoices: [{ Status: "DRAFT" }], invoices: [{ Status: "AUTHORISED" }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", reason: "invoice-ambiguous-key" });
+    expect(res.message).toContain('"Invoices"');
   });
 });

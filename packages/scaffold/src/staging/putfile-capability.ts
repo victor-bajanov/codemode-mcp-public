@@ -41,8 +41,14 @@ function decodeBase64(s: string): Uint8Array | null {
  * Behaviour (see docs/superpowers/specs/2026-05-19-symmetric-file-download-design.md):
  *
  *   - Validates input types (no exceptions cross the sandbox boundary).
+ *   - Rejects a base64 string too long to decode within `config.maxBytes`
+ *     (status 413) BEFORE decoding it, so an over-cap payload costs no decode
+ *     CPU or buffer memory (F-24); malformed over-cap input is therefore a
+ *     413, not a 400.
  *   - Decodes base64 → Uint8Array; rejects malformed input as status 400.
- *   - Enforces `config.maxBytes` post-decode (status 413). Zero-byte payloads are valid.
+ *   - Re-checks `config.maxBytes` post-decode (status 413) — the length bound
+ *     above is deliberately loose (padding/whitespace). Zero-byte payloads are
+ *     valid.
  *   - Mints token + file_handle; derives AES-GCM key via the shared HKDF chain
  *     in crypto.ts; AAD is bound to the file_handle.
  *   - Writes ciphertext to R2; on failure returns 500.
@@ -70,6 +76,12 @@ export function createPutFileCapability(deps: PutFileCapabilityDeps) {
     }
     if (filename !== null && typeof filename !== "string") {
       return { ok: false, status: 400, message: "filename must be a string or null" };
+    }
+    // Length bound before decoding (F-24): n bytes encode to ceil(n/3)*4
+    // base64 chars. The +4 slack tolerates stray padding; the post-decode
+    // check below stays the exact one.
+    if (bytesBase64.length > Math.ceil(deps.config.maxBytes / 3) * 4 + 4) {
+      return { ok: false, status: 413, message: "payload too large" };
     }
     const bytes = decodeBase64(bytesBase64);
     if (!bytes) {

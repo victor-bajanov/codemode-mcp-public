@@ -47,5 +47,8 @@ export default defineConfig({
   ssr: {
     noExternal: true,
   },
-  test: {},
+  test: {
+    // Security-review POCs run only via vitest.poc.config.ts.
+    exclude: ["**/node_modules/**", "**/security-poc/**"],
+  },
 });

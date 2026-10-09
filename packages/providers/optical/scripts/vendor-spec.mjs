@@ -112,10 +112,10 @@ for (const ms of Object.values(newPaths)) {
 console.log(`vendored optical spec → ${TARGET}`);
 console.log(`  paths: ${Object.keys(newPaths).length}`);
 console.log(`  operationIds: ${ids.size}`);
-// 46 = every operationId optical publishes (webhook ops included — see the
+// 49 = every operationId optical publishes (webhook ops included — see the
 // exclusion note above). Bump deliberately when optical's surface grows, in
 // the same commit that adds the new ops to surface-review.ts and its test.
-if (ids.size !== 46) {
-  console.error(`expected 46 operationIds, got ${ids.size}; check OPERATION_IDS table and the source spec.`);
+if (ids.size !== 49) {
+  console.error(`expected 49 operationIds, got ${ids.size}; check OPERATION_IDS table and the source spec.`);
   process.exit(1);
 }

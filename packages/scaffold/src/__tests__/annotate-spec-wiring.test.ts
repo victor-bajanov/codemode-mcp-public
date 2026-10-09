@@ -58,12 +58,20 @@ async function specPassedToCodemode(spec: Record<string, unknown>): Promise<Reco
   const agent = Object.create(AgentClass.prototype) as {
     env: Record<string, unknown>;
     props: Record<string, unknown>;
-    ctx: { waitUntil: (p: Promise<unknown>) => void };
+    ctx: {
+      waitUntil: (p: Promise<unknown>) => void;
+      storage: { get: (k: string) => Promise<unknown>; put: (k: string, v: unknown) => Promise<void> };
+    };
     init: () => Promise<void>;
   };
   agent.env = { LOADER: {}, DEPLOYMENT_NAME: "test-deployment" };
   agent.props = {};
-  agent.ctx = { waitUntil: () => {} };
+  // init() records the session principal in DO storage (F-16).
+  const storage = new Map<string, unknown>();
+  agent.ctx = {
+    waitUntil: () => {},
+    storage: { get: async (k) => storage.get(k), put: async (k, v) => void storage.set(k, v) },
+  };
   await agent.init();
   if (!capturedSpec) throw new Error("openApiMcpServer was never called");
   return capturedSpec;

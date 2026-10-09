@@ -35,6 +35,32 @@ export type StageFromUpstreamJsonCapability = (
   contentTypeOverride?: string | null,
 ) => Promise<PutFileResult>;
 
+/** The declared StageRequestOpts fields — the only ones forwarded to the
+ *  upstream handler (F-24). Anything else on the sandbox-supplied object
+ *  (`headers`, `returnAs`, `multipart`, `relatedRequestId`, …) is dropped. */
+const DECLARED_REQUEST_FIELDS = [
+  "method",
+  "path",
+  "query",
+  "body",
+  "contentType",
+  "rawBody",
+  "bodyBase64",
+] as const satisfies ReadonlyArray<keyof StageRequestOpts>;
+
+function pickDeclaredRequestOpts(
+  requestOpts: Record<string, unknown>,
+): StageRequestOpts & { bypassTruncate: true } {
+  const picked: Record<string, unknown> = {};
+  for (const field of DECLARED_REQUEST_FIELDS) {
+    // Own properties only, and only when defined (exactOptionalPropertyTypes).
+    if (Object.hasOwn(requestOpts, field) && requestOpts[field] !== undefined) {
+      picked[field] = requestOpts[field];
+    }
+  }
+  return { ...(picked as unknown as StageRequestOpts), bypassTruncate: true };
+}
+
 function base64urlToBase64(s: string): string {
   const standard = s.replace(/-/g, "+").replace(/_/g, "/");
   const padNeeded = (4 - (standard.length % 4)) % 4;
@@ -58,9 +84,19 @@ export function createStageFromUpstreamJsonCapability(
       return { ok: false, status: 400, message: 'dataEncoding must be "base64url" or "base64"' };
     }
 
+    if (
+      requestOpts === null ||
+      typeof requestOpts !== "object" ||
+      Array.isArray(requestOpts)
+    ) {
+      return { ok: false, status: 400, message: "requestOpts must be an object" };
+    }
+
     let r: UpstreamRequestResult;
     try {
-      r = await deps.upstreamRequest({ ...requestOpts, bypassTruncate: true });
+      r = await deps.upstreamRequest(
+        pickDeclaredRequestOpts(requestOpts as unknown as Record<string, unknown>),
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { ok: false, status: 502, message: `upstream request failed: ${msg}` };

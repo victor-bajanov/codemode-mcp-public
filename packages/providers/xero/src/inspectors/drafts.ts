@@ -14,12 +14,21 @@
 //   - Status omitted + no <id> → deny (this is a create; force the caller to be
 //     explicit so AUTHORISED-by-default surprises can't sneak through).
 //   - any other value (AUTHORISED, PAID, VOIDED, DELETED) → deny.
-//   - SentToContact === true → deny regardless of Status (triggers an email send).
+//   - SentToContact set → deny regardless of Status (triggers an email send).
+//
+// Key case and lenient booleans (security review F-10): Xero's .NET JSON
+// deserialiser matches property names case-insensitively and coerces "true"
+// to a boolean, so every gated key (the bulk wrapper, Status, the id field,
+// SentToContact) is read case-insensitively via ./keys, a body carrying two
+// spellings of one gated key is denied as ambiguous, and SentToContact counts
+// as set unless it is absent, null or false (so "true", 1 and even "false"
+// are denied). A body that carries the wrapper under any casing is bulk.
 //
 // Denials carry a human-readable `message` so the caller sees *why* the request
 // was blocked instead of the opaque "denied by surface review"; `reason` stays a
 // terse, greppable code for audit logs.
 import type { InspectRequest, InspectResult } from "@local/shared";
+import { getCaseInsensitive, isTruthyFlag } from "./keys.js";
 
 interface DraftResourceConfig {
   /** Request-body wrapper key for the bulk endpoints, e.g. "Invoices". */
@@ -36,6 +45,7 @@ function makeDraftStatusInspector(cfg: DraftResourceConfig) {
   const REASON_NO_PAYLOAD = `${cfg.reasonPrefix}-no-payload`;
   const REASON_NOT_DRAFT = `${cfg.reasonPrefix}-not-draft`;
   const REASON_SENT = `${cfg.reasonPrefix}-sent-to-contact`;
+  const REASON_AMBIGUOUS = `${cfg.reasonPrefix}-ambiguous-key`;
 
   const noPayload: InspectResult = {
     decision: "deny",
@@ -78,6 +88,18 @@ function makeDraftStatusInspector(cfg: DraftResourceConfig) {
       `SentToContact, then send it deliberately.`,
   };
 
+  function denyAmbiguous(key: string): InspectResult {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: REASON_AMBIGUOUS,
+      message:
+        `Refusing a ${cfg.label} payload that spells "${key}" more than one way (keys differing ` +
+        `only by letter case, or a non-ASCII lookalike). Xero matches property names ` +
+        `case-insensitively, so which value it would apply is unclear. Send "${key}" exactly once.`,
+    };
+  }
+
   return function inspect(req: InspectRequest): InspectResult {
     const body = req.body;
     if (!body || typeof body !== "object") {
@@ -85,10 +107,20 @@ function makeDraftStatusInspector(cfg: DraftResourceConfig) {
     }
     const bodyObj = body as Record<string, unknown>;
     // Bulk endpoints send { [arrayKey]: [...] }; the singular by-ID endpoint sends
-    // a flat object. An empty body {} is treated as no-payload.
+    // a flat object. An empty body {} is treated as no-payload. The wrapper is
+    // matched under any casing (Xero reads "invoices" as "Invoices"); once it is
+    // present the body is bulk, and a non-array wrapper is no payload rather than
+    // a flat item that the inspector and Xero would read differently.
+    const wrapper = getCaseInsensitive(bodyObj, cfg.arrayKey);
+    if (wrapper.ambiguous) {
+      return denyAmbiguous(cfg.arrayKey);
+    }
     let items: unknown[];
-    if (Array.isArray(bodyObj[cfg.arrayKey])) {
-      items = bodyObj[cfg.arrayKey] as unknown[];
+    if (wrapper.present) {
+      if (!Array.isArray(wrapper.value)) {
+        return noPayload;
+      }
+      items = wrapper.value;
     } else if (Object.keys(bodyObj).length === 0) {
       return noPayload;
     } else {
@@ -102,8 +134,15 @@ function makeDraftStatusInspector(cfg: DraftResourceConfig) {
         return noPayload;
       }
       const itemObj = item as Record<string, unknown>;
-      const status = String(itemObj["Status"] ?? "").toUpperCase();
-      const id = itemObj[cfg.idField];
+      const statusKey = getCaseInsensitive(itemObj, "Status");
+      const idKey = getCaseInsensitive(itemObj, cfg.idField);
+      const sentKey = getCaseInsensitive(itemObj, "SentToContact");
+      if (statusKey.ambiguous) return denyAmbiguous("Status");
+      if (idKey.ambiguous) return denyAmbiguous(cfg.idField);
+      if (sentKey.ambiguous) return denyAmbiguous("SentToContact");
+      // A null Status is treated like an absent one (Xero ignores it on update).
+      const status = String(statusKey.value ?? "").toUpperCase();
+      const id = idKey.value;
       const hasId = typeof id === "string" && id.length > 0;
       if (status === "") {
         if (!hasId) {
@@ -112,7 +151,7 @@ function makeDraftStatusInspector(cfg: DraftResourceConfig) {
       } else if (status !== "DRAFT" && status !== "SUBMITTED") {
         return denyNotDraft(status);
       }
-      if (itemObj["SentToContact"] === true) {
+      if (isTruthyFlag(sentKey.value)) {
         return denySent;
       }
     }

@@ -42,7 +42,9 @@ In Claude.ai → Connectors → Add custom MCP, URL:
 
 ## OAuth flow notes
 
-- First `/authorize` shows the **Xero consent screen for ALL listed scopes** —
+- First `/authorize` shows the Worker's own consent page (check the
+  redirect host, then click **Approve** within five minutes); after that
+  comes the **Xero consent screen for ALL listed scopes** —
   the operator should see writes for accounting.transactions /
   accounting.contacts / accounting.attachments / files even though the
   surface-review only allows specific operationIds inside those scope

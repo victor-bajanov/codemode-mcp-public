@@ -63,6 +63,7 @@ export { RESPONSE_CHAR_CAP, buildSearchStrategyBlock } from "./descriptions/frag
 import { resolveEndpoints } from "./config";
 import { handleUpstreamRequest, type HandleArgs, type UpstreamCtx } from "./request-handler";
 import { ToolError } from "./elicit";
+import { readExecutionLimits, type ExecutionLimits } from "./execution-limits";
 import type { TokenBrokerStub } from "./token-broker";
 import { createGetFileCapability } from "./staging/getfile-capability";
 import { createPutFileCapability } from "./staging/putfile-capability";
@@ -90,6 +91,10 @@ export interface ProviderEnv extends Record<string, unknown> {
   STAGING_FETCH_TTL_SECONDS?: string;
   STAGING_MAX_BYTES?: string;
   STAGING_UPLOAD_ORIGIN?: string;     // e.g., "https://xero.example.com"; required when staging is enabled
+  // Host-side sandbox limits (F-12) — see execution-limits.ts. Optional
+  // positive integers; unset uses the defaults (75 000 ms / 1 000 calls).
+  EXECUTE_HOST_TIMEOUT_MS?: string;
+  EXECUTE_MAX_UPSTREAM_CALLS?: string;
 }
 
 /**
@@ -259,6 +264,142 @@ export function buildDocsHostFns(
   };
 }
 
+type HostFns = Record<string, (...args: unknown[]) => Promise<unknown>>;
+/** A `{ name, fns }` capability as codemode's executor takes it (its
+ *  `ResolvedProvider`, minus the optional fields this module never sets —
+ *  they are preserved by the spread in createGuardedExecutor regardless). */
+export type HostProvider = { name: string; fns: HostFns };
+export interface SandboxExecuteResult {
+  result: unknown;
+  error?: string;
+  logs?: string[];
+}
+/** The slice of codemode's `Executor` contract the guard wraps. */
+export interface SandboxExecutor {
+  execute(code: string, providersOrFns: HostProvider[] | HostFns): Promise<SandboxExecuteResult>;
+}
+
+/** The provider name openApiMcpServer gives the `execute` tool's request
+ *  channel. Its presence is what distinguishes an `execute` run from a
+ *  `search` run (which codemode hands an empty array). */
+const OPENAPI_HOST = "__openapiHost";
+/** `__stagingHost` fns that reach the upstream (via handleUpstreamRequest)
+ *  and therefore count against the per-execution budget. getFile/putFile
+ *  touch only staging storage and are not counted. */
+const STAGING_UPSTREAM_FNS = ["stageFromUpstreamJson", "stageFromAttachment"] as const;
+
+/**
+ * Wraps codemode's executor with the host-side controls the sandbox cannot
+ * opt out of (2026-10-07 security review, F-4 and F-12):
+ *
+ *   • `__stagingHost` is appended ONLY to `execute` runs — those whose
+ *     providers include `__openapiHost`. codemode deliberately withholds the
+ *     request channel from `search`; staging's stageFromUpstreamJson drives
+ *     the full upstream path (writes included), so handing it to `search`
+ *     re-opened what codemode closed (F-4). `__docsHost` is read-only and
+ *     goes to both tools.
+ *   • Every run gets a fresh upstream budget: `codemode.request` and the two
+ *     upstream-reaching staging fns share `limits.maxUpstreamCalls`; the call
+ *     past it throws a ToolError, which the sandbox sees as an ordinary
+ *     rejection (F-12).
+ *   • The host stops waiting after `limits.hostTimeoutMs`, resolving with an
+ *     `error` (codemode's Executor contract: never reject). codemode's own
+ *     timeout races INSIDE the sandbox and LLM code can neuter it. The host
+ *     cannot kill the isolate, so once the deadline fires every later
+ *     upstream call from that run is refused — a runaway sandbox can burn its
+ *     own CPU until the runtime reclaims it, but can no longer reach the API.
+ *
+ * The code string is alias-patched (patchCodemodeDocsAlias, best-effort,
+ * spec D6) on the array form only. The Record form is codemode's legacy
+ * convenience API — openApiMcpServer never uses it — and is forwarded
+ * unchanged, still under the deadline.
+ */
+export function createGuardedExecutor(
+  base: SandboxExecutor,
+  opts: {
+    stagingProvider: HostProvider | null;
+    docsProvider: HostProvider;
+    limits: ExecutionLimits;
+  },
+): SandboxExecutor {
+  const { stagingProvider, docsProvider, limits } = opts;
+  return {
+    execute: async (code, providersOrFns) => {
+      const run = { calls: 0, expired: false };
+      const wrapUpstream =
+        (fn: (...args: unknown[]) => Promise<unknown>) =>
+        async (...args: unknown[]): Promise<unknown> => {
+          if (run.expired) {
+            throw new ToolError(
+              "this execution passed its host-side deadline; further upstream calls are refused",
+            );
+          }
+          if (++run.calls > limits.maxUpstreamCalls) {
+            throw new ToolError(
+              `upstream call budget exceeded: at most ${limits.maxUpstreamCalls} upstream requests per execution`,
+            );
+          }
+          return fn(...args);
+        };
+      const wrapNamed = (fns: HostFns, names: readonly string[]): HostFns => {
+        const out: HostFns = { ...fns };
+        for (const name of names) {
+          const fn = fns[name];
+          if (typeof fn === "function") out[name] = wrapUpstream(fn);
+        }
+        return out;
+      };
+
+      // Arm the deadline BEFORE handing control to the executor: the timer
+      // must not depend on anything the sandbox run can reach first.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<SandboxExecuteResult>((resolve) => {
+        timer = setTimeout(() => {
+          run.expired = true;
+          resolve({
+            result: undefined,
+            error: `Execution exceeded the host-side deadline of ${limits.hostTimeoutMs} ms and was abandoned`,
+          });
+        }, limits.hostTimeoutMs);
+      });
+
+      let forwarded: Promise<SandboxExecuteResult>;
+      try {
+        if (Array.isArray(providersOrFns)) {
+          const isExecute = providersOrFns.some((p) => p.name === OPENAPI_HOST);
+          const providers = providersOrFns.map((p) =>
+            p.name === OPENAPI_HOST ? { ...p, fns: wrapNamed(p.fns, ["request"]) } : p,
+          );
+          forwarded = base.execute(patchCodemodeDocsAlias(code), [
+            ...providers,
+            ...(isExecute && stagingProvider
+              ? [{ ...stagingProvider, fns: wrapNamed(stagingProvider.fns, STAGING_UPSTREAM_FNS) }]
+              : []),
+            docsProvider,
+          ]);
+        } else {
+          forwarded = base.execute(code, providersOrFns);
+        }
+      } catch (err) {
+        forwarded = Promise.reject(err);
+      }
+      // An abandoned run may still settle later; never let that surface as an
+      // unhandled rejection.
+      const settled = forwarded.catch(
+        (err: unknown): SandboxExecuteResult => ({
+          result: undefined,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      try {
+        return await Promise.race([settled, deadline]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
 /** Version reported in MCP `serverInfo`. Single source of truth: the field
  *  initializer below and the openApiMcpServer instance that replaces it in
  *  init() must agree, or the advertised version depends on init() timing.
@@ -269,19 +410,85 @@ export function buildDocsHostFns(
  *  servers make no 1.0 stability promise. */
 const SERVER_VERSION = "0.1.0";
 
+/** DO-storage key binding an MCP session to the principal it was initialised
+ *  for (F-16). Value: `{ principal: string | null }`. */
+export const SESSION_PRINCIPAL_KEY = "codemode:session-principal";
+
 /** Returns a constructor suitable for use as a Durable Object class.
  *  The returned class extends `McpAgent` and is parameterised by `provider`. */
 export function createProviderMcpAgent<
   P extends Record<string, unknown>,
   Env extends ProviderEnv = ProviderEnv,
 >(provider: ApiProvider<P, Env>) {
+  /** The principal a set of props resolves to: the provider's audit accessor
+   *  when it has one, else a string `props.userId`; null when neither yields
+   *  one. Single definition shared by the session binding (F-16) and the
+   *  broker addressing in buildUpstreamArgs. A closure rather than a method so
+   *  it adds nothing to the Durable Object's RPC surface. */
+  const principalOf = (props: P | undefined): string | null => {
+    if (props === undefined || props === null) return null;
+    return (
+      provider.audit?.principalIdAccessor?.(props) ??
+      (typeof (props as Record<string, unknown>).userId === "string"
+        ? ((props as Record<string, unknown>).userId as string)
+        : null)
+    );
+  };
+
   return class ProviderMCP extends McpAgent<Env, Record<string, never>, P> {
     server: McpServer = new McpServer({
       name: provider.name,
       version: SERVER_VERSION,
     });
 
+    /** Principal this session was bound to, as read in init() (F-16). */
+    sessionPrincipal: string | null | undefined;
+
+    /**
+     * MCP sessions are Durable Objects named by `mcp-session-id`, and
+     * partyserver's getServerByName calls `setName(name, ctx.props)` with the
+     * CURRENT request's props on every routed request (streamable HTTP and
+     * SSE alike). For a running DO those props are stashed but never
+     * re-applied, and after eviction they replace the stored ones — so without
+     * this check a different valid user presenting someone else's session id
+     * would run as the first user (F-16). Refuse before partyserver sees the
+     * props. The thrown error surfaces as a 5xx at the edge; agents 0.17.1
+     * offers no cleaner hook. `props === undefined` (internal bootstrap
+     * paths) and sessions with no stored binding yet (first request, or a
+     * session that predates the binding) pass through.
+     */
+    async setName(name: string, props?: P): Promise<void> {
+      if (props !== undefined) {
+        const stored = await this.ctx.storage.get<{ principal: string | null }>(
+          SESSION_PRINCIPAL_KEY,
+        );
+        if (stored !== undefined && principalOf(props) !== stored.principal) {
+          throw new Error(
+            "mcp-session-principal-mismatch: this MCP session belongs to a different user",
+          );
+        }
+      }
+      return super.setName(name, props);
+    }
+
     async init(): Promise<void> {
+      // Bind the session to its principal first (F-16). The first init()
+      // records the principal it was started with; later inits (restart,
+      // eviction) keep the stored one, so buildUpstreamArgs' defence-in-depth
+      // check below compares against the ORIGINAL binding, not whatever props
+      // the restarting request carried.
+      const stored = await this.ctx.storage.get<{ principal: string | null }>(
+        SESSION_PRINCIPAL_KEY,
+      );
+      if (stored === undefined) {
+        this.sessionPrincipal = principalOf(this.props);
+        await this.ctx.storage.put(SESSION_PRINCIPAL_KEY, {
+          principal: this.sessionPrincipal,
+        });
+      } else {
+        this.sessionPrincipal = stored.principal;
+      }
+      const limits = readExecutionLimits(this.env as unknown as Record<string, unknown>);
       const baseExecutor = new DynamicWorkerExecutor({
         loader: this.env.LOADER,
         timeout: 70_000,
@@ -302,11 +509,13 @@ export function createProviderMcpAgent<
       //     with a fixed providers array. There is no public hook to extend
       //     that array.
       //
-      // To add a SECOND capability (`__stagingHost`) we wrap the executor: the
-      // wrapped `execute()` forwards to the underlying executor but appends
-      // `__stagingHost` to the providers array (only when staging bindings are
-      // configured). This is the minimum surface change and avoids forking
-      // openApiMcpServer.
+      // To add more capabilities we wrap the executor (createGuardedExecutor):
+      // the wrapped `execute()` forwards to the underlying executor, appending
+      // `__docsHost` to every run and `__stagingHost` to `execute` runs only
+      // (those carrying `__openapiHost`; staging bindings must also be
+      // configured) — `search` must stay read-only (F-4). The same wrapper
+      // enforces the host-side deadline and upstream budget (F-12). This is
+      // the minimum surface change and avoids forking openApiMcpServer.
       //
       // On preludes: codemode 0.4.2 DOES have a sandbox prelude (the fixed
       // template createOpenApiSandboxCode emits before the LLM's code), but
@@ -397,27 +606,14 @@ export function createProviderMcpAgent<
 
       // Wrap unconditionally: __docsHost is appended to EVERY sandbox run
       // (search included — codemode passes the array form for both tools),
-      // __stagingHost only when staging bindings exist, and the code string is
+      // __stagingHost to execute runs only (F-4), every run is bounded by the
+      // host-side deadline and upstream budget (F-12), and the code string is
       // alias-patched (best-effort, spec D6) before forwarding.
-      const executor = {
-        execute: (
-          code: string,
-          providersOrFns:
-            | Array<{ name: string; fns: Record<string, (...args: unknown[]) => Promise<unknown>> }>
-            | Record<string, (...args: unknown[]) => Promise<unknown>>,
-        ) => {
-          // openApiMcpServer always passes an array form; the Record form
-          // is the legacy convenience API. Append only when array form.
-          if (Array.isArray(providersOrFns)) {
-            return baseExecutor.execute(patchCodemodeDocsAlias(code), [
-              ...providersOrFns,
-              ...(stagingProvider ? [stagingProvider] : []),
-              docsProvider,
-            ]);
-          }
-          return baseExecutor.execute(code, providersOrFns);
-        },
-      };
+      const executor = createGuardedExecutor(baseExecutor, {
+        stagingProvider,
+        docsProvider,
+        limits,
+      });
       // Single source of truth for the per-request HandleArgs object. Both
       // call sites (codemode `request` closure for execute(), and the
       // stageFromUpstreamJson sandbox capability) build their args via this
@@ -430,12 +626,16 @@ export function createProviderMcpAgent<
       // the primary guard; this stub is the defence-in-depth that ensures a
       // future relaxation of that check can't accidentally route every
       // anonymous caller to a single shared `""` broker instance.
+      //
+      // Defence in depth for F-16: setName() above refuses a request whose
+      // bearer resolves to a different principal; should props ever change
+      // under a running session anyway, refuse to build upstream args for them.
       const buildUpstreamArgs = (ctx: UpstreamCtx): HandleArgs<P> => {
-        const resolvedUserId: string | undefined =
-          (provider.audit?.principalIdAccessor?.(this.props as P)) ??
-          (typeof (this.props as Record<string, unknown>).userId === "string"
-            ? ((this.props as Record<string, unknown>).userId as string)
-            : undefined);
+        const principal = principalOf(this.props as P);
+        if (principal !== this.sessionPrincipal) {
+          throw new ToolError("MCP session principal changed; reconnect");
+        }
+        const resolvedUserId: string | undefined = principal ?? undefined;
         const broker: TokenBrokerStub = resolvedUserId
           ? (this.env.TOKEN_BROKER.get(
               this.env.TOKEN_BROKER.idFromName(resolvedUserId),
@@ -515,7 +715,10 @@ export function createProviderMcpAgent<
       // `isConnected()`-guarded) — both facts pinned by
       // __tests__/codemode-cap-drift.test.ts.
       const registeredTools = (this.server as unknown as {
-        _registeredTools?: Record<string, { update(u: { description?: string }): void }>;
+        _registeredTools?: Record<
+          string,
+          { update(u: { description?: string; annotations?: { readOnlyHint?: boolean } }): void }
+        >;
       })._registeredTools;
       if (!registeredTools?.execute || !registeredTools?.search) {
         throw new Error(
@@ -529,7 +732,13 @@ export function createProviderMcpAgent<
           Object.keys(providerDocs.sections),
         ),
       });
-      registeredTools.search.update({ description: COMPACT_SEARCH_DESCRIPTION });
+      // `search` gets no upstream channel (createGuardedExecutor withholds
+      // __stagingHost from it, F-4), so say so to clients that auto-approve
+      // read-only tools.
+      registeredTools.search.update({
+        description: COMPACT_SEARCH_DESCRIPTION,
+        annotations: { readOnlyHint: true },
+      });
 
       // The docs tool — UNCONDITIONAL (not staging-gated): it is the recovery
       // channel for everything the compact descriptions evict. `_meta` opts it

@@ -3,7 +3,10 @@
 // M3 — origin-invariant upstream URL builder. Asserts that
 // `new URL(path, base).origin === base.origin`, throwing ToolError with
 // prefix `upstream-url-origin-mismatch:` on mismatch. Defence-in-depth on
-// top of resolveOperation's static-template matching.
+// top of matchOperation's static-template matching.
+//
+// F-1 / F-6 — path invariant: the parsed pathname must equal the path
+// exactly, with no search or hash, else ToolError `upstream-url-path-mismatch:`.
 
 import { describe, it, expect } from "vitest";
 import { buildUpstreamUrl } from "../build-upstream-url";
@@ -85,5 +88,60 @@ crucially, no cross-origin request is allowed", () => {
     const result = buildUpstreamUrl("https://api.example.com/", "/v1/x");
     expect(result).toBe("https://api.example.com/v1/x");
     expect(result).not.toContain("//v1");
+  });
+
+  it("path the URL parser would rewrite throws path-mismatch ToolError (F-1)", () => {
+    for (const path of [
+      "/gmail/v1/users/me/labels/../messages/abc",
+      "/gmail/v1/users/me/labels/%2e%2e/messages/abc",
+      "/gmail/v1/users/me/labels/.%2e/messages/abc",
+      "/gmail/v1/users/me/./profile",
+      "/gmail/v1/users/me/labels/..\\messages\\abc",
+      "/gmail/v1/users/me/pro\tfile",
+      "/gmail/v1/users/me/a b",
+      "/gmail/v1/users/me/{x}",
+    ]) {
+      expect(() => buildUpstreamUrl("https://gmail.googleapis.com", path), path).toThrow(
+        /^upstream-url-path-mismatch:/,
+      );
+    }
+  });
+
+  it("query or fragment syntax in the path throws path-mismatch ToolError (F-6)", () => {
+    for (const path of ["/x/abc?trash=true", "/x/abc#frag", "/x/abc?", "/x/abc#", "/x/a?b/c"]) {
+      expect(() => buildUpstreamUrl("https://api.example.com", path, { q: "1" }), path).toThrow(
+        /^upstream-url-path-mismatch:/,
+      );
+    }
+  });
+
+  it("does not echo the (possibly PII-bearing) path in the path-mismatch message", () => {
+    try {
+      buildUpstreamUrl("https://api.example.com", "/users/alice@example.com/../x");
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ToolError);
+      expect((e as Error).message).not.toContain("alice");
+    }
+  });
+
+  it("a clean percent-encoded path passes unchanged", () => {
+    const result = buildUpstreamUrl(
+      "https://gmail.googleapis.com",
+      "/gmail/v1/users/user%40example.com/messages/my%20file%2Bv2",
+      { q: "a b" },
+    );
+    const parsed = new URL(result);
+    expect(parsed.pathname).toBe("/gmail/v1/users/user%40example.com/messages/my%20file%2Bv2");
+    expect(parsed.searchParams.get("q")).toBe("a b");
+  });
+
+  it("origin checks still fire first", () => {
+    expect(() => buildUpstreamUrl("https://api.example.com", "//evil.com/../x?y")).toThrow(
+      /^upstream-url-origin-mismatch:/,
+    );
+    expect(() => buildUpstreamUrl("https://api.example.com", "https://evil.com/x#f")).toThrow(
+      /^upstream-url-origin-mismatch:/,
+    );
   });
 });
