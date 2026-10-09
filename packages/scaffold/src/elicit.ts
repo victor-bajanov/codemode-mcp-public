@@ -180,6 +180,11 @@ export interface RunElicitationArgs {
   method: string;
   path: string;
   body: unknown;
+  /** Set when the payload being approved is raw non-JSON bytes or multipart
+   *  that no inspector interpreted: a short description (content-type and
+   *  size). The dialog then says the body cannot be shown instead of running
+   *  a renderer over an absent `body`, which would read as an empty request. */
+  opaquePayload?: string;
   query?: unknown;
   category?: string;
   reason?: string;
@@ -254,12 +259,20 @@ export async function runElicitation(args: RunElicitationArgs): Promise<void> {
       ...(input.inspectorSummary ? { inspectorSummary: input.inspectorSummary } : {}),
     }));
 
-  const rendered = renderer({
-    operationId: args.operationId,
-    body: args.body,
-    ...(args.query !== undefined ? { query: args.query } : {}),
-    ...(args.inspectorSummary ? { inspectorSummary: args.inspectorSummary } : {}),
-  });
+  const rendered =
+    args.opaquePayload !== undefined
+      ? {
+          message:
+            `Confirm operation: ${args.operationId}. Its request body (${args.opaquePayload}) ` +
+            "cannot be shown here; approve only if you expected this upload.",
+          fields: { confirm: true } as FormFields,
+        }
+      : renderer({
+          operationId: args.operationId,
+          body: args.body,
+          ...(args.query !== undefined ? { query: args.query } : {}),
+          ...(args.inspectorSummary ? { inspectorSummary: args.inspectorSummary } : {}),
+        });
   const requestedSchema = buildRequestedSchema(rendered.fields);
   const fields = rendered.fields;
 

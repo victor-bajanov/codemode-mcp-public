@@ -4,5 +4,8 @@
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  // Security-review POCs import sibling packages by relative path and run only
+  // under vitest.poc.config.ts; keep them out of the package typecheck.
+  "exclude": ["src/__tests__/security-poc"]
 }

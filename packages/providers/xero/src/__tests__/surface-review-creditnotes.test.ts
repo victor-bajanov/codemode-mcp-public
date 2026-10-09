@@ -6,7 +6,9 @@
 //   - Status omitted + CreditNoteID present → allow (update preserving existing state).
 //   - Status omitted + no CreditNoteID → deny (would be a create with no explicit state).
 //   - any other Status (AUTHORISED, PAID, VOIDED, DELETED) → deny.
-//   - SentToContact === true → deny regardless of Status.
+//   - SentToContact set (anything but absent/null/false) → deny regardless of Status.
+//   - Gated keys (wrapper, Status, CreditNoteID, SentToContact) are read case-insensitively,
+//     as Xero does; two spellings of one gated key → deny creditnote-ambiguous-key (F-10).
 //
 // Denials carry a human-readable `message` so the caller sees *why* (only DRAFT/SUBMITTED
 // allowed, plus the offending status) instead of the opaque "denied by surface review".
@@ -135,5 +137,68 @@ describe("inspectCreditNoteDraft", () => {
     expect(result.decision).toBe("deny");
     expect(result.message).toBeDefined();
     expect(result.message?.toLowerCase()).toContain("senttocontact");
+  });
+
+  // === F-10: Xero reads property names case-insensitively and coerces "true" ===
+
+  const ID = "8576f4cf-e24d-4e3a-83ff-c6f30418a7de";
+
+  it.each(["status", "STATUS", "StAtUs"])("reads a %s key as Status (AUTHORISED on an update is denied)", (key) => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, [key]: "AUTHORISED" }] },
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-not-draft" });
+  });
+
+  it("denies two spellings of Status as ambiguous", () => {
+    const res = inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, Status: "DRAFT", STATUS: "VOIDED" }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-ambiguous-key" });
+    expect(res.message).toContain('"Status"');
+  });
+
+  it("reads CreditNoteID case-insensitively and denies two spellings of it", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ creditNoteId: ID }] },
+    })).toEqual({ decision: "allow" });
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, creditnoteid: "other" }] },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-ambiguous-key" });
+  });
+
+  it.each([["the string \"true\"", "true"], ["1", 1], ["the string \"false\"", "false"]])(
+    "denies SentToContact given as %s (lenient boolean, fail closed)",
+    (_label, value) => {
+      expect(inspectCreditNoteDraft({
+        body: { CreditNotes: [{ CreditNoteID: ID, Status: "DRAFT", SentToContact: value }] },
+      })).toMatchObject({ decision: "deny", category: "external_data_flow", reason: "creditnote-sent-to-contact" });
+    },
+  );
+
+  it.each([["false", false], ["null", null], ["absent", undefined]])("allows SentToContact %s", (_label, value) => {
+    const item: Record<string, unknown> = { CreditNoteID: ID, Status: "DRAFT" };
+    if (value !== undefined) item["SentToContact"] = value;
+    expect(inspectCreditNoteDraft({ body: { CreditNotes: [item] } })).toEqual({ decision: "allow" });
+  });
+
+  it("denies a lower-case sentToContact: true", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, Status: "DRAFT", sentToContact: true }] },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-sent-to-contact" });
+  });
+
+  it("treats a lower-case creditnotes wrapper as bulk", () => {
+    expect(inspectCreditNoteDraft({
+      body: { creditnotes: [{ Status: "AUTHORISED" }], CreditNoteID: "x" },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-not-draft" });
+    expect(inspectCreditNoteDraft({
+      body: { creditNotes: [{ Status: "DRAFT" }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies two spellings of the CreditNotes wrapper as ambiguous", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ Status: "DRAFT" }], creditnotes: [{ Status: "AUTHORISED" }] },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-ambiguous-key" });
   });
 });

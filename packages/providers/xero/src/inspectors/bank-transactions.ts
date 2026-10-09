@@ -2,7 +2,16 @@
 // updateBankTransaction. Xero has no separate delete/void op for bank
 // transactions — destruction flows through updateBankTransaction setting
 // Status: "DELETED" or "VOIDED". This inspector rejects those transitions.
+//
+// Key case and lenient booleans (security review F-10): Xero's .NET JSON
+// deserialiser matches property names case-insensitively and coerces "true"
+// to a boolean, so the gated keys (the BankTransactions wrapper, Type, Status,
+// IsReconciled) are read case-insensitively via ./keys, a body carrying two
+// spellings of one gated key is denied as ambiguous, and IsReconciled counts
+// as set unless it is absent, null or false (so "true", 1 and even "false"
+// are denied).
 import type { InspectRequest, InspectResult } from "@local/shared";
+import { getCaseInsensitive, isTruthyFlag } from "./keys.js";
 
 const ALLOWED_TYPES = new Set(["SPEND", "RECEIVE"]);
 
@@ -58,12 +67,28 @@ const denyReconciled: InspectResult = {
     `IsReconciled (or IsReconciled=false) and let reconciliation happen through bank matching.`,
 };
 
+function denyAmbiguous(key: string): InspectResult {
+  return {
+    decision: "deny",
+    category: "malformed",
+    reason: "banktx-ambiguous-key",
+    message:
+      `Refusing a bank-transaction payload that spells "${key}" more than one way (keys ` +
+      `differing only by letter case, or a non-ASCII lookalike). Xero matches property names ` +
+      `case-insensitively, so which value it would apply is unclear. Send "${key}" exactly once.`,
+  };
+}
+
 export function inspectBankTxCreate(req: InspectRequest): InspectResult {
   const body = req.body;
   if (!body || typeof body !== "object") {
     return noPayload;
   }
-  const txs = (body as Record<string, unknown>)["BankTransactions"];
+  const wrapper = getCaseInsensitive(body as Record<string, unknown>, "BankTransactions");
+  if (wrapper.ambiguous) {
+    return denyAmbiguous("BankTransactions");
+  }
+  const txs = wrapper.value;
   if (!Array.isArray(txs) || txs.length === 0) {
     return noPayload;
   }
@@ -72,18 +97,26 @@ export function inspectBankTxCreate(req: InspectRequest): InspectResult {
       return noPayload;
     }
     const txObj = tx as Record<string, unknown>;
-    const type = String(txObj["Type"] ?? "").toUpperCase();
+    const typeKey = getCaseInsensitive(txObj, "Type");
+    const statusKey = getCaseInsensitive(txObj, "Status");
+    const reconciledKey = getCaseInsensitive(txObj, "IsReconciled");
+    if (typeKey.ambiguous) return denyAmbiguous("Type");
+    if (statusKey.ambiguous) return denyAmbiguous("Status");
+    if (reconciledKey.ambiguous) return denyAmbiguous("IsReconciled");
+    const type = String(typeKey.value ?? "").toUpperCase();
     if (!ALLOWED_TYPES.has(type)) {
       return denyDisallowedType(type);
     }
-    const statusRaw = txObj["Status"];
+    // Only an absent Status means "default"; an explicit null is not AUTHORISED
+    // and stays denied (fail closed), as before.
+    const statusRaw = statusKey.value;
     if (statusRaw !== undefined) {
       const status = String(statusRaw).toUpperCase();
       if (!ALLOWED_STATUSES.has(status)) {
         return denyDisallowedStatus(status);
       }
     }
-    if (txObj["IsReconciled"] === true) {
+    if (isTruthyFlag(reconciledKey.value)) {
       return denyReconciled;
     }
   }

@@ -1,5 +1,8 @@
 // Bank-transaction inspector: only SPEND / RECEIVE allowed; IsReconciled must be false.
 // Denies prepayment, overpayment, transfer.
+// Gated keys (BankTransactions, Type, Status, IsReconciled) are read case-insensitively, as
+// Xero does; two spellings of one gated key → deny banktx-ambiguous-key; IsReconciled counts
+// as set unless absent/null/false (F-10).
 
 import { describe, it, expect } from "vitest";
 import { inspectBankTxCreate } from "../inspectors/bank-transactions";
@@ -159,5 +162,82 @@ describe("inspectBankTxCreate", () => {
     expect(inspectBankTxCreate({
       body: { BankTransactions: [{ Type: "SPEND", Status: "AUTHORISED" }, { Type: "RECEIVE", Status: "DELETED" }] },
     })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-status" });
+  });
+
+  // === F-10: Xero reads property names case-insensitively and coerces "true" ===
+
+  it("reads a lower-case type key: SPEND allowed, TRANSFER denied", () => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ type: "SPEND" }] },
+    })).toEqual({ decision: "allow" });
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ type: "TRANSFER" }] },
+    })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-type" });
+  });
+
+  it.each(["status", "STATUS", "sTatus"])("reads a %s key as Status (VOIDED is denied)", (key) => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND", [key]: "VOIDED" }] },
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-disallowed-status" });
+  });
+
+  it("still denies an explicit null Status (only absence means the default)", () => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND", Status: null }] },
+    })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-status" });
+  });
+
+  it.each([
+    ["Type", { Type: "SPEND", type: "TRANSFER" }],
+    ["Status", { Type: "SPEND", Status: "AUTHORISED", status: "VOIDED" }],
+    ["IsReconciled", { Type: "SPEND", IsReconciled: false, isreconciled: true }],
+  ])("denies two spellings of %s as ambiguous", (key, tx) => {
+    const res = inspectBankTxCreate({ body: { BankTransactions: [tx] } });
+    expect(res).toMatchObject({ decision: "deny", category: "malformed", reason: "banktx-ambiguous-key" });
+    expect(res.message).toContain(`"${key}"`);
+  });
+
+  it("denies a non-ASCII lookalike of Status as ambiguous (U+017F long s)", () => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND", "\u017Ftatus": "VOIDED" }] },
+    })).toMatchObject({ decision: "deny", reason: "banktx-ambiguous-key" });
+  });
+
+  it.each([["the string \"true\"", "true"], ["1", 1], ["0", 0], ["the string \"false\"", "false"]])(
+    "denies IsReconciled given as %s (lenient boolean, fail closed)",
+    (_label, value) => {
+      expect(inspectBankTxCreate({
+        body: { BankTransactions: [{ Type: "SPEND", IsReconciled: value }] },
+      })).toMatchObject({ decision: "deny", category: "irreversible", reason: "banktx-reconciled" });
+    },
+  );
+
+  it("allows IsReconciled: null", () => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND", IsReconciled: null }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("denies a lower-case isReconciled: true", () => {
+    expect(inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND", isReconciled: true }] },
+    })).toMatchObject({ decision: "deny", reason: "banktx-reconciled" });
+  });
+
+  it("reads the BankTransactions wrapper case-insensitively", () => {
+    expect(inspectBankTxCreate({
+      body: { banktransactions: [{ Type: "SPEND" }] },
+    })).toEqual({ decision: "allow" });
+    expect(inspectBankTxCreate({
+      body: { bankTransactions: [{ Type: "SPEND", Status: "VOIDED" }] },
+    })).toMatchObject({ decision: "deny", reason: "banktx-disallowed-status" });
+  });
+
+  it("denies two spellings of the BankTransactions wrapper as ambiguous", () => {
+    const res = inspectBankTxCreate({
+      body: { BankTransactions: [{ Type: "SPEND" }], banktransactions: [{ Type: "TRANSFER" }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", reason: "banktx-ambiguous-key" });
+    expect(res.message).toContain('"BankTransactions"');
   });
 });

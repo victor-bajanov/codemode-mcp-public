@@ -252,3 +252,66 @@ describe("description-budget-docs-surface drift guards (Task 6)", () => {
     });
   });
 });
+
+// Drift guards for the 2026-10-07 security-review fixes in
+// mcp-agent-factory.ts (F-4):
+//   • createGuardedExecutor tells an `execute` run from a `search` run by the
+//     presence of `__openapiHost` in the providers array, and appends
+//     `__stagingHost` only to the former. If codemode ever hands `search` a
+//     provider of that name (or renames it for `execute`), staging would leak
+//     back into `search` or vanish from `execute`.
+//   • init() sets `search`'s annotations to `{ readOnlyHint: true }` through
+//     `RegisteredTool.update`, which REPLACES the annotations object. That is
+//     only lossless while codemode registers `search` with none of its own.
+describe("security-review drift guards (F-4)", () => {
+  it("search runs get an empty providers array; execute runs get exactly __openapiHost", async () => {
+    const seen: string[][] = [];
+    const server = openApiMcpServer({
+      spec: MINIMAL_SPEC,
+      executor: {
+        execute: async (_code: string, providersOrFns: unknown) => {
+          seen.push(
+            Array.isArray(providersOrFns)
+              ? (providersOrFns as Array<{ name: string }>).map((p) => p.name)
+              : ["<record form>"],
+          );
+          return { result: "captured" };
+        },
+      },
+      request: async () => ({}),
+    }) as unknown as {
+      connect: (t: unknown) => Promise<void>;
+      close: () => Promise<void>;
+    };
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "drift-guard", version: "1.0" });
+    try {
+      await client.connect(clientTransport);
+      await client.callTool({ name: "search", arguments: { code: "async () => 1" } });
+      await client.callTool({ name: "execute", arguments: { code: "async () => 1" } });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+    expect(
+      seen,
+      "codemode's per-tool providers changed — re-check createGuardedExecutor's execute/search discriminator",
+    ).toEqual([[], ["__openapiHost"]]);
+  });
+
+  it("codemode registers `search` without annotations of its own (init() replaces them wholesale)", () => {
+    const server = openApiMcpServer({
+      spec: MINIMAL_SPEC,
+      executor: { execute: async () => ({ result: undefined }) },
+      request: async () => ({}),
+    });
+    const registeredTools = (server as unknown as {
+      _registeredTools: Record<string, { annotations?: unknown }>;
+    })._registeredTools;
+    expect(
+      registeredTools.search!.annotations,
+      "codemode now annotates `search` — merge them into init()'s readOnlyHint update instead of replacing",
+    ).toBeUndefined();
+  });
+});

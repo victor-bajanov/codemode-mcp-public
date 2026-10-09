@@ -147,6 +147,15 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   // replanNow.
   subscribeWebhook: { decision: "allow", category: "standard_write" },
 
+  // Timezone ops (2026-09 re-vendor). Caller-scoped `users.home_tz` in
+  // optical's own D1. setTimezone discards the caller's own pending plans and
+  // stamps the old zone onto their untimezoned task windows; resetTimezone
+  // falls back to the instance default. Each is recoverable via the other and
+  // nothing fans out to other humans — same class as updateWeights/resetWeights.
+  getTimezone:   { decision: "allow", category: "standard_read" },
+  setTimezone:   { decision: "allow", category: "standard_write" },
+  resetTimezone: { decision: "allow", category: "standard_write" },
+
   // googleCalendarWebhook is the machine-to-machine receiver Google's push
   // notifications POST to. It authenticates via X-Goog-Channel-Token, not
   // Bearer, and the spec marks it "Not for end-user clients". The agent

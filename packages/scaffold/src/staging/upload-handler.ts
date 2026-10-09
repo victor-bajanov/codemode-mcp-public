@@ -19,6 +19,35 @@ function parseBearer(req: Request): string | null {
   return v.startsWith("stg_") ? v : null;
 }
 
+/**
+ * Read `req`'s body into one buffer, or return `null` (after cancelling the
+ * stream) once more than `maxBytes` have arrived. A missing body is a
+ * zero-byte upload.
+ */
+async function readBodyCapped(req: Request, maxBytes: number): Promise<Uint8Array | null> {
+  const reader = req.body?.getReader();
+  if (!reader) return new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
 export async function handleUpload(req: Request, deps: UploadDeps): Promise<Response> {
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
   const bearer = parseBearer(req);
@@ -48,9 +77,11 @@ export async function handleUpload(req: Request, deps: UploadDeps): Promise<Resp
     return new Response("content-type mismatch", { status: 400 });
   }
 
-  // Read body, enforcing max.
-  const buf = new Uint8Array(await req.arrayBuffer());
-  if (buf.byteLength > deps.config.maxBytes) {
+  // Read body, enforcing max while streaming (F-13): a body with no (or a
+  // lying) Content-Length is cancelled as soon as it passes maxBytes instead
+  // of being buffered in full first.
+  const buf = await readBodyCapped(req, deps.config.maxBytes);
+  if (!buf) {
     return new Response("payload too large", { status: 413 });
   }
 

@@ -311,6 +311,70 @@ describe("createStageFromUpstreamJsonCapability", () => {
     });
   });
 
+  describe("requestOpts hygiene (F-24)", () => {
+    it("forwards only the declared StageRequestOpts fields plus bypassTruncate", async () => {
+      const { cap, upstreamRequest } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+      const opts = {
+        method: "POST",
+        path: "/x",
+        query: { a: 1 },
+        body: { k: "v" },
+        contentType: "application/json",
+        rawBody: false,
+        bodyBase64: "e30=",
+        // Undeclared: must not ride through to the handler ctx.
+        headers: { "X-Extra": "1" },
+        returnAs: "stage",
+        multipart: [],
+        relatedRequestId: "rid-1",
+      };
+      await cap(opts as never, "data", "base64");
+      expect(upstreamRequest).toHaveBeenCalledTimes(1);
+      expect(upstreamRequest.mock.calls[0]![0]).toEqual({
+        method: "POST",
+        path: "/x",
+        query: { a: 1 },
+        body: { k: "v" },
+        contentType: "application/json",
+        rawBody: false,
+        bodyBase64: "e30=",
+        bypassTruncate: true,
+      });
+    });
+
+    it("omits declared fields that are undefined rather than forwarding undefined keys", async () => {
+      const { cap, upstreamRequest } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+      await cap({ method: "GET", path: "/x", query: undefined } as never, "data", "base64");
+      const ctx = upstreamRequest.mock.calls[0]![0];
+      expect(Object.keys(ctx).sort()).toEqual(["bypassTruncate", "method", "path"]);
+    });
+
+    it("a sandbox-supplied bypassTruncate cannot be turned off", async () => {
+      const { cap, upstreamRequest } = makeDeps({
+        upstreamResult: { success: true, status: 200, result: { data: "AAAA" } },
+      });
+      await cap({ ...BASE_REQ, bypassTruncate: false } as never, "data", "base64");
+      expect(upstreamRequest.mock.calls[0]![0].bypassTruncate).toBe(true);
+    });
+
+    it.each([
+      ["null", null],
+      ["a string", "GET /x"],
+      ["an array", [{ method: "GET", path: "/x" }]],
+      ["a number", 42],
+    ])("rejects requestOpts that is %s with 400 and never calls upstream", async (_label, bad) => {
+      const { cap, upstreamRequest, putFile } = makeDeps({});
+      const out = await cap(bad as never, "data", "base64");
+      expect(out).toEqual({ ok: false, status: 400, message: "requestOpts must be an object" });
+      expect(upstreamRequest).not.toHaveBeenCalled();
+      expect(putFile).not.toHaveBeenCalled();
+    });
+  });
+
   describe("base64url padding correctness", () => {
     it("3 chars → 1 pad char ('AAA' → 'AAA=')", async () => {
       const { cap, putFile } = makeDeps({

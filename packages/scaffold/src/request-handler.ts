@@ -1,7 +1,7 @@
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { Decision, ElicitRenderer, InspectRequest, InspectResult, SurfaceReview } from "@local/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { resolveOperation } from "./path-matcher";
+import { hasUnsafePathSegment, matchOperation } from "./path-matcher";
 import { truncateForReturn } from "./truncate";
 import { auditLog, redactAuditEntry, type AuditEntry } from "./audit";
 import { mostRestrictive } from "./restrict";
@@ -88,11 +88,29 @@ function bytesToBase64(bytes: Uint8Array): string {
  *  bypass channel wired today (see Task 5). */
 export const INSPECT_JSON_MAX_BYTES = 50 * 1024 * 1024;
 
-const JSON_CONTENT_TYPE_RE = /^application\/(?:[\w.+-]+\+)?json\b/i;
+// Media-type essence (before any `;` parameters) whose subtype is `json`,
+// `x-json` or a `+json` suffix, under any top-level type: `application/json`,
+// `application/vnd.api+json`, `text/json`, `application/x-json`. Upstreams are
+// lenient about which of these they parse as JSON, so all of them are judged
+// as JSON (F-7).
+const JSON_CONTENT_TYPE_RE = /^[\w.+-]+\/(?:[\w.+-]+\+)?(?:x-)?json$/i;
 
-/** True when the content-type denotes JSON (application/json, application/*+json). */
+/** Leading and trailing HTTP whitespace (space, tab, CR, LF), which fetch's
+ *  `Headers` strips from a header value before it goes on the wire. */
+const HTTP_WHITESPACE_EDGES = /^[\t\n\r ]+|[\t\n\r ]+$/g;
+
+/** The content-type as it will appear on the wire: HTTP whitespace trimmed,
+ *  as `Headers` does, so the inspector judges the value that is sent (F-7). */
+export function normaliseContentType(contentType: string | undefined): string | undefined {
+  return contentType === undefined ? undefined : contentType.replace(HTTP_WHITESPACE_EDGES, "");
+}
+
+/** True when the content-type denotes JSON: a media type whose subtype is
+ *  `json`, `x-json` or ends in `+json` (parameters and edge whitespace ignored). */
 export function isJsonContentType(contentType: string | undefined): boolean {
-  return contentType !== undefined && JSON_CONTENT_TYPE_RE.test(contentType);
+  if (contentType === undefined) return false;
+  const essence = (normaliseContentType(contentType) ?? "").split(";")[0]!.replace(HTTP_WHITESPACE_EDGES, "");
+  return JSON_CONTENT_TYPE_RE.test(essence);
 }
 
 /** The single effective outbound payload, resolved from the legacy channel
@@ -114,6 +132,7 @@ export function bodyChannelCount(ctx: UpstreamCtx): number {
 
 /** Resolve the effective outbound payload (wire form). */
 export function resolveEffective(ctx: UpstreamCtx): EffectiveBody {
+  const contentType = normaliseContentType(ctx.contentType);
   if (Array.isArray(ctx.multipart)) {
     return { kind: "multipart", parts: ctx.multipart };
   }
@@ -121,32 +140,35 @@ export function resolveEffective(ctx: UpstreamCtx): EffectiveBody {
     return {
       kind: "raw",
       bytes: base64ToBytes(ctx.bodyBase64),
-      contentType: ctx.contentType ?? "application/octet-stream",
+      contentType: contentType ?? "application/octet-stream",
     };
   }
   if (ctx.rawBody && ctx.body !== undefined && ctx.body !== null) {
-    // The sandbox→host RPC rejects typed-array views (`Cannot freeze array buffer
-    // views with elements`, see mcp-agent-factory.ts), so a `rawBody` body is
-    // always a string here. Guard the invariant rather than silently marshalling
-    // an EMPTY body — the old code sent `ctx.body as BodyInit` verbatim, so a
-    // non-string here must fail loudly, not vanish.
+    // Typed arrays (which codemode's RPC codec can revive from tagged values)
+    // are rejected at handler entry (`containsBinaryValue`), so `ctx.body` is
+    // never a view here. Guard the string invariant rather than silently
+    // marshalling an EMPTY body — the old code sent `ctx.body as BodyInit`
+    // verbatim, so a non-string here must fail loudly, not vanish.
     if (typeof ctx.body !== "string") {
       throw new ToolError("rawBody requires a string body; send binary via bodyBase64 or multipart");
     }
     return {
       kind: "raw",
       bytes: new TextEncoder().encode(ctx.body),
-      contentType: ctx.contentType ?? "application/octet-stream",
+      contentType: contentType ?? "application/octet-stream",
     };
   }
   if (ctx.body !== undefined && ctx.body !== null) {
-    return { kind: "json", body: ctx.body, contentType: ctx.contentType ?? "application/json" };
+    return { kind: "json", body: ctx.body, contentType: contentType ?? "application/json" };
   }
   return { kind: "none" };
 }
 
 /** Marshal the effective payload to the outbound fetch body + content-type.
- *  Reused verbatim for the upstream request so inspected == sent. */
+ *  Reused for the upstream request so inspected == sent: on inspected
+ *  operations the handler passes `DerivedInspect.sendAs` when set, so raw JSON
+ *  bytes go out as the canonical re-serialisation of what the inspector
+ *  judged, not as the original bytes. */
 export function marshalBody(
   ctx: UpstreamCtx,
   eff: EffectiveBody,
@@ -162,7 +184,7 @@ export function marshalBody(
       return { bodyToSend: JSON.stringify(eff.body), contentType: eff.contentType };
     case "none":
       // No body; honour an explicit caller content-type if present (rare).
-      return { bodyToSend: undefined, contentType: ctx.contentType };
+      return { bodyToSend: undefined, contentType: normaliseContentType(ctx.contentType) };
   }
 }
 
@@ -170,6 +192,15 @@ export interface DerivedInspect {
   req: InspectRequest;
   /** True when the effective payload is JSON over the parse cap (→ deny). */
   oversize?: boolean;
+  /** True when raw bytes carry a JSON content-type but do not parse (→ deny
+   *  on gated operations: neither an inspector nor an approver can judge
+   *  them as the JSON the upstream may still read leniently). */
+  unparseableJson?: boolean;
+  /** Payload to send instead of the effective one. Set when raw JSON-typed
+   *  bytes parsed: the inspector judges `JSON.parse(bytes)` (last duplicate
+   *  key wins, BOM stripped), so the bytes sent must be
+   *  `JSON.stringify(parsed)`, never the original bytes (F-7). */
+  sendAs?: EffectiveBody;
 }
 
 /** Build the canonical InspectRequest from the effective payload. */
@@ -192,10 +223,14 @@ export function deriveInspectRequest(
           return { req: base, oversize: true };
         }
         try {
-          const parsed = JSON.parse(new TextDecoder().decode(eff.bytes));
-          return { req: { ...base, body: parsed, contentType: eff.contentType } };
+          const parsed: unknown = JSON.parse(new TextDecoder().decode(eff.bytes));
+          return {
+            req: { ...base, body: parsed, contentType: eff.contentType },
+            sendAs: { kind: "json", body: parsed, contentType: eff.contentType },
+          };
         } catch {
-          /* not valid JSON despite the content-type → expose as raw bytes */
+          /* not valid JSON despite the content-type → flagged; also exposed as raw bytes */
+          return { req: { ...base, rawBody: eff.bytes, contentType: eff.contentType }, unparseableJson: true };
         }
       }
       return { req: { ...base, rawBody: eff.bytes, contentType: eff.contentType } };
@@ -215,7 +250,87 @@ function filenameFromContentDisposition(header: string | null): string | null {
   return null;
 }
 
+// CR, LF or NUL in a part's name/filename/content-type would let the caller
+// inject extra part headers (or a whole extra part) into the assembled body
+// while the inspector sees one structured part (F-11).
+const MULTIPART_HEADER_INJECTION = /[\r\n\0]/;
+const MULTIPART_OPTIONAL_STRING_FIELDS = ["filename", "contentType", "value", "bodyBase64"] as const;
+const MULTIPART_HEADER_FIELDS = ["name", "filename", "contentType"] as const;
+
+/** Why a multipart part list is refused, as an audit reason plus a message
+ *  naming the part and field (never echoing the value), or `null` when every
+ *  part is well formed. Each part must be a plain object whose `name` is a
+ *  non-empty string and whose `filename`, `contentType`, `value` and
+ *  `bodyBase64` are strings when present: the sandbox RPC carries arbitrary
+ *  JSON, and a non-string `contentType` (for example an array) is
+ *  stringified straight into the part header by `buildMultipartBody`. String
+ *  header fields must not contain CR, LF or NUL. */
+function multipartPartsProblem(
+  parts: readonly unknown[],
+): { reason: "multipart-part-malformed" | "multipart-header-injection"; message: string } | null {
+  for (let i = 0; i < parts.length; i++) {
+    const p: unknown = parts[i];
+    if (p === null || typeof p !== "object" || Array.isArray(p)) {
+      return { reason: "multipart-part-malformed", message: `multipart part ${i}: must be an object` };
+    }
+    const part = p as Record<string, unknown>;
+    if (typeof part.name !== "string" || part.name === "") {
+      return {
+        reason: "multipart-part-malformed",
+        message: `multipart part ${i}: \`name\` must be a non-empty string`,
+      };
+    }
+    for (const field of MULTIPART_OPTIONAL_STRING_FIELDS) {
+      const v = part[field];
+      if (v !== undefined && typeof v !== "string") {
+        return {
+          reason: "multipart-part-malformed",
+          message: `multipart part ${i}: \`${field}\` must be a string when present`,
+        };
+      }
+    }
+    for (const field of MULTIPART_HEADER_FIELDS) {
+      const v = part[field];
+      if (typeof v === "string" && MULTIPART_HEADER_INJECTION.test(v)) {
+        return {
+          reason: "multipart-header-injection",
+          message: `multipart part ${i}: \`${field}\` may not contain CR, LF or NUL characters`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** True when `value` is, or contains (through arrays and object properties),
+ *  an ArrayBuffer or ArrayBuffer view. codemode's RPC codec revives
+ *  `{"__codemode_binary_v1__": …}` tags into real typed arrays, which the
+ *  inspector would see as bytes while `JSON.stringify` sends `{"0":104,…}` or
+ *  `{}` (F-19). Cycle-safe; recursive like `deepFreeze`. */
+function containsBinaryValue(value: unknown, seen: WeakSet<object> = new WeakSet()): boolean {
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+  if (value === null || typeof value !== "object") return false;
+  if (Object.prototype.toString.call(value) === "[object ArrayBuffer]") return true;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  for (const v of Object.values(value)) {
+    if (containsBinaryValue(v, seen)) return true;
+  }
+  return false;
+}
+
+/** Audit-safe rendering of a ctx field that should have been a string. */
+function describeNonString(v: unknown): string {
+  if (v !== null && (typeof v === "object" || typeof v === "function")) {
+    return Array.isArray(v) ? "[array]" : "[object]";
+  }
+  return String(v);
+}
+
 function buildMultipartBody(parts: MultipartPart[]): { body: Uint8Array; boundary: string } {
+  // Defence in depth: handler entry already refused these (with an audit line).
+  const problem = multipartPartsProblem(parts);
+  if (problem) throw new ToolError(problem.message);
   // RFC 2046 §5.1.1: boundary is `1*70(bchars)`. Use 24 random bytes hex (48 chars).
   const rb = new Uint8Array(24);
   crypto.getRandomValues(rb);
@@ -378,6 +493,68 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   args: HandleArgs<P>,
 ): Promise<unknown> {
   const { spec, surfaceReview } = args;
+  // Entry validation (malformed requests): before anything reads the ctx, so a
+  // doomed request never reaches surface review, elicitation or token minting.
+  if (typeof args.ctx.method !== "string" || typeof args.ctx.path !== "string") {
+    // F-24: `method: 42` used to surface as a raw TypeError with no audit line.
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: describeNonString(args.ctx.method),
+      path: describeNonString(args.ctx.path),
+      decision: "deny",
+      category: "malformed",
+      reason: "invalid-method-or-path",
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError("codemode.request needs string `method` and `path`");
+  }
+  if (args.ctx.contentType !== undefined && typeof args.ctx.contentType !== "string") {
+    // A non-string content-type would be stringified into the header while
+    // the JSON check below read something else (F-7).
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: args.ctx.method,
+      path: args.ctx.path,
+      decision: "deny",
+      category: "malformed",
+      reason: "invalid-content-type",
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError("codemode.request `contentType` must be a string when present");
+  }
+  if (
+    containsBinaryValue(args.ctx.body) ||
+    containsBinaryValue(args.ctx.query) ||
+    containsBinaryValue(args.ctx.multipart)
+  ) {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: args.ctx.method,
+      path: args.ctx.path,
+      decision: "deny",
+      category: "malformed",
+      reason: "binary-value-in-request",
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(
+      "Binary values (Uint8Array/ArrayBuffer) are not accepted in body, query or multipart; send bytes with bodyBase64 or multipart[].bodyBase64",
+    );
+  }
+  if (Array.isArray(args.ctx.multipart)) {
+    const problem = multipartPartsProblem(args.ctx.multipart);
+    if (problem) {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: args.ctx.method,
+        path: args.ctx.path,
+        decision: "deny",
+        category: "malformed",
+        reason: problem.reason,
+        ts: new Date().toISOString(),
+      });
+      throw new ToolError(problem.message);
+    }
+  }
   // Validate before any token mint / elicitation round: a doomed request must
   // not cost the user an approval dialog first.
   assertAllowedCtxHeaders(args.ctx.headers);
@@ -395,9 +572,28 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     },
     { containsPii: true },
   );
-  const op = resolveOperation(spec, ctx.method, ctx.path);
+  // F-1 / F-6: refuse any segment the WHATWG URL parser could rewrite (dot
+  // segments, `\`, control characters) or that smuggles query/fragment syntax
+  // (a raw `?` or `#`) or an extra segment (encoded `/` or `\`), so the
+  // operation matched below is the operation the upstream receives. An encoded
+  // `?`/`#` inside a value is fine: the wire path re-encodes it.
+  if (hasUnsafePathSegment(ctx.path)) {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      decision: "deny",
+      category: "url_safety",
+      reason: "unsafe-path-segment",
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(
+      'Path contains a disallowed segment ("."/"..", a raw "\\", "?" or "#", a control character, or an encoded "/" or "\\"); pass query parameters via `query`, and percent-encode "?" or "#" inside a path value',
+    );
+  }
+  const match = matchOperation(spec, ctx.method, ctx.path);
 
-  if (!op) {
+  if (!match) {
     emitAudit(args, {
       deployment: args.deploymentName,
       method: ctx.method,
@@ -408,6 +604,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     });
     throw new ToolError(`No operation found for ${ctx.method} ${ctx.path}`);
   }
+  const op = match.op;
 
   const review = surfaceReview[op.operationId];
   if (!review) {
@@ -434,6 +631,53 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       ts: new Date().toISOString(),
     });
     throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+  }
+
+  // Build the outbound URL from the template-derived wire path BEFORE
+  // inspection, elicitation and token minting, so nothing is judged, approved
+  // or authorised for a request that cannot be sent as reviewed.
+  let urlString: string;
+  try {
+    urlString = buildUpstreamUrl(args.apiBaseUrl, match.wirePath, ctx.query);
+  } catch (err) {
+    // M3 / F-1: defence-in-depth on URL origin and path. Tag mismatch deny
+    // audits with category "url_safety" so they're greppable in production logs.
+    if (
+      err instanceof ToolError &&
+      (err.message.startsWith("upstream-url-origin-mismatch") ||
+        err.message.startsWith("upstream-url-path-mismatch"))
+    ) {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "deny",
+        category: "url_safety",
+        reason: err.message,
+        ts: new Date().toISOString(),
+      });
+    }
+    throw err;
+  }
+  // Re-resolve the operation from what the upstream will actually receive and
+  // require the very same operation object (F-1): a raw segment such as
+  // `lab%65ls` matches a param slot but goes out as the literal `labels`.
+  const wire = matchOperation(spec, ctx.method, new URL(urlString).pathname);
+  if (!wire || wire.op !== op) {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "deny",
+      category: "url_safety",
+      reason: "operation-mismatch-after-url-build",
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(
+      `Path for ${op.operationId} would reach a different operation once sent; refusing the request`,
+    );
   }
 
   // Sandbox-supplied headers are refused outright on gated operations. The
@@ -485,47 +729,68 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // are one and the same. Can throw ToolError (rawBody + non-string body); that
   // propagation is correct, mirroring the other deny paths.
   const eff = resolveEffective(nctx);
+  // What is actually marshalled: `eff`, except on gated raw JSON, where it is
+  // the canonical re-serialisation of what was inspected and approved (F-7).
+  // Plain "allow" operations keep sending the original bytes.
+  let sendEff: EffectiveBody = eff;
 
+  // Gated operations (inspected, or needing approval) must be judged on the
+  // payload that is sent. Plain "allow" operations grant the caller the
+  // operation wholesale, so they keep the legacy channel precedence.
+  const gated = review.inspect !== undefined || review.decision === "elicit";
   let inspectResult: InspectResult | undefined;
-  if (review.inspect) {
+  // What the approval dialog renders: the parsed JSON payload that is sent,
+  // or nothing when the payload cannot be shown (see `opaquePayload`).
+  let renderBody: unknown = nctx.body;
+  // Set when an approval would otherwise be asked over a payload nobody
+  // interpreted (raw non-JSON bytes or multipart, no inspector).
+  let opaquePayload: string | undefined;
+  if (gated) {
+    const denyMalformed = (why: string): never => {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "deny",
+        category: "malformed",
+        reason: why,
+        ts: new Date().toISOString(),
+      });
+      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+    };
     // One-channel guard: a legitimate caller uses exactly one body channel.
-    // Supplying two is the decoy-bypass primitive (inspect one, send another) → deny.
-    if (bodyChannelCount(nctx) > 1) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: ctx.method,
-        path: ctx.path,
-        operationId: op.operationId,
-        decision: "deny",
-        category: "malformed",
-        reason: "multiple-body-channels",
-        ts: new Date().toISOString(),
-      });
-      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
-    }
+    // Supplying two is the decoy primitive (inspect or show one, send
+    // another) → deny, on approval-only operations as well as inspected ones.
+    if (bodyChannelCount(nctx) > 1) denyMalformed("multiple-body-channels");
     const derived = deriveInspectRequest(nctx, eff, INSPECT_JSON_MAX_BYTES);
-    if (derived.oversize) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: ctx.method,
-        path: ctx.path,
-        operationId: op.operationId,
-        decision: "deny",
-        category: "malformed",
-        reason: "oversize-json-body",
-        ts: new Date().toISOString(),
-      });
-      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+    if (derived.oversize) denyMalformed("oversize-json-body");
+    if (derived.unparseableJson) denyMalformed("unparseable-json-body");
+    sendEff = derived.sendAs ?? eff;
+    if (sendEff.kind === "json") {
+      renderBody = sendEff.body;
+    } else if (sendEff.kind === "none") {
+      renderBody = undefined;
+    } else {
+      renderBody = undefined;
+      if (!review.inspect) {
+        opaquePayload =
+          sendEff.kind === "raw"
+            ? `${sendEff.contentType.slice(0, 100)}, ${sendEff.bytes.byteLength} bytes`
+            : `multipart, ${sendEff.parts.length} part${sendEff.parts.length === 1 ? "" : "s"}`;
+      }
     }
-    // Freeze the derived request so inspectors cannot mutate what will be sent,
-    // matching the deepFreeze protection previously applied to ctx.body.
-    // env rides along un-frozen (it is the live worker env, bindings included)
-    // so inspectors can resolve per-deployment policy vars.
-    inspectResult = review.inspect(deepFreeze(derived.req), args.env);
-    decision = mostRestrictive(decision, inspectResult.decision);
-    if (inspectResult.category) category = inspectResult.category;
-    if (inspectResult.reason) reason = inspectResult.reason;
-    if (inspectResult.message) denyMessage = inspectResult.message;
+    if (review.inspect) {
+      // Freeze the derived request so inspectors cannot mutate what will be sent,
+      // matching the deepFreeze protection previously applied to ctx.body.
+      // env rides along un-frozen (it is the live worker env, bindings included)
+      // so inspectors can resolve per-deployment policy vars.
+      inspectResult = review.inspect(deepFreeze(derived.req), args.env);
+      decision = mostRestrictive(decision, inspectResult.decision);
+      if (inspectResult.category) category = inspectResult.category;
+      if (inspectResult.reason) reason = inspectResult.reason;
+      if (inspectResult.message) denyMessage = inspectResult.message;
+    }
   }
 
   if (decision === "deny") {
@@ -562,7 +827,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       operationId: op.operationId,
       method: ctx.method,
       path: ctx.path,
-      body: nctx.body,
+      body: renderBody,
+      ...(opaquePayload !== undefined ? { opaquePayload } : {}),
       env: args.env,
       ...(args.relatedRequestId !== undefined ? { relatedRequestId: args.relatedRequestId } : {}),
       ...(ctx.query !== undefined ? { query: ctx.query } : {}),
@@ -599,27 +865,6 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     refreshToken: args.oauth.refreshTokenAccessor(args.props),
   });
 
-  let urlString: string;
-  try {
-    urlString = buildUpstreamUrl(args.apiBaseUrl, ctx.path, ctx.query);
-  } catch (err) {
-    // M3: defence-in-depth on URL origin. Tag origin-mismatch deny audits
-    // with category "url_safety" so they're greppable in production logs.
-    if (err instanceof ToolError && err.message.startsWith("upstream-url-origin-mismatch")) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: ctx.method,
-        path: ctx.path,
-        operationId: op.operationId,
-        decision: "deny",
-        category: "url_safety",
-        reason: err.message,
-        ts: new Date().toISOString(),
-      });
-    }
-    throw err;
-  }
-
   // ctx.headers first (validated at entry), so the scaffold-controlled set
   // below always wins on collision — sandbox code can extend, never override.
   // Collisions are matched case-insensitively: a plain-object spread would
@@ -634,9 +879,10 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   };
   setHeader("Authorization", `Bearer ${accessToken}`);
 
-  // Marshal the SAME effective payload resolved before inspection, so the bytes
-  // inspected and the bytes sent are one and the same.
-  const { bodyToSend, contentType: outboundContentType } = marshalBody(nctx, eff);
+  // Marshal the SAME effective payload resolved before inspection (or its
+  // canonical form, see `sendEff`), so the bytes inspected and the bytes sent
+  // are one and the same.
+  const { bodyToSend, contentType: outboundContentType } = marshalBody(nctx, sendEff);
   if (outboundContentType) {
     setHeader("content-type", outboundContentType);
   }
@@ -647,7 +893,10 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     }
   }
 
-  const fetchOptions: RequestInit = { method: ctx.method, headers };
+  // F-17: never follow redirects. The origin and path guards vouch only for
+  // the URL built above; a followed 3xx would replay the request to wherever
+  // the upstream (or anything in front of it) points, unreviewed.
+  const fetchOptions: RequestInit = { method: ctx.method, headers, redirect: "manual" };
   if (bodyToSend !== undefined) fetchOptions.body = bodyToSend;
 
   const upstreamRes = await fetch(urlString, fetchOptions);
@@ -669,6 +918,31 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // operationally interesting signal, whereas per-call remaining counters would
   // bloat every audit line.
   const rateLimitAudit = rateLimit && upstreamRes.status === 429 ? { rateLimit } : {};
+
+  // A 3xx (other than 304 Not Modified) is reported, never followed or staged.
+  // `Location` is not echoed: it is upstream-controlled and may carry tokens.
+  if (upstreamRes.status >= 300 && upstreamRes.status < 400 && upstreamRes.status !== 304) {
+    try { await upstreamRes.body?.cancel(); } catch { /* best effort */ }
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "allow",
+      upstreamStatus: upstreamRes.status,
+      ts: new Date().toISOString(),
+    });
+    return {
+      success: false,
+      status: upstreamRes.status,
+      result: { error: "upstream_redirect" },
+      errors: [{
+        code: upstreamRes.status,
+        message: `Upstream answered with a redirect (HTTP ${upstreamRes.status}); redirects are not followed`,
+      }],
+      ...rateLimitField,
+    };
+  }
 
   // Stage-mode: only on 2xx + putFile dep present. Bytes go straight to R2,
   // bypassing truncateForReturn. On non-2xx, fall through to the normal error

@@ -182,6 +182,10 @@
                         "hard": {
                           "type": "boolean",
                           "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                        },
+                        "tz": {
+                          "type": "string",
+                          "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                         }
                       },
                       "required": [
@@ -192,7 +196,7 @@
                       ],
                       "additionalProperties": false
                     },
-                    "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                    "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                   },
                   "dependencies": {
                     "type": "array",
@@ -540,6 +544,10 @@
                           "hard": {
                             "type": "boolean",
                             "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                          },
+                          "tz": {
+                            "type": "string",
+                            "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                           }
                         },
                         "required": [
@@ -549,7 +557,7 @@
                           "hard"
                         ]
                       },
-                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                     },
                     "dependencies": {
                       "type": "array",
@@ -968,6 +976,10 @@
                                 "hard": {
                                   "type": "boolean",
                                   "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                                },
+                                "tz": {
+                                  "type": "string",
+                                  "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                                 }
                               },
                               "required": [
@@ -977,7 +989,7 @@
                                 "hard"
                               ]
                             },
-                            "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                            "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                           },
                           "dependencies": {
                             "type": "array",
@@ -1326,6 +1338,10 @@
                           "hard": {
                             "type": "boolean",
                             "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                          },
+                          "tz": {
+                            "type": "string",
+                            "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                           }
                         },
                         "required": [
@@ -1335,7 +1351,7 @@
                           "hard"
                         ]
                       },
-                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                     },
                     "dependencies": {
                       "type": "array",
@@ -1673,6 +1689,10 @@
                         "hard": {
                           "type": "boolean",
                           "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                        },
+                        "tz": {
+                          "type": "string",
+                          "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                         }
                       },
                       "required": [
@@ -1683,7 +1703,7 @@
                       ],
                       "additionalProperties": false
                     },
-                    "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                    "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                   },
                   "dependencies": {
                     "type": "array",
@@ -2026,6 +2046,10 @@
                           "hard": {
                             "type": "boolean",
                             "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                          },
+                          "tz": {
+                            "type": "string",
+                            "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
                           }
                         },
                         "required": [
@@ -2035,7 +2059,7 @@
                           "hard"
                         ]
                       },
-                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed)."
+                      "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
                     },
                     "dependencies": {
                       "type": "array",
@@ -2314,7 +2338,7 @@
                   "pinned_tz": {
                     "type": "string",
                     "nullable": true,
-                    "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York')."
+                    "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York'); stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine)."
                   },
                   "duration_minutes": {
                     "type": "integer",
@@ -2324,10 +2348,60 @@
                   },
                   "task_body": {
                     "type": "object",
-                    "additionalProperties": {
-                      "nullable": true
+                    "properties": {
+                      "preferred_windows": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "days": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "enum": [
+                                  "mon",
+                                  "tue",
+                                  "wed",
+                                  "thu",
+                                  "fri",
+                                  "sat",
+                                  "sun"
+                                ]
+                              },
+                              "minItems": 1,
+                              "description": "Weekdays this window applies to; any of 'mon','tue','wed','thu','fri','sat','sun'. At least one."
+                            },
+                            "start": {
+                              "type": "string",
+                              "pattern": "^\\d{2}:\\d{2}$",
+                              "description": "Window start time of day, 'HH:MM'."
+                            },
+                            "end": {
+                              "type": "string",
+                              "pattern": "^\\d{2}:\\d{2}$",
+                              "description": "Window end time of day, 'HH:MM'."
+                            },
+                            "hard": {
+                              "type": "boolean",
+                              "description": "If true, the task must land inside one of its windows when scheduled; if no window slot is free it is dropped rather than placed outside (if false, falling outside is a weighed penalty). A hard window also REPLACES the business-hours floor with the window itself — so to keep business hours while pinning days, set the window to your business hours (e.g. 09:00–17:00), not 00:00–23:59."
+                            },
+                            "tz": {
+                              "type": "string",
+                              "description": "IANA timezone the window's days and times are read in, e.g. 'Australia/Sydney'; stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine). Omitted: your effective timezone at solve time (so the window follows a timezone change). Set automatically to your previous timezone when you change it; may also be set explicitly. A window in another zone than the one being planned in is converted to the equivalent local times, which can move it to a different weekday or split it at midnight."
+                            }
+                          },
+                          "required": [
+                            "days",
+                            "start",
+                            "end",
+                            "hard"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "description": "Recurring time-of-day windows the task should fall within. Each window is weighed, or required if hard. A task with NO pin and NO hard window is confined to your configured business hours (fetch them at GET /v1/business-hours; a 09:00–17:00 Mon–Fri default applies unless changed). Days and times are read in the window's own `tz` when set, else in your effective timezone (GET /v1/timezone) at solve time. Changing your timezone stamps the OLD zone onto every untimezoned window of your tasks, so existing windows keep their real-world times; recurring-task templates are not stamped and follow your timezone."
+                      }
                     },
-                    "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.); validated when the occurrence is materialised."
+                    "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.). preferred_windows is validated on write (same rules as a task's, tz canonicalised); the rest is validated when the occurrence is materialised, and an occurrence that fails is skipped."
                   },
                   "active_from": {
                     "type": "string",
@@ -2400,7 +2474,7 @@
                     "pinned_tz": {
                       "type": "string",
                       "nullable": true,
-                      "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York')."
+                      "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York'); stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine)."
                     },
                     "duration_minutes": {
                       "type": "integer",
@@ -2413,7 +2487,7 @@
                       "additionalProperties": {
                         "nullable": true
                       },
-                      "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.); validated when the occurrence is materialised."
+                      "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.). preferred_windows is validated on write (same rules as a task's, tz canonicalised); the rest is validated when the occurrence is materialised, and an occurrence that fails is skipped."
                     },
                     "active_from": {
                       "type": "string",
@@ -2527,7 +2601,7 @@
                           "pinned_tz": {
                             "type": "string",
                             "nullable": true,
-                            "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York')."
+                            "description": "IANA timezone used to interpret pinned_time (e.g. 'Australia/Sydney', 'America/New_York'); stored in canonical spelling. UTC offsets such as '+10:00' and bare abbreviations such as 'EST' are rejected (use an Area/Location name; 'UTC' is fine)."
                           },
                           "duration_minutes": {
                             "type": "integer",
@@ -2540,7 +2614,7 @@
                             "additionalProperties": {
                               "nullable": true
                             },
-                            "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.); validated when the occurrence is materialised."
+                            "description": "Partial Task fields applied to each generated occurrence (priority, deadline, preferred_windows, etc.). preferred_windows is validated on write (same rules as a task's, tz canonicalised); the rest is validated when the occurrence is materialised, and an occurrence that fails is skipped."
                           },
                           "active_from": {
                             "type": "string",
@@ -2943,7 +3017,7 @@
       "get": {
         "operationId": "getLatestProposedPlan",
         "summary": "The caller's latest uncommitted proposed plan.",
-        "description": "Return the caller's most recent uncommitted proposed plan. With ?covers=<ISO instant>, return the latest plan whose window covers that instant (the week containing it) instead of the global most-recent — used to deterministically read back a webhook-triggered replan.",
+        "description": "Return the caller's most recent uncommitted proposed plan. With ?covers=<ISO instant>, return the latest plan whose window covers that instant (the week containing it) instead of the global most-recent — used to deterministically read back a webhook-triggered replan. Plans produced under a timezone other than the caller's current effective timezone are skipped (they cannot be committed).",
         "security": [
           {
             "BearerAuth": []
@@ -3068,7 +3142,7 @@
       "get": {
         "operationId": "listPendingPlans",
         "summary": "List every pending (uncommitted, unexpired) proposed plan.",
-        "description": "List all of the caller's pending proposed plans — uncommitted and unexpired — as lightweight summaries, ordered by window start. A burst of replans can leave pending plans strewn across widely separated weeks; this is the one-call way to enumerate (and then review or DELETE) all of them, instead of probing week-by-week via /plans/latest?covers. Fetch a specific plan's full body via GET /plans/{plan_hash}.",
+        "description": "List all of the caller's pending proposed plans — uncommitted and unexpired — as lightweight summaries, ordered by window start. A burst of replans can leave pending plans strewn across widely separated weeks; this is the one-call way to enumerate (and then review or DELETE) all of them, instead of probing week-by-week via /plans/latest?covers. Plans produced under a timezone other than the caller's current effective timezone are omitted (they cannot be committed). Fetch a specific plan's full body via GET /plans/{plan_hash}.",
         "security": [
           {
             "BearerAuth": []
@@ -3438,12 +3512,12 @@
                   "window_start": {
                     "type": "string",
                     "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(Z|[+-]\\d{2}:?\\d{2})?$",
-                    "description": "Start of the date window to solve (ISO 8601). The solver only places work inside [window_start, window_end). Align both bounds to a 15-minute block boundary (:00/:15/:30/:45) — the solver models time in 15-minute slots and truncates a fractional bound inward, silently shrinking the window."
+                    "description": "Start of the date window to solve (ISO 8601). For a week, pass the caller's LOCAL Monday 00:00 in their effective timezone (home_tz from GET /v1/whoami or tz from GET /v1/timezone), e.g. 2026-05-18T00:00:00-07:00 for America/Los_Angeles — not UTC midnight, which west of UTC falls on the previous local Sunday and so into the previous week. Plans are grouped into weeks (supersede, accept, churn and drop baselines) by the local week containing window_start in that timezone. The solver only places work inside [window_start, window_end). Align both bounds to a 15-minute block boundary (:00/:15/:30/:45) — the solver models time in 15-minute slots and truncates a fractional bound inward, silently shrinking the window."
                   },
                   "window_end": {
                     "type": "string",
                     "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(Z|[+-]\\d{2}:?\\d{2})?$",
-                    "description": "End of the date window to solve (ISO 8601), exclusive. Use a 15-minute-aligned instant: for a whole day, pass the NEXT day's midnight (e.g. 2026-07-10T00:00:00+10:00), NOT 23:59:59 — an unaligned end truncates down to the previous block (23:59:59 → 23:45), dropping the last 15 minutes of the day."
+                    "description": "End of the date window to solve (ISO 8601), exclusive. For a week, pass the following local Monday 00:00 in the same effective timezone as window_start. Use a 15-minute-aligned instant: for a whole day, pass the NEXT day's local midnight (e.g. 2026-07-10T00:00:00+10:00), NOT 23:59:59 — an unaligned end truncates down to the previous block (23:59:59 → 23:45), dropping the last 15 minutes of the day."
                   },
                   "weights_override": {
                     "type": "object",
@@ -3710,7 +3784,7 @@
       "post": {
         "operationId": "commit",
         "summary": "Commit a proposed plan to Google Calendar.",
-        "description": "Commit a proposed plan (by plan_hash) to Google Calendar, creating/updating the corresponding events. Irreversible from the API's perspective. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed.",
+        "description": "Commit a proposed plan (by plan_hash) to Google Calendar, creating/updating the corresponding events. Irreversible from the API's perspective. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
         "security": [
           {
             "BearerAuth": []
@@ -4167,7 +4241,7 @@
         ],
         "operationId": "acceptPlan",
         "summary": "Accept (commit) the proposed plan identified by {plan_hash}.",
-        "description": "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer. If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. Idempotent on an already-committed hash.",
+        "description": "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer. If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash.",
         "responses": {
           "200": {
             "description": "Committed (idempotent on an already-committed plan)",
@@ -5840,7 +5914,7 @@
       "get": {
         "operationId": "whoami",
         "summary": "The caller's own identity and effective timezone.",
-        "description": "Return the bearer subject's email and effective home timezone (their configured home_tz, else the instance default SCHEDULER_TZ).",
+        "description": "Return the bearer subject's email, effective home timezone (their configured home_tz, else the instance default SCHEDULER_TZ), and connected calendar provider.",
         "security": [
           {
             "BearerAuth": []
@@ -5861,11 +5935,20 @@
                     "home_tz": {
                       "type": "string",
                       "description": "The caller's effective home timezone (their configured home_tz, else the instance default SCHEDULER_TZ)."
+                    },
+                    "provider": {
+                      "type": "string",
+                      "enum": [
+                        "google",
+                        "microsoft"
+                      ],
+                      "description": "The caller's connected calendar/identity provider (same lookup calendar-access-token.ts uses; defaults to google for a subject with no identity_tokens row)."
                     }
                   },
                   "required": [
                     "email",
-                    "home_tz"
+                    "home_tz",
+                    "provider"
                   ]
                 }
               }
@@ -5898,6 +5981,379 @@
                   "properties": {
                     "error": {
                       "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/timezone": {
+      "get": {
+        "operationId": "getTimezone",
+        "tags": [
+          "config"
+        ],
+        "summary": "The caller's effective timezone.",
+        "description": "Return the caller's effective timezone: their own home_tz if they have set one (source 'user'), else the instance default SCHEDULER_TZ (source 'default'). This is the zone business hours, the solve window and fit-curve times are interpreted in, and the same value GET /v1/whoami reports as home_tz. superseded_plans is always 0 on a read.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Effective timezone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tz": {
+                      "type": "string",
+                      "description": "The caller's effective IANA timezone: their own home_tz if set, else the instance default SCHEDULER_TZ."
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "user",
+                        "default"
+                      ],
+                      "description": "'user' if the caller has set their own timezone (even one equal to the instance default), else 'default' (inheriting SCHEDULER_TZ)."
+                    },
+                    "superseded_plans": {
+                      "type": "integer",
+                      "description": "How many of the caller's pending (uncommitted) proposed plans this call discarded. Non-zero only on a write that changed the effective timezone; always 0 on GET."
+                    }
+                  },
+                  "required": [
+                    "tz",
+                    "source",
+                    "superseded_plans"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token carries no subject",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "setTimezone",
+        "tags": [
+          "config"
+        ],
+        "summary": "Set the caller's timezone.",
+        "description": "Set the caller's timezone to an IANA zone (e.g. 'Europe/London'). The zone is validated and stored in its canonical spelling ('europe/london' is stored as 'Europe/London'); an unknown zone, a UTC offset such as '+10:00' (not an IANA zone: no daylight-saving rules), or a bare abbreviation such as 'EST' (tzdata maps it to a fixed-offset zone like America/Panama, not US Eastern; use an Area/Location name, 'UTC' is fine) is 400 validation_failed and changes nothing. This only changes config and does not replan: business hours are interpreted in the new timezone from the next resolve, whatever triggers it (calendar webhook, the Monday cron, replanNow or resolve). When the effective timezone actually changes, every pending (uncommitted) proposed plan for the caller is discarded, since it was solved against the old business hours and week, and superseded_plans reports how many; committed plans are untouched, and a write that leaves the effective timezone unchanged discards nothing. Hard pins, deadlines and templates with their own pinned_tz are instants or carry their own zone, so they are unaffected. Task preferred_windows without their own tz are frozen in the zone being left: the change stamps that zone onto them (on every task, done ones included, in the same atomic write), so they keep their real-world times; recurring-task templates are not stamped and follow the new zone for future occurrences; free-floating chunks outside the new business hours move at the next resolve. To see the replanned week now, call POST /v1/replan-now?force=true.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tz": {
+                    "type": "string",
+                    "description": "IANA timezone name, e.g. 'Australia/Sydney' or 'Europe/London'. Matched case-insensitively and stored in canonical spelling."
+                  }
+                },
+                "required": [
+                  "tz"
+                ],
+                "additionalProperties": false,
+                "description": "The caller's new timezone. Unknown keys are rejected (400), not silently ignored."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New effective timezone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tz": {
+                      "type": "string",
+                      "description": "The caller's effective IANA timezone: their own home_tz if set, else the instance default SCHEDULER_TZ."
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "user",
+                        "default"
+                      ],
+                      "description": "'user' if the caller has set their own timezone (even one equal to the instance default), else 'default' (inheriting SCHEDULER_TZ)."
+                    },
+                    "superseded_plans": {
+                      "type": "integer",
+                      "description": "How many of the caller's pending (uncommitted) proposed plans this call discarded. Non-zero only on a write that changed the effective timezone; always 0 on GET."
+                    }
+                  },
+                  "required": [
+                    "tz",
+                    "source",
+                    "superseded_plans"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "validation_failed: tz missing or not a known IANA zone, or an unknown key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token carries no subject",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no_user_row: the caller has no users row (created at sign-in). Nothing is written and no plans are discarded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "resetTimezone",
+        "tags": [
+          "config"
+        ],
+        "summary": "Reset the caller's timezone to the instance default.",
+        "description": "Clear the caller's own timezone so they inherit the instance default SCHEDULER_TZ again (source 'default'). As with setTimezone, when this changes the effective timezone every pending (uncommitted) proposed plan for the caller is discarded (reported in superseded_plans), no replan runs until the next resolve, untimezoned task preferred_windows are stamped with the zone being left, and clients should call POST /v1/replan-now?force=true to replan now. Idempotent: calling it when already on the default is a 200 no-op that discards nothing.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default timezone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tz": {
+                      "type": "string",
+                      "description": "The caller's effective IANA timezone: their own home_tz if set, else the instance default SCHEDULER_TZ."
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "user",
+                        "default"
+                      ],
+                      "description": "'user' if the caller has set their own timezone (even one equal to the instance default), else 'default' (inheriting SCHEDULER_TZ)."
+                    },
+                    "superseded_plans": {
+                      "type": "integer",
+                      "description": "How many of the caller's pending (uncommitted) proposed plans this call discarded. Non-zero only on a write that changed the effective timezone; always 0 on GET."
+                    }
+                  },
+                  "required": [
+                    "tz",
+                    "source",
+                    "superseded_plans"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid bearer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token carries no subject",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no_user_row: the caller has no users row (created at sign-in). Nothing is written and no plans are discarded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "description": "Machine-readable error code."
+                    },
+                    "detail": {
+                      "type": "string",
+                      "description": "Human-readable detail; not machine-readable."
                     }
                   },
                   "required": [

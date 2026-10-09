@@ -77,3 +77,36 @@ describe("McpServer._registeredTools SDK-shape drift guard (Task 6)", () => {
     await server.close();
   });
 });
+
+// init() also sets `search`'s annotations to `{ readOnlyHint: true }` through
+// the same pre-connect `update()` (2026-10-07 security review, F-4). Pin that
+// the SDK applies an annotations update and that clients see it.
+describe("McpServer._registeredTools annotations update (F-4)", () => {
+  it("annotations set pre-connect via update() reach a connected client", async () => {
+    const server = new McpServer({ name: "sdk-shape-guard", version: "1.0.0" });
+    server.registerTool(
+      "dummy",
+      { description: "original", inputSchema: {} },
+      async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+    );
+    const registeredTools = (server as unknown as {
+      _registeredTools: Record<
+        string,
+        { update(u: { description?: string; annotations?: { readOnlyHint?: boolean } }): void }
+      >;
+    })._registeredTools;
+    registeredTools.dummy!.update({ description: "patched", annotations: { readOnlyHint: true } });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "test", version: "1.0" });
+    await client.connect(clientTransport);
+
+    const dummy = (await client.listTools()).tools.find((t) => t.name === "dummy");
+    expect(dummy?.description).toBe("patched");
+    expect(dummy?.annotations?.readOnlyHint).toBe(true);
+
+    await client.close();
+    await server.close();
+  });
+});

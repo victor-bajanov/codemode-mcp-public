@@ -1,5 +1,5 @@
 import type { InspectEnv, InspectRequest, InspectResult } from "@local/shared";
-import { isAllowedRecipient, outboundAllowlistFromEnv } from "./allowlist.js";
+import { isAllowedRecipient, isPlainAddrSpec, outboundAllowlistFromEnv } from "./allowlist.js";
 
 /** Strictly-greater-than threshold for mass-send elicitation. 26+ recipients elicits. */
 export const MASS_SEND_THRESHOLD = 25;
@@ -73,58 +73,218 @@ export function decodeEncodedWords(value: string): string {
 }
 
 /**
- * Split an RFC 822 address-list header value on commas. Trims each element,
- * filters empties. Does not handle quoted display names with embedded commas
- * — slice 1 inputs are simple `a@b, c@d` style. Bare-angle-bracket form
- * `Name <addr@host>` has its bracketed address extracted when present.
+ * Split an RFC 822 address-list header value on commas, trim each element and
+ * drop empties. The split is naive (it does not know about quoted strings or
+ * comments), so each element is then read conservatively and fails closed:
+ *
+ *   - an element containing `"`, `(` or `)` is returned unchanged. A quoted
+ *     display-name or a CFWS comment can carry text that looks like an
+ *     angle-addr but is not where the message goes: `"<ok@a>" <evil@x>` and
+ *     `evil@x (<ok@a>)` are both delivered to evil@x. Returned unchanged, the
+ *     element is not a plain addr-spec, so `isAllowedRecipient` refuses it and
+ *     the send denies as external-send (F-3, F-18);
+ *   - the angle-addr of `Name <addr@host>` is extracted only when the element
+ *     has exactly one `<` and one `>`, the `>` is its last character, and the
+ *     display-name before the `<` is an unquoted RFC 5322 phrase: atext,
+ *     dots and whitespace only (non-ASCII allowed, as RFC 6532 does). A
+ *     display-name holding `@`, `:`, `;`, `[`, `]`, `\` or `,` is not a
+ *     phrase, and a mainstream parser reads `evil@x <ok@a>`, `evil@x: <ok@a>`
+ *     or `g:evil@x; <ok@a>` as a message to evil@x (F-3);
+ *   - anything else is returned unchanged (and so refused).
+ *
+ * Known false positive, accepted: a quoted display-name, including one with
+ * an embedded comma such as `"Smith, John" <ok@a>`, is refused, as is a
+ * display-name that repeats the address (`ok@a <ok@a>`).
  */
 function splitAddresses(headerValue: string): string[] {
   return headerValue
     .split(",")
     .map((part) => {
       const s = part.trim();
+      if (/["()]/.test(s)) return s;
       const lt = s.indexOf("<");
-      const gt = s.indexOf(">", lt + 1);
-      if (lt >= 0 && gt > lt) {
-        return s.slice(lt + 1, gt).trim();
-      }
-      return s;
+      if (lt < 0) return s;
+      const gt = s.indexOf(">");
+      const singleAngleAddr =
+        lt === s.lastIndexOf("<") && gt === s.lastIndexOf(">") && gt === s.length - 1 && gt > lt;
+      if (!singleAngleAddr) return s;
+      if (!DISPLAY_NAME_PHRASE.test(s.slice(0, lt))) return s;
+      return s.slice(lt + 1, gt).trim();
     })
     .filter((s) => s.length > 0);
 }
 
+/** An unquoted RFC 5322 display-name (possibly empty): atext, `.` (obs-phrase)
+ *  and whitespace, plus non-ASCII text (RFC 6532). RFC 2047 encoded-words are
+ *  made of atext, so they pass. Excludes the specials `@ : ; , [ ] \ < > " ( )`. */
+const DISPLAY_NAME_PHRASE = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~.\s\u0080-\uFFFF]*$/;
+
+/** Normalise CRLF line endings to LF, so every RFC 822 reader in this module
+ *  agrees on where lines (and the header block) end. A lone CR is NOT a line
+ *  ending here: RFC 5322 does not define it as one and MIME readers disagree
+ *  on it, so `lineEndingDecision` refuses any lone CR in the header block
+ *  before this reading is relied on (F-3). */
+function normaliseLineEndings(text: string): string {
+  return text.replace(/\r\n/g, "\n");
+}
+
 /**
- * Parse RFC 822 header section. Splits on the first blank line (CRLF or LF
- * variants), unfolds continuation lines (a line beginning with a space or tab
- * is a continuation of the previous header per RFC 822 §3.1.1 — dropping this
- * would hide a folded recipient list from the inspector while Gmail still
- * unfolds and sends to it), then walks each header line pulling `Name: Value`.
- * Header names are normalized to lowercase. Structured fields are not parsed
- * further — slice 1 fixtures are otherwise single-line.
+ * Deny when the header block's line endings are ambiguous. The header block is
+ * found with CRLF and bare LF as the only line endings (as `parseHeaders`
+ * reads it) and runs up to and including the first empty line, or over the
+ * whole text when there is none. Within it:
+ *
+ *   - a CR not followed by LF is refused: some readers (Python's feedparser,
+ *     JavaMail) treat a lone CR as a line break, others (MimeKit, many MTAs)
+ *     as an ordinary character, so `To: a\r\rTo: b` is one To header, two,
+ *     or a To followed by body depending on the reader;
+ *   - CRLF mixed with bare LF is refused: a reader that detects the
+ *     line-ending style from the first line would not see `\r\n\n` or
+ *     `\n\r\n` as the end of the header block.
+ *
+ * Failing closed here, rather than picking one reading, keeps the inspector
+ * from judging a recipient set Gmail's MTA might not use (F-3). The body is
+ * not examined.
  */
-function parseHeaders(rfc822: string): Map<string, string> {
-  const headers = new Map<string, string>();
-  // Locate end of header section.
-  let endIdx = rfc822.indexOf("\r\n\r\n");
-  if (endIdx < 0) endIdx = rfc822.indexOf("\n\n");
-  const headerSection = endIdx >= 0 ? rfc822.slice(0, endIdx) : rfc822;
-  const rawLines = headerSection.split(/\r?\n/);
+function lineEndingDecision(text: string): InspectResult | null {
+  const ambiguous: InspectResult = {
+    decision: "deny",
+    category: "malformed",
+    reason: "ambiguous-line-ending",
+    message:
+      "The message header block has a bare CR or mixes CRLF with bare LF line endings; " +
+      "end every header line, and the blank line after the headers, with CRLF",
+  };
+  const lineEnd = /\r?\n/g;
+  let start = 0;
+  let sawCrlf = false;
+  let sawLf = false;
+  let m: RegExpExecArray | null;
+  while ((m = lineEnd.exec(text)) !== null) {
+    const line = text.slice(start, m.index);
+    if (line.includes("\r")) return ambiguous;
+    if (m[0] === "\r\n") sawCrlf = true;
+    else sawLf = true;
+    if (sawCrlf && sawLf) return ambiguous;
+    start = m.index + m[0].length;
+    if (line.length === 0) return null; // the empty line ends the header block
+  }
+  // No empty line: the whole text is the header section.
+  return text.slice(start).includes("\r") ? ambiguous : null;
+}
+
+/**
+ * The header section's lines, unfolded. Line endings are normalised first
+ * (CRLF becomes LF; callers deny a lone CR or mixed endings in the header
+ * block via `lineEndingDecision` before relying on the result), and the
+ * header section ends at the FIRST empty line, as RFC 5322 §2.1 requires; a
+ * message that begins with an empty line has an empty header section.
+ * Searching for one terminator style before the other would let a bare-LF
+ * header block be extended into the body by a later CRLFCRLF, with body text
+ * then parsed as headers (F-3).
+ *
+ * Continuation lines are unfolded (a line beginning with a space or tab is a
+ * continuation of the previous header per RFC 822 §3.1.1 — dropping this
+ * would hide a folded recipient list from the inspector while Gmail still
+ * unfolds and sends to it).
+ */
+function unfoldedHeaderLines(rfc822: string): string[] {
+  const text = normaliseLineEndings(rfc822);
+  let headerSection: string;
+  if (text.startsWith("\n")) {
+    headerSection = "";
+  } else {
+    const endIdx = text.indexOf("\n\n");
+    headerSection = endIdx >= 0 ? text.slice(0, endIdx) : text;
+  }
+  if (headerSection.length === 0) return [];
   const lines: string[] = [];
-  for (const line of rawLines) {
+  for (const line of headerSection.split("\n")) {
     if ((line.startsWith(" ") || line.startsWith("\t")) && lines.length > 0) {
       lines[lines.length - 1] += " " + line.trim();
     } else {
       lines.push(line);
     }
   }
-  for (const line of lines) {
+  return lines;
+}
+
+/**
+ * Parse the RFC 822 header section (see `unfoldedHeaderLines` for where it
+ * ends and how folding is handled); each header line yields `Name: Value`.
+ * Header names are normalised to lowercase and EVERY occurrence is kept, in
+ * order: MTAs honour every recipient line, so keeping only the last one would
+ * judge a message on a recipient set Gmail does not use (F-3). Structured
+ * fields are not parsed further.
+ */
+function parseHeaders(rfc822: string): Map<string, string[]> {
+  const headers = new Map<string, string[]>();
+  for (const line of unfoldedHeaderLines(rfc822)) {
     const colon = line.indexOf(":");
     if (colon < 0) continue;
     const name = line.slice(0, colon).trim().toLowerCase();
     const value = line.slice(colon + 1).trim();
-    if (name.length > 0) headers.set(name, value);
+    if (name.length === 0) continue;
+    const existing = headers.get(name);
+    if (existing) existing.push(value);
+    else headers.set(name, [value]);
   }
   return headers;
+}
+
+/** RFC 5322 §3.6.8 field-name: one or more printable US-ASCII characters
+ *  other than the colon. */
+const FIELD_NAME = /^[\x21-\x39\x3b-\x7e]+$/;
+
+/**
+ * Deny when a header line's field name is not RFC 5322 ftext (printable
+ * US-ASCII except the colon), for example `Bcc\0: x@y` or `B cc: x@y`.
+ * `parseHeaders` would file such a line under an unknown name, so it would
+ * not be judged as a recipient header, while a lenient reader might still
+ * treat it as one. Whitespace between the name and the colon (RFC 5322
+ * obsolete syntax) is tolerated. Lines without a colon are left alone.
+ */
+function headerNameDecision(text: string): InspectResult | null {
+  for (const line of unfoldedHeaderLines(text)) {
+    const colon = line.indexOf(":");
+    if (colon < 0) continue;
+    if (!FIELD_NAME.test(line.slice(0, colon).replace(/[ \t]+$/, ""))) {
+      return {
+        decision: "deny",
+        category: "malformed",
+        reason: "malformed-header-name",
+        message:
+          "A header name in the message contains a character other than printable US-ASCII " +
+          "(or is empty); use plain header names such as To, Cc and Bcc",
+      };
+    }
+  }
+  return null;
+}
+
+/** First occurrence of a header (display-only fields such as Subject). */
+function firstHeader(headers: Map<string, string[]>, name: string): string | undefined {
+  return headers.get(name)?.[0];
+}
+
+/**
+ * Deny when `To`, `Cc` or `Bcc` occurs more than once. RFC 5322 §3.6 allows
+ * each at most once, and readers disagree on a repeat (first wins, last wins,
+ * or all are merged), so the inspector refuses the ambiguity outright rather
+ * than guessing which reading Gmail's MTA applies (F-3).
+ */
+function recipientHeaderDecision(headers: Map<string, string[]>): InspectResult | null {
+  for (const name of ["to", "cc", "bcc"] as const) {
+    if ((headers.get(name)?.length ?? 0) > 1) {
+      return {
+        decision: "deny",
+        category: "malformed",
+        reason: "duplicate-recipient-header",
+        message: "The message repeats a To, Cc or Bcc header; send one header per recipient field",
+      };
+    }
+  }
+  return null;
 }
 
 /** Max bytes to decode when scanning an uploaded message for its header block.
@@ -132,20 +292,39 @@ function parseHeaders(rfc822: string): Map<string, string> {
  *  50 MB attachment. */
 const RFC822_HEADER_SCAN_BYTES = 64 * 1024;
 
-/** Recipients (to/cc/bcc) parsed from raw RFC 822 header text. */
-function recipientsFromRfc822(text: string): string[] {
-  const headers = parseHeaders(text);
+/** Recipient addresses (to/cc/bcc, every occurrence) from parsed headers,
+ *  un-normalised. Callers run `recipientHeaderDecision` first. */
+function recipientsFromHeaders(headers: Map<string, string[]>): string[] {
   const collected: string[] = [];
   for (const name of ["to", "cc", "bcc"] as const) {
-    const v = headers.get(name);
-    if (typeof v === "string" && v.length > 0) collected.push(...splitAddresses(v));
+    for (const v of headers.get(name) ?? []) {
+      if (v.length > 0) collected.push(...splitAddresses(v));
+    }
   }
-  return Array.from(new Set(collected.map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0)));
+  return collected;
 }
 
-/** Subject parsed from raw RFC 822 header text (display-only, encoded-words decoded). */
+/** Recipients (to/cc/bcc) parsed from raw RFC 822 header text, or the
+ *  ambiguous-line-ending, malformed-header-name or duplicate-recipient-header
+ *  deny. */
+function recipientsFromRfc822(text: string): { recipients: string[] } | { deny: InspectResult } {
+  const lineEndingDeny = lineEndingDecision(text);
+  if (lineEndingDeny) return { deny: lineEndingDeny };
+  const nameDeny = headerNameDecision(text);
+  if (nameDeny) return { deny: nameDeny };
+  const headers = parseHeaders(text);
+  const deny = recipientHeaderDecision(headers);
+  if (deny) return { deny };
+  const collected = recipientsFromHeaders(headers);
+  return {
+    recipients: Array.from(new Set(collected.map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0))),
+  };
+}
+
+/** Subject parsed from raw RFC 822 header text (display-only, encoded-words
+ *  decoded; the first Subject occurrence wins). */
 function subjectFromRfc822(text: string): string {
-  return decodeEncodedWords(parseHeaders(text).get("subject") ?? "");
+  return decodeEncodedWords(firstHeader(parseHeaders(text), "subject") ?? "");
 }
 
 /** Decode a bounded prefix of bytes as UTF-8 text (non-fatal). */
@@ -159,15 +338,27 @@ function isJsonPart(contentType: string | undefined): boolean {
   return typeof contentType === "string" && /application\/(?:[\w.+-]+\+)?json\b/i.test(contentType);
 }
 
-/** True when the scanned prefix contains the header/body blank-line terminator
- *  (CRLF or LF variant). `parseHeaders` silently treats its *entire* input as
- *  the header section when no terminator is found, so a candidate whose real
- *  terminator falls past the scan window must be rejected here rather than
- *  handed to `parseHeaders` — otherwise a recipient header sitting beyond the
- *  scanned prefix (e.g. behind >64 KiB of padding) would go unseen while a
- *  visible, allowlisted header earlier in the prefix causes a false allow. */
+/** True when the scanned prefix, with line endings normalised as
+ *  `parseHeaders` does (CRLF to LF; a lone CR is not a line ending),
+ *  contains the header/body blank-line terminator or begins with an empty
+ *  line (an empty header section). `parseHeaders`
+ *  silently treats its *entire* input as the header section when no
+ *  terminator is found, so a candidate whose real terminator falls past the
+ *  scan window must be rejected here rather than handed to `parseHeaders` —
+ *  otherwise a recipient header sitting beyond the scanned prefix (e.g. behind
+ *  >64 KiB of padding) would go unseen while a visible, allowlisted header
+ *  earlier in the prefix causes a false allow. */
 function hasHeaderTerminatorWithinScan(text: string): boolean {
-  return text.includes("\r\n\r\n") || text.includes("\n\n");
+  const normalised = normaliseLineEndings(text);
+  return normalised.startsWith("\n") || normalised.includes("\n\n");
+}
+
+/** The candidate text when it can be judged: its header block ends within
+ *  the scanned prefix, or its line endings are already ambiguous within that
+ *  prefix (so `recipientsFromRfc822` denies it as ambiguous-line-ending rather
+ *  than as send-no-recipients). Otherwise null. */
+function judgeableCandidate(text: string): string | null {
+  return hasHeaderTerminatorWithinScan(text) || lineEndingDecision(text) !== null ? text : null;
 }
 
 /** Locate the uploaded message text in a non-JSON effective payload
@@ -183,7 +374,7 @@ function rfc822FromNonJson(req: InspectRequest): string | null {
       typeof req.rawBody === "string"
         ? req.rawBody.slice(0, RFC822_HEADER_SCAN_BYTES)
         : bytesPrefixToText(req.rawBody instanceof Uint8Array ? req.rawBody : new Uint8Array(req.rawBody));
-    return hasHeaderTerminatorWithinScan(text) ? text : null;
+    return judgeableCandidate(text);
   }
   if (Array.isArray(req.multipart)) {
     const parts = req.multipart;
@@ -212,10 +403,17 @@ function rfc822FromNonJson(req: InspectRequest): string | null {
       }
     }
     if (text === null) return null;
-    return hasHeaderTerminatorWithinScan(text) ? text : null;
+    return judgeableCandidate(text);
   }
   return null;
 }
+
+/** Caller-facing explanation for a recipient element that cannot be read as
+ *  one plain address (F-18). */
+export const UNREADABLE_RECIPIENT_MESSAGE =
+  "A To, Cc or Bcc recipient could not be read as a single plain address, so it " +
+  "cannot be checked against the outbound allowlist. Write each recipient as a bare " +
+  "addr@host or as Name <addr@host>, with no quotes, comments or @ : ; , [ ] \\ in the name.";
 
 /** Shared decision from a recipient set + lazy subject getter. */
 function decideRecipients(
@@ -224,6 +422,16 @@ function decideRecipients(
   getSubject: () => string,
 ): InspectResult {
   for (const r of recipients) {
+    if (!isPlainAddrSpec(r.trim().toLowerCase())) {
+      // Same audit code as an off-allowlist address (the element might hide
+      // one), but tell the caller how to write recipients that can be read.
+      return {
+        decision: "deny",
+        category: "external_data_flow",
+        reason: "external-send",
+        message: UNREADABLE_RECIPIENT_MESSAGE,
+      };
+    }
     if (!isAllowedRecipient(r, allowlist)) {
       return { decision: "deny", category: "external_data_flow", reason: "external-send" };
     }
@@ -260,8 +468,7 @@ function extractSubject(message: Record<string, unknown>): string {
       decoded = "";
     }
     if (decoded.length > 0) {
-      const headers = parseHeaders(decoded);
-      return decodeEncodedWords(headers.get("subject") ?? "");
+      return decodeEncodedWords(firstHeader(parseHeaders(decoded), "subject") ?? "");
     }
   }
   const payload = message["payload"];
@@ -284,10 +491,15 @@ function extractSubject(message: Record<string, unknown>): string {
 /**
  * Extract recipient addresses from a Gmail Message resource. Looks at
  * `message.raw` (base64url-encoded RFC 822) first; falls back to
- * `message.payload.headers`. Returns deduplicated, lowercase-normalized
- * addresses.
+ * `message.payload.headers`. Returns deduplicated, lowercase-normalised
+ * addresses, or a deny when `raw` has ambiguous header line endings
+ * (ambiguous-line-ending), a header name that is not RFC 5322 ftext
+ * (malformed-header-name) or repeats a To/Cc/Bcc header
+ * (duplicate-recipient-header). (`payload.headers` already yields every
+ * occurrence, which is what Gmail sends to, so that path collects them all
+ * and is not denied.)
  */
-function extractRecipients(message: Record<string, unknown>): string[] {
+function extractRecipients(message: Record<string, unknown>): { recipients: string[] } | { deny: InspectResult } {
   const collected: string[] = [];
 
   const raw = message["raw"];
@@ -299,13 +511,14 @@ function extractRecipients(message: Record<string, unknown>): string[] {
       decoded = "";
     }
     if (decoded.length > 0) {
+      const lineEndingDeny = lineEndingDecision(decoded);
+      if (lineEndingDeny) return { deny: lineEndingDeny };
+      const nameDeny = headerNameDecision(decoded);
+      if (nameDeny) return { deny: nameDeny };
       const headers = parseHeaders(decoded);
-      for (const name of ["to", "cc", "bcc"] as const) {
-        const v = headers.get(name);
-        if (typeof v === "string" && v.length > 0) {
-          collected.push(...splitAddresses(v));
-        }
-      }
+      const deny = recipientHeaderDecision(headers);
+      if (deny) return { deny };
+      collected.push(...recipientsFromHeaders(headers));
     }
   } else {
     const payload = message["payload"];
@@ -329,7 +542,7 @@ function extractRecipients(message: Record<string, unknown>): string[] {
   const normalized = collected
     .map((s) => s.trim().toLowerCase())
     .filter((s) => s.length > 0);
-  return Array.from(new Set(normalized));
+  return { recipients: Array.from(new Set(normalized)) };
 }
 
 /**
@@ -345,17 +558,34 @@ function extractRecipients(message: Record<string, unknown>): string[] {
  *     2. If body looks like a draft wrapper with no usable message (`id`
  *        present, no usable `message`), return deny/malformed/draft-update-no-message.
  *     3. Unwrap `body.message` if present (drafts.send update-and-send).
- *     4. Extract recipients from `raw` or `payload.headers`. Empty → deny/malformed.
+ *     4. Extract recipients from `raw` or `payload.headers`. A `raw` message
+ *        with a lone CR, or mixed CRLF and bare LF, in its header block →
+ *        deny/malformed/ambiguous-line-ending; one with a header name that
+ *        is not RFC 5322 ftext → deny/malformed/malformed-header-name; one
+ *        that repeats a To, Cc or Bcc header →
+ *        deny/malformed/duplicate-recipient-header. Empty → deny/malformed.
  *
  *   Non-JSON payload (`req.rawBody` media upload, or `req.multipart` upload):
  *     Locate the uploaded RFC 822 message and extract recipients from its
- *     headers. No candidate message, or no recipients found → deny/malformed
- *     (fail closed).
+ *     headers. No candidate message → deny/malformed; ambiguous header line
+ *     endings → deny/malformed/ambiguous-line-ending; a header name that is
+ *     not RFC 5322 ftext → deny/malformed/malformed-header-name; a repeated
+ *     To, Cc or Bcc header → deny/malformed/duplicate-recipient-header; no
+ *     recipients found → deny/malformed (fail closed).
+ *
+ *   RFC 822 text is read as RFC 5322 does: CRLF (or bare LF) line endings,
+ *   the header block ending at the first empty line (see `parseHeaders`). A
+ *   lone CR or mixed endings in the header block deny rather than pick one
+ *   reading (see `lineEndingDecision`).
  *
  *   Either path then applies the same recipient decision:
  *     5. Any recipient off the deployment's allowlist (from the
  *        OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list, so
  *        every recipient denies) → deny/external_data_flow/external-send.
+ *        An address that is not a plain addr-spec (two `@`, quotes, group
+ *        syntax, …) is never on the allowlist, so it denies the same way;
+ *        that includes any address-list element with a quoted string or a
+ *        comment, which `splitAddresses` returns unread.
  *        (Off-allowlist wins over mass-send.)
  *     6. Recipient count > MASS_SEND_THRESHOLD → elicit/mass-send.
  *     7. Otherwise → allow.
@@ -395,7 +625,9 @@ export function inspectOutboundMessage(req: InspectRequest, env?: InspectEnv): I
       message = body;
     }
 
-    const recipients = extractRecipients(message);
+    const extracted = extractRecipients(message);
+    if ("deny" in extracted) return extracted.deny;
+    const recipients = extracted.recipients;
     if (recipients.length === 0) {
       return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
     }
@@ -407,7 +639,9 @@ export function inspectOutboundMessage(req: InspectRequest, env?: InspectEnv): I
   if (text === null) {
     return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
   }
-  const recipients = recipientsFromRfc822(text);
+  const parsed = recipientsFromRfc822(text);
+  if ("deny" in parsed) return parsed.deny;
+  const recipients = parsed.recipients;
   if (recipients.length === 0) {
     return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
   }

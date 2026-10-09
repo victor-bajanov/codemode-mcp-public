@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { FakeD1 } from "./__fixtures__/fake-d1";
 import { FakeR2 } from "./__fixtures__/fake-r2";
 import { createPutFileCapability } from "../putfile-capability";
@@ -135,6 +135,57 @@ describe("createPutFileCapability — bad inputs", () => {
     if (out.ok) return;
     expect(out.status).toBe(413);
     expect(r2.store.size).toBe(0);
+  });
+
+  describe("length bound before decoding (F-24)", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    function smallCap(maxBytes: number) {
+      const r2 = new FakeR2();
+      const putFile = createPutFileCapability({
+        STAGING_D1: new FakeD1() as unknown as D1Database,
+        STAGING_R2: r2 as unknown as R2Bucket,
+        config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes },
+        uploadOrigin: "https://x.test",
+        now: () => 1_700_000_000,
+      });
+      return { putFile, r2 };
+    }
+
+    it("rejects an over-cap base64 string with 413 without decoding it", async () => {
+      const { putFile, r2 } = smallCap(16);
+      const atobSpy = vi.spyOn(globalThis, "atob");
+      const out = await putFile(btoa("x".repeat(1000)), "text/plain", null);
+      expect(out).toEqual({ ok: false, status: 413, message: "payload too large" });
+      expect(atobSpy).not.toHaveBeenCalled();
+      expect(r2.store.size).toBe(0);
+    });
+
+    it("malformed over-cap input is a 413 (size checked first), not a 400", async () => {
+      const { putFile } = smallCap(16);
+      const atobSpy = vi.spyOn(globalThis, "atob");
+      const out = await putFile("!".repeat(1000), "text/plain", null);
+      expect(out).toEqual({ ok: false, status: 413, message: "payload too large" });
+      expect(atobSpy).not.toHaveBeenCalled();
+    });
+
+    it("exactly maxBytes still decodes and stores (the bound is not off by one)", async () => {
+      for (const maxBytes of [1, 2, 3, 4, 15, 16, 17]) {
+        const { putFile } = smallCap(maxBytes);
+        const out = await putFile(bytesToBase64(new Uint8Array(maxBytes)), "application/octet-stream", null);
+        expect(out.ok, `maxBytes=${maxBytes}`).toBe(true);
+      }
+    });
+
+    it("a string within the length bound but over maxBytes after decoding is still a 413", async () => {
+      // 17 bytes → 24 base64 chars, within ceil(16/3)*4+4 = 28: the
+      // post-decode check is what rejects it.
+      const { putFile } = smallCap(16);
+      const out = await putFile(bytesToBase64(new Uint8Array(17)), "application/octet-stream", null);
+      expect(out).toEqual({ ok: false, status: 413, message: "payload too large" });
+    });
   });
 
   it("accepts zero-byte payloads and round-trips", async () => {

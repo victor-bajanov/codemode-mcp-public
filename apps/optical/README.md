@@ -96,7 +96,9 @@ secrets to both environments, and deploys.
 1. Claude.ai → Settings → Connectors → Add custom MCP.
 2. URL: `https://optical.<your-subdomain>.workers.dev/mcp`.
 3. First `/authorize` redirect → Cloudflare Access (codemode-mcp side) →
-   optical's Access (Cloudflare) → optical's IdP login → optical's
+   the Worker's consent page (check the redirect host, then click
+   **Approve** within five minutes) → optical's Access (Cloudflare) →
+   optical's IdP login → optical's
    `/oauth/authorize` issues the auth code → `/callback` on the
    codemode-mcp Worker.
 4. From inside Claude.ai, ask the connector "list my tasks". You should see

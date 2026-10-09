@@ -117,12 +117,38 @@ describe("adversarial: surface-review enforcement", () => {
   });
 
   it("does not allow path-encoding attacks to escalate to denied operations", async () => {
+    // An encoded "/" decodes to a segment separator: refused outright (F-6).
     await expect(
       handleUpstreamRequest({
         ...baseScaffoldArgs,
         ctx: { method: "POST", path: "/gmail/v1/users/me/settings%2Fdelegates" },
       }),
-    ).rejects.toThrow();   // either no-match or denied — both acceptable
+    ).rejects.toThrow(/disallowed segment/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses dot-segment and backslash paths that the URL parser would rewrite to another operation (F-1)", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    for (const ctx of [
+      // Matches labels.delete (allow) but would be sent as messages.delete (elicit).
+      { method: "DELETE", path: "/gmail/v1/users/me/labels/..\\messages\\abc" },
+      { method: "DELETE", path: "/gmail/v1/users/me/labels/%2e%2e" },
+      // Matches calendar.events.patch but would be sent as calendars.patch.
+      { method: "PATCH", path: "/calendar/v3/calendars/primary/events/..", body: {} },
+      // Query smuggled through a path parameter, invisible to the inspector.
+      { method: "GET", path: "/gmail/v1/users/me/messages/abc?format=raw" },
+    ]) {
+      await expect(handleUpstreamRequest({ ...baseScaffoldArgs, ctx })).rejects.toThrow(/disallowed segment/);
+    }
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    const audits = logSpy.mock.calls
+      .map((c) => c[0])
+      .filter((s: unknown): s is string => typeof s === "string" && s.startsWith("AUDIT "))
+      .map((s) => JSON.parse(s.slice("AUDIT ".length)));
+    expect(audits).toHaveLength(4);
+    for (const a of audits) {
+      expect(a).toMatchObject({ decision: "deny", category: "url_safety", reason: "unsafe-path-segment" });
+    }
   });
 });
 

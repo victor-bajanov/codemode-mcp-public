@@ -2,8 +2,8 @@
 //
 // I4 — first request after a misconfigured deploy must fail loudly with an
 // actionable error naming the >=32-char floor and the `wrangler secret put`
-// remedy, instead of failing opaquely inside the cookie-decryption path
-// during /authorize.
+// remedy, instead of failing opaquely inside /authorize, where the key signs
+// the consent form tokens (oauth-consent.ts, F-20).
 
 import { describe, it, expect } from "vitest";
 import { assertSecrets } from "../config";

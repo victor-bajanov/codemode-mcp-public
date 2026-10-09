@@ -5,10 +5,12 @@ import {
   readOAuthClientTtlSeconds,
   readOAuthRateLimitConfig,
   readStagingConfig,
+  readStagingThrottleConfig,
   type ScaffoldSecrets,
 } from "./config";
 import { createOAuthHandler } from "./oauth-handler";
-import { enforceOAuthHardening } from "./oauth-hardening";
+import { enforceOAuthHardening, enforceStagingThrottle } from "./oauth-hardening";
+import { MCP_OAUTH_PROVIDER_OPTIONS } from "./oauth-provider-options";
 import { runClientSweep, type ClientSweepKv } from "./oauth-client-sweep";
 import { createProviderMcpAgent, type ProviderEnv } from "./mcp-agent-factory";
 import { createTokenBrokerDO } from "./token-broker";
@@ -30,7 +32,13 @@ import { handleUpload, handleFetch, runSweep } from "./staging/index.js";
  * The returned `default` handler wraps the underlying `OAuthProvider` so that
  * `assertSecrets(env)` runs at the top of every `fetch` invocation (I4 — fail
  * the first request after a misconfigured deploy with a clear message instead
- * of an opaque cookie-decrypt failure inside `/authorize`).
+ * of an opaque failure inside `/authorize`, whose consent form tokens are
+ * signed with that key — see `oauth-consent.ts`).
+ *
+ * The `OAuthProvider` takes its security options (MCP-client PKCE S256, the
+ * 90-day refresh-token lifetime) from `MCP_OAUTH_PROVIDER_OPTIONS`. The public
+ * `/staging/*` endpoints sit behind a per-client failure-budget throttle;
+ * `POST /register` and `POST /token` behind rate limiting and no-store.
  */
 export function setupProvider<
   P extends Record<string, unknown>,
@@ -44,10 +52,7 @@ export function setupProvider<
   const oauth = new OAuthProvider({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     apiHandler: (McpAgentClass as any).serve("/mcp", { binding: "MCP_OBJECT" }),
-    apiRoute: "/mcp",
-    authorizeEndpoint: "/authorize",
-    tokenEndpoint: "/token",
-    clientRegistrationEndpoint: "/register",
+    ...MCP_OAUTH_PROVIDER_OPTIONS,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     defaultHandler: authHandler as any,
   });
@@ -61,17 +66,29 @@ export function setupProvider<
       assertSecrets(env as ScaffoldSecrets);
 
       const url = new URL(request.url);
+      const oauthKv = (env as unknown as { OAUTH_KV: KVNamespace }).OAUTH_KV;
+      // Failure-budget throttle in front of the public staging endpoints
+      // (F-13): once a client has spent its 403 budget it gets 429 before any
+      // D1 read.
       if (url.pathname === "/staging/upload" && request.method === "POST") {
         const stagingEnv = env as unknown as {
           STAGING_D1: D1Database;
           STAGING_R2: R2Bucket;
         } & Record<string, unknown>;
         const config = readStagingConfig(env as unknown as Record<string, unknown>);
-        return handleUpload(request, {
-          STAGING_D1: stagingEnv.STAGING_D1,
-          STAGING_R2: stagingEnv.STAGING_R2,
-          config,
-        });
+        return enforceStagingThrottle(
+          request,
+          oauthKv,
+          readStagingThrottleConfig(env as unknown as Record<string, unknown>),
+          Date.now(),
+          (r) =>
+            handleUpload(r, {
+              STAGING_D1: stagingEnv.STAGING_D1,
+              STAGING_R2: stagingEnv.STAGING_R2,
+              config,
+            }),
+          ctx.waitUntil.bind(ctx),
+        );
       }
       if (url.pathname.startsWith("/staging/fetch/") && request.method === "GET") {
         const stagingEnv = env as unknown as {
@@ -79,16 +96,23 @@ export function setupProvider<
           STAGING_R2: R2Bucket;
         } & Record<string, unknown>;
         const config = readStagingConfig(env as unknown as Record<string, unknown>);
-        return handleFetch(request, {
-          STAGING_D1: stagingEnv.STAGING_D1,
-          STAGING_R2: stagingEnv.STAGING_R2,
-          config,
-        });
+        return enforceStagingThrottle(
+          request,
+          oauthKv,
+          readStagingThrottleConfig(env as unknown as Record<string, unknown>),
+          Date.now(),
+          (r) =>
+            handleFetch(r, {
+              STAGING_D1: stagingEnv.STAGING_D1,
+              STAGING_R2: stagingEnv.STAGING_R2,
+              config,
+            }),
+          ctx.waitUntil.bind(ctx),
+        );
       }
       // Rate-limit + no-store hardening for the library-owned OAuth endpoints
       // (POST /register, POST /token); all other paths pass straight through.
       const rateLimitCfg = readOAuthRateLimitConfig(env as unknown as Record<string, unknown>);
-      const oauthKv = (env as unknown as { OAUTH_KV: KVNamespace }).OAUTH_KV;
       return enforceOAuthHardening(
         request,
         oauthKv,

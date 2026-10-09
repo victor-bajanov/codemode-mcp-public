@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { McpAgent } from "agents/mcp";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
@@ -8,12 +9,19 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
 import { registerFileHandleTool } from "../staging";
 import {
+  buildDocsHostFns,
   buildExecuteAddendum,
   buildSearchStrategyBlock,
   buildStagingHostFns,
+  CODEMODE_SANDBOX_ANCHOR,
+  createGuardedExecutor,
   createProviderMcpAgent,
   RESPONSE_CHAR_CAP,
+  SESSION_PRINCIPAL_KEY,
+  type HostProvider,
+  type SandboxExecuteResult,
 } from "../mcp-agent-factory";
+import { ToolError } from "../elicit";
 import { annotateSpecWithSurfaceReview } from "../annotate-spec";
 import type { ApiProvider } from "../api-provider";
 
@@ -151,6 +159,47 @@ const dummyProvider = {
   apiBaseUrl: "https://test.example",
 } as unknown as ApiProvider;
 
+/** Durable Object storage stub: just the get/put the agent uses, over a Map. */
+function makeStorage(initial: Record<string, unknown> = {}) {
+  const map = new Map<string, unknown>(Object.entries(initial));
+  return {
+    map,
+    get: async (key: string) => map.get(key),
+    put: async (key: string, value: unknown) => {
+      map.set(key, value);
+    },
+  };
+}
+
+type StubAgent = {
+  env: Record<string, unknown>;
+  props: Record<string, unknown> | undefined;
+  ctx: { waitUntil: (p: Promise<unknown>) => void; storage: ReturnType<typeof makeStorage> };
+  init: () => Promise<void>;
+  setName: (name: string, props?: Record<string, unknown>) => Promise<void>;
+  sessionPrincipal: string | null | undefined;
+  // biome-ignore lint/suspicious/noExplicitAny: McpServer type isn't exported usefully
+  server: any;
+};
+
+/** An agent instance WITHOUT running the DurableObject constructor (which
+ *  needs workerd state); env/props/ctx are the minimal stubs init() reads. */
+function makeStubAgent(
+  provider: ApiProvider,
+  opts: {
+    envOverrides?: Record<string, unknown>;
+    props?: Record<string, unknown>;
+    storage?: ReturnType<typeof makeStorage>;
+  } = {},
+): StubAgent {
+  const AgentClass = createProviderMcpAgent(provider);
+  const agent = Object.create(AgentClass.prototype) as StubAgent;
+  agent.env = { LOADER: {}, DEPLOYMENT_NAME: "test-deployment", ...(opts.envOverrides ?? {}) };
+  agent.props = opts.props ?? {};
+  agent.ctx = { waitUntil: () => {}, storage: opts.storage ?? makeStorage() };
+  return agent;
+}
+
 // Runs the agent's real init() and connects a client to the server it built,
 // so assertions see exactly what an MCP client sees. Object.create skips the
 // DurableObject constructor (which needs workerd state) while leaving init() —
@@ -159,19 +208,9 @@ const dummyProvider = {
 async function connectToAgentServer(
   provider: ApiProvider,
   envOverrides: Record<string, unknown> = {},
-): Promise<{ client: Client; close: () => Promise<void> }> {
-  const AgentClass = createProviderMcpAgent(provider);
-  const agent = Object.create(AgentClass.prototype) as {
-    env: Record<string, unknown>;
-    props: Record<string, unknown>;
-    ctx: { waitUntil: (p: Promise<unknown>) => void };
-    init: () => Promise<void>;
-    // biome-ignore lint/suspicious/noExplicitAny: McpServer type isn't exported usefully
-    server: any;
-  };
-  agent.env = { LOADER: {}, DEPLOYMENT_NAME: "test-deployment", ...envOverrides };
-  agent.props = {};
-  agent.ctx = { waitUntil: () => {} };
+  opts: { props?: Record<string, unknown>; storage?: ReturnType<typeof makeStorage> } = {},
+): Promise<{ client: Client; close: () => Promise<void>; agent: StubAgent }> {
+  const agent = makeStubAgent(provider, { envOverrides, ...opts });
   await agent.init();
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -180,6 +219,7 @@ async function connectToAgentServer(
   await client.connect(clientTransport);
   return {
     client,
+    agent,
     close: async () => {
       await client.close();
       await agent.server.close();
@@ -832,6 +872,467 @@ describe("init() docs surface (Task 4)", () => {
     // …and the docs tool serves that snippet.
     const attach = await callToolText(client, "docs", { section: "attachments" });
     expect(attach).toContain("ATTACH-MARKER");
+    await close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-10-07 security review — sandbox executor guard (F-4, F-12) and the
+// MCP session principal binding (F-16).
+// ---------------------------------------------------------------------------
+
+type Fns = Record<string, (...a: unknown[]) => Promise<unknown>>;
+
+/** Base executor stand-in: records each call's code + provider names and
+ *  hands the providers to `run`, whose return value becomes the result. */
+function makeRecordingBase(
+  run: (providers: HostProvider[]) => Promise<unknown> = async () => "ok",
+) {
+  const calls: Array<{ code: string; names: string[]; providersOrFns: unknown }> = [];
+  return {
+    calls,
+    base: {
+      execute: async (code: string, providersOrFns: HostProvider[] | Fns): Promise<SandboxExecuteResult> => {
+        const providers = Array.isArray(providersOrFns) ? providersOrFns : [];
+        calls.push({ code, names: providers.map((p) => p.name), providersOrFns });
+        return { result: await run(providers) };
+      },
+    },
+  };
+}
+
+function fakeStagingProvider() {
+  const hits: string[] = [];
+  const fn = (name: string) => async (..._a: unknown[]) => {
+    hits.push(name);
+    return { ok: true, name };
+  };
+  const provider: HostProvider = {
+    name: "__stagingHost",
+    fns: {
+      getFile: fn("getFile"),
+      putFile: fn("putFile"),
+      stageFromUpstreamJson: fn("stageFromUpstreamJson"),
+      stageFromAttachment: fn("stageFromAttachment"),
+    },
+  };
+  return { provider, hits };
+}
+
+const DOCS_PROVIDER = buildDocsHostFns(() => "docs");
+const LIMITS = { hostTimeoutMs: 10_000, maxUpstreamCalls: 200 };
+
+function openapiHost(request: (...a: unknown[]) => Promise<unknown>): HostProvider {
+  return { name: "__openapiHost", fns: { request } };
+}
+
+const host = (providers: HostProvider[], name: string): Fns =>
+  providers.find((p) => p.name === name)!.fns;
+
+describe("createGuardedExecutor — which capabilities each tool gets (F-4)", () => {
+  it("a search-shaped run ([] from codemode) gets ONLY __docsHost, even with staging configured", async () => {
+    const { calls, base } = makeRecordingBase();
+    const staging = fakeStagingProvider();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: staging.provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    const out = await guarded.execute("async () => 1", []);
+    expect(out).toEqual({ result: "ok" });
+    expect(calls[0]!.names).toEqual(["__docsHost"]);
+  });
+
+  it("an execute-shaped run gets __openapiHost, __stagingHost and __docsHost, in that order", async () => {
+    const { calls, base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: fakeStagingProvider().provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    await guarded.execute("async () => 1", [openapiHost(async () => "r")]);
+    expect(calls[0]!.names).toEqual(["__openapiHost", "__stagingHost", "__docsHost"]);
+  });
+
+  it("without staging bindings an execute run gets __openapiHost and __docsHost only", async () => {
+    const { calls, base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    await guarded.execute("async () => 1", [openapiHost(async () => "r")]);
+    expect(calls[0]!.names).toEqual(["__openapiHost", "__docsHost"]);
+  });
+
+  it("alias-patches the array form's code; forwards the legacy Record form untouched", async () => {
+    const { calls, base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: fakeStagingProvider().provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    const code = `const codemode = {\n  spec: 1${CODEMODE_SANDBOX_ANCHOR}x)`;
+    await guarded.execute(code, []);
+    expect(calls[0]!.code).toContain("__docsHost.docs(section)");
+    const recordFns: Fns = { f: async () => 1 };
+    await guarded.execute(code, recordFns);
+    expect(calls[1]!.code).toBe(code);
+    expect(calls[1]!.providersOrFns).toBe(recordFns);
+  });
+});
+
+describe("createGuardedExecutor — per-execution upstream budget (F-12)", () => {
+  it("refuses the call past maxUpstreamCalls with a ToolError, without reaching the upstream", async () => {
+    let upstreamHits = 0;
+    const errors: unknown[] = [];
+    const { base } = makeRecordingBase(async (providers) => {
+      const { request } = host(providers, "__openapiHost");
+      for (let i = 0; i < 3; i++) {
+        try {
+          await request!({ method: "GET", path: "/x" });
+        } catch (e) {
+          errors.push(e);
+        }
+      }
+      return upstreamHits;
+    });
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 2 },
+    });
+    const out = await guarded.execute("c", [
+      openapiHost(async () => {
+        upstreamHits++;
+        return "r";
+      }),
+    ]);
+    expect(out.result).toBe(2);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(ToolError);
+    expect((errors[0] as Error).message).toBe(
+      "upstream call budget exceeded: at most 2 upstream requests per execution",
+    );
+  });
+
+  it("codemode.request and the upstream-reaching staging fns share one budget; getFile/putFile are not counted", async () => {
+    const staging = fakeStagingProvider();
+    const outcomes: string[] = [];
+    const { base } = makeRecordingBase(async (providers) => {
+      const st = host(providers, "__stagingHost");
+      const attempt = async (label: string, fn: () => Promise<unknown>) => {
+        try {
+          await fn();
+          outcomes.push(`${label}:ok`);
+        } catch {
+          outcomes.push(`${label}:refused`);
+        }
+      };
+      await attempt("request", () => host(providers, "__openapiHost").request!({}));
+      await attempt("getFile", () => st.getFile!("fh", "tok"));
+      await attempt("putFile", () => st.putFile!("", "text/plain", null));
+      await attempt("stageFromUpstreamJson", () => st.stageFromUpstreamJson!({}, "data"));
+      await attempt("stageFromAttachment", () => st.stageFromAttachment!({}, "data"));
+      await attempt("getFile", () => st.getFile!("fh", "tok"));
+      return null;
+    });
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: staging.provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 2 },
+    });
+    await guarded.execute("c", [openapiHost(async () => "r")]);
+    expect(outcomes).toEqual([
+      "request:ok",
+      "getFile:ok",
+      "putFile:ok",
+      "stageFromUpstreamJson:ok",
+      "stageFromAttachment:refused",
+      "getFile:ok",
+    ]);
+    expect(staging.hits).toEqual(["getFile", "putFile", "stageFromUpstreamJson", "getFile"]);
+  });
+
+  it("each execution starts with a fresh budget", async () => {
+    const { base } = makeRecordingBase(async (providers) => {
+      await host(providers, "__openapiHost").request!({});
+      return "done";
+    });
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1 },
+    });
+    const req = openapiHost(async () => "r");
+    expect(await guarded.execute("c", [req])).toEqual({ result: "done" });
+    expect(await guarded.execute("c", [req])).toEqual({ result: "done" });
+  });
+
+  it("does not mutate the caller's provider objects (the wrap is a copy)", async () => {
+    const staging = fakeStagingProvider();
+    const originalStage = staging.provider.fns.stageFromUpstreamJson;
+    const request = async () => "r";
+    const openapi = openapiHost(request);
+    const { base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: staging.provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    await guarded.execute("c", [openapi]);
+    expect(openapi.fns.request).toBe(request);
+    expect(staging.provider.fns.stageFromUpstreamJson).toBe(originalStage);
+  });
+});
+
+describe("createGuardedExecutor — host-side deadline (F-12)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("abandons a never-settling run after hostTimeoutMs and refuses its later upstream calls", async () => {
+    let captured: HostProvider[] = [];
+    let upstreamHits = 0;
+    const base = {
+      execute: (_code: string, providersOrFns: HostProvider[] | Fns) => {
+        captured = providersOrFns as HostProvider[];
+        return new Promise<SandboxExecuteResult>(() => {}); // sandbox ignores its own timeout
+      },
+    };
+    const staging = fakeStagingProvider();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: staging.provider,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 20, maxUpstreamCalls: 200 },
+    });
+    const out = await guarded.execute("c", [
+      openapiHost(async () => {
+        upstreamHits++;
+        return "r";
+      }),
+    ]);
+    expect(out).toEqual({
+      result: undefined,
+      error: "Execution exceeded the host-side deadline of 20 ms and was abandoned",
+    });
+    // The abandoned sandbox is still alive; its later upstream calls are refused.
+    const late = host(captured, "__openapiHost").request!({});
+    await expect(late).rejects.toBeInstanceOf(ToolError);
+    await expect(late).rejects.toThrow(/passed its host-side deadline; further upstream calls are refused/);
+    await expect(host(captured, "__stagingHost").stageFromUpstreamJson!({}, "data")).rejects.toThrow(
+      /host-side deadline/,
+    );
+    expect(upstreamHits).toBe(0);
+    expect(staging.hits).toEqual([]);
+  });
+
+  it("clears its timer when the run completes normally", async () => {
+    vi.useFakeTimers();
+    const { base } = makeRecordingBase(async () => "fast");
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 75_000, maxUpstreamCalls: 200 },
+    });
+    expect(await guarded.execute("c", [])).toEqual({ result: "fast" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never rejects: a throwing base executor resolves with its message in `error`", async () => {
+    const guarded = createGuardedExecutor(
+      {
+        execute: async () => {
+          throw new Error("loader exploded");
+        },
+      },
+      { stagingProvider: null, docsProvider: DOCS_PROVIDER, limits: LIMITS },
+    );
+    expect(await guarded.execute("c", [])).toEqual({ result: undefined, error: "loader exploded" });
+  });
+
+  it("bounds the legacy Record form by the deadline too", async () => {
+    const guarded = createGuardedExecutor(
+      { execute: () => new Promise<SandboxExecuteResult>(() => {}) },
+      { stagingProvider: null, docsProvider: DOCS_PROVIDER, limits: { hostTimeoutMs: 20, maxUpstreamCalls: 1 } },
+    );
+    const out = await guarded.execute("c", { f: async () => 1 });
+    expect(out.error).toMatch(/host-side deadline of 20 ms/);
+  });
+});
+
+describe("init() wiring of the executor guard (F-4, F-12)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const stagingEnv = () => ({
+    STAGING_D1: new FakeD1() as unknown as D1Database,
+    STAGING_R2: {},
+    STAGING_UPLOAD_ORIGIN: "https://x.test",
+  });
+
+  it("tools/list advertises `search` as read-only (and `execute` not)", async () => {
+    const { client, close } = await connectToAgentServer(namedProvider);
+    const tools = (await client.listTools()).tools;
+    expect(tools.find((t) => t.name === "search")!.annotations?.readOnlyHint).toBe(true);
+    expect(tools.find((t) => t.name === "execute")!.annotations?.readOnlyHint).not.toBe(true);
+    await close();
+  });
+
+  it("with staging bound, the search sandbox has no __stagingHost while the execute sandbox does", async () => {
+    stubExecutorWithNodeEval();
+    const { client, close } = await connectToAgentServer(namedProvider, stagingEnv());
+    const inSearch = await callToolText(client, "search", {
+      code: "async () => typeof __stagingHost",
+    });
+    const inExecute = await callToolText(client, "execute", {
+      code: "async () => typeof __stagingHost",
+    });
+    expect(inSearch).toContain("undefined");
+    expect(inExecute).toContain("object");
+    await close();
+  });
+
+  it("reads the limits from env: EXECUTE_MAX_UPSTREAM_CALLS=1 refuses the second codemode.request", async () => {
+    stubExecutorWithNodeEval();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchSpy = vi.fn(async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const provider = {
+      ...namedProvider,
+      spec: { openapi: "3.0.0", info: { title: "T", version: "1" }, paths: { "/w": { get: { operationId: "listW", responses: {} } } } },
+      surfaceReview: { listW: { decision: "allow", category: "standard_read" } },
+    } as unknown as ApiProvider;
+    const { client, close } = await connectToAgentServer(
+      provider,
+      {
+        EXECUTE_MAX_UPSTREAM_CALLS: "1",
+        TOKEN_BROKER: { idFromName: (n: string) => n, get: () => ({ async getOrRefreshAccessToken() { return "AT"; } }) },
+      },
+      { props: { userId: "u1", refreshToken: "RT" } },
+    );
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        await codemode.request({ method: "GET", path: "/w" });
+        try { await codemode.request({ method: "GET", path: "/w" }); return "second-allowed"; }
+        catch (e) { return "second-refused: " + e.message; }
+      }`,
+    });
+    expect(out).toContain("second-refused: upstream call budget exceeded: at most 1 upstream requests per execution");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await close();
+  });
+
+  it("an invalid EXECUTE_HOST_TIMEOUT_MS fails init() loudly", async () => {
+    const agent = makeStubAgent(namedProvider, { envOverrides: { EXECUTE_HOST_TIMEOUT_MS: "soon" } });
+    await expect(agent.init()).rejects.toThrow(/EXECUTE_HOST_TIMEOUT_MS: must be a positive integer/);
+  });
+});
+
+describe("MCP session principal binding (F-16)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  /** partyserver's real setName needs workerd state; stub the parent so the
+   *  override's own decision is what is under test. */
+  function spyParentSetName() {
+    return vi
+      .spyOn(McpAgent.prototype as unknown as { setName: (n: string, p?: unknown) => Promise<void> }, "setName")
+      .mockResolvedValue(undefined);
+  }
+
+  it("init() stores the binding for the principal it was started with", async () => {
+    const storage = makeStorage();
+    const agent = makeStubAgent(namedProvider, { props: { userId: "u1" }, storage });
+    await agent.init();
+    expect(storage.map.get(SESSION_PRINCIPAL_KEY)).toEqual({ principal: "u1" });
+    expect(agent.sessionPrincipal).toBe("u1");
+  });
+
+  it("init() records null for a principal-less session", async () => {
+    const storage = makeStorage();
+    await makeStubAgent(namedProvider, { props: {}, storage }).init();
+    expect(storage.map.get(SESSION_PRINCIPAL_KEY)).toEqual({ principal: null });
+  });
+
+  it("a later init() (restart/eviction) keeps the ORIGINAL binding rather than re-recording", async () => {
+    const storage = makeStorage({ [SESSION_PRINCIPAL_KEY]: { principal: "u1" } });
+    const agent = makeStubAgent(namedProvider, { props: { userId: "u2" }, storage });
+    await agent.init();
+    expect(storage.map.get(SESSION_PRINCIPAL_KEY)).toEqual({ principal: "u1" });
+    expect(agent.sessionPrincipal).toBe("u1");
+  });
+
+  it("init() uses the provider's audit principal accessor when it has one", async () => {
+    const storage = makeStorage();
+    const provider = {
+      ...namedProvider,
+      audit: { principalIdAccessor: (p: Record<string, unknown>) => p.sub as string | undefined },
+    } as unknown as ApiProvider;
+    await makeStubAgent(provider, { props: { userId: "ignored", sub: "sub-1" }, storage }).init();
+    expect(storage.map.get(SESSION_PRINCIPAL_KEY)).toEqual({ principal: "sub-1" });
+  });
+
+  it("setName: the same principal passes through to the parent with the request's props", async () => {
+    const parent = spyParentSetName();
+    const agent = makeStubAgent(namedProvider, {
+      storage: makeStorage({ [SESSION_PRINCIPAL_KEY]: { principal: "u1" } }),
+    });
+    const props = { userId: "u1", refreshToken: "RT-2" };
+    await expect(agent.setName("streamable-http:s1", props)).resolves.toBeUndefined();
+    expect(parent).toHaveBeenCalledWith("streamable-http:s1", props);
+  });
+
+  it("setName: a different principal is refused and never reaches the parent", async () => {
+    const parent = spyParentSetName();
+    const agent = makeStubAgent(namedProvider, {
+      storage: makeStorage({ [SESSION_PRINCIPAL_KEY]: { principal: "u1" } }),
+    });
+    await expect(agent.setName("streamable-http:s1", { userId: "u2" })).rejects.toThrow(
+      "mcp-session-principal-mismatch: this MCP session belongs to a different user",
+    );
+    await expect(agent.setName("streamable-http:s1", {})).rejects.toThrow(/principal-mismatch/);
+    expect(parent).not.toHaveBeenCalled();
+  });
+
+  it("setName: no stored binding yet (new or pre-binding session) passes", async () => {
+    const parent = spyParentSetName();
+    const agent = makeStubAgent(namedProvider);
+    await agent.setName("streamable-http:s1", { userId: "anyone" });
+    expect(parent).toHaveBeenCalledTimes(1);
+  });
+
+  it("setName: props === undefined (internal bootstrap) skips the check", async () => {
+    const parent = spyParentSetName();
+    const agent = makeStubAgent(namedProvider, {
+      storage: makeStorage({ [SESSION_PRINCIPAL_KEY]: { principal: "u1" } }),
+    });
+    await agent.setName("streamable-http:s1");
+    expect(parent).toHaveBeenCalledWith("streamable-http:s1", undefined);
+  });
+
+  it("buildUpstreamArgs refuses once this.props resolves to a different principal than the binding", async () => {
+    stubExecutorWithNodeEval();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchSpy = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const mintSpy = vi.fn(async () => "AT");
+    const { client, close, agent } = await connectToAgentServer(
+      namedProvider,
+      { TOKEN_BROKER: { idFromName: (n: string) => n, get: () => ({ getOrRefreshAccessToken: mintSpy }) } },
+      { props: { userId: "u1", refreshToken: "RT" } },
+    );
+    agent.props = { userId: "u2", refreshToken: "RT-other" };
+    const out = await callToolText(client, "execute", {
+      code: 'async () => codemode.request({ method: "GET", path: "/Invoices" })',
+    });
+    expect(out).toContain("MCP session principal changed; reconnect");
+    expect(mintSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
     await close();
   });
 });

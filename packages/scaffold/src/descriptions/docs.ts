@@ -64,7 +64,8 @@ const OVERVIEW_TEXT =
   '  • `codemode.docs(section?)` — returns this document. The argument is a BARE STRING section name (`codemode.docs("search-strategy")`), not an options object — `{ section: "…" }` will not match any section. No argument returns the complete document.\n\n' +
   "This server also registers a `search` tool for browsing the spec without executing anything: search first, then execute — see 'Search strategy' for the retrieval pattern this spec needs.\n\n" +
   "Authentication (API keys, OAuth tokens, bearer credentials) is held by this server and NEVER enters the sandbox — you cannot see it, and you never construct an Authorization header yourself.\n\n" +
-  `Tool results over ${RESPONSE_CHAR_CAP} characters are truncated, with a \`--- TRUNCATED ---\` footer appended; the excess is silently dropped with no indication of what was lost. Narrow your query rather than requesting broad data in one call — see 'Search strategy'.\n\n`;
+  `Tool results over ${RESPONSE_CHAR_CAP} characters are truncated, with a \`--- TRUNCATED ---\` footer appended; the excess is silently dropped with no indication of what was lost. Narrow your query rather than requesting broad data in one call — see 'Search strategy'.\n\n` +
+  "Each execute run has a wall-clock deadline and a budget of upstream calls (1,000 by default, set per deployment); a call past the budget throws. For bulk work (say, fetching hundreds of messages or paging a long list), process it in batches across several execute runs.\n\n";
 
 // `stagingEnabled`-dependent because two things in this interface only make
 // sense when staging bindings exist: `returnAs: "stage"` (otherwise the field

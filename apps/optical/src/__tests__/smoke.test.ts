@@ -90,4 +90,36 @@ describe("optical adversarial: surface-review enforcement", () => {
     const apiCall = calls.find(([u]) => String(u).includes("/v1/tasks"));
     expect(apiCall, "expected an outbound /v1/tasks call").toBeDefined();
   });
+
+  it("sends with redirect: manual and reports an upstream 3xx instead of following it (F-17)", async () => {
+    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/oauth/token")) {
+        return new Response(
+          JSON.stringify({ access_token: "AT-fake", refresh_token: "RT-fake-rotated-2", expires_in: 3600, token_type: "Bearer" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example/v1/tasks" } });
+    });
+    const res = (await handleUpstreamRequest({
+      ...baseScaffoldArgs,
+      props: { ...baseProps, refreshToken: "RT-fake-redirect" },
+      ctx: { method: "GET", path: "/v1/tasks" },
+    })) as { success: boolean; status: number; result: unknown };
+    expect(res).toMatchObject({ success: false, status: 302, result: { error: "upstream_redirect" } });
+    const calls = (globalThis.fetch as unknown as { mock: { calls: [string | URL, RequestInit?][] } }).mock.calls;
+    const apiCalls = calls.filter(([u]) => String(u).includes("/v1/tasks"));
+    expect(apiCalls).toHaveLength(1);
+    expect(apiCalls[0]![1]?.redirect).toBe("manual");
+  });
+
+  it("refuses dot-segment paths before any fetch (F-1)", async () => {
+    for (const path of ["/v1/tasks/..", "/v1/polls/%2e%2e/cancel", "/v1/tasks/.%2e"]) {
+      await expect(
+        handleUpstreamRequest({ ...baseScaffoldArgs, ctx: { method: "DELETE", path } }),
+      ).rejects.toThrow(/disallowed segment/);
+    }
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
 });
