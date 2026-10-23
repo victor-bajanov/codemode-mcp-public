@@ -1,4 +1,4 @@
-import type { StagingRow } from "./types";
+import type { EncVersion, StagingRow } from "./types";
 
 export interface InsertPendingInput {
   token_hash: Uint8Array;
@@ -19,6 +19,7 @@ export interface AtomicClaimInput {
   claimed_at: number;
   new_expires_at: number;
   now: number;
+  enc_version: EncVersion;
 }
 
 export async function insertPending(d1: D1Database, input: InsertPendingInput): Promise<void> {
@@ -47,7 +48,7 @@ export async function atomicClaim(
 ): Promise<{ file_handle: string } | null> {
   const result = await d1
     .prepare(
-      `UPDATE staging SET state='claimed', iv=?, content_type=?, byte_len=?, r2_key=?, claimed_at=?, expires_at=?
+      `UPDATE staging SET state='claimed', iv=?, content_type=?, byte_len=?, r2_key=?, claimed_at=?, expires_at=?, enc_version=?
        WHERE token_hash=? AND state='pending' AND expires_at>?
        RETURNING file_handle`,
     )
@@ -58,6 +59,7 @@ export async function atomicClaim(
       input.r2_key,
       input.claimed_at,
       input.new_expires_at,
+      input.enc_version,
       input.token_hash,
       input.now,
     )
@@ -76,6 +78,7 @@ export interface InsertClaimedInput {
   created_at: number;
   claimed_at: number;
   expires_at: number;
+  enc_version: EncVersion;
 }
 
 export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): Promise<void> {
@@ -83,8 +86,8 @@ export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): 
     .prepare(
       `INSERT INTO staging
        (token_hash, file_handle, state, r2_key, iv, content_type_hint, content_type,
-        expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at, enc_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.token_hash,
@@ -100,6 +103,7 @@ export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): 
       input.created_at,
       input.claimed_at,
       input.expires_at,
+      input.enc_version,
     )
     .run();
 }
@@ -122,6 +126,15 @@ function toUint8Array(v: unknown): Uint8Array | null {
   return null;
 }
 
+// Rows written before migration 0002 have no `enc_version`; they are the
+// retired v1 format and report 1 so the opener can refuse them cleanly.
+// Anything other than 1/2 is not a format we know.
+function toEncVersion(v: unknown): EncVersion {
+  if (v === undefined || v === null || v === 1) return 1;
+  if (v === 2) return 2;
+  throw new Error("staging row has an unknown enc_version");
+}
+
 export async function lookupByHash(d1: D1Database, token_hash: Uint8Array): Promise<StagingRow | null> {
   const raw = await d1
     .prepare(`SELECT * FROM staging WHERE token_hash=?`)
@@ -142,6 +155,7 @@ export async function lookupByHash(d1: D1Database, token_hash: Uint8Array): Prom
     created_at: raw.created_at as number,
     claimed_at: (raw.claimed_at as number | null) ?? null,
     expires_at: raw.expires_at as number,
+    enc_version: toEncVersion(raw.enc_version),
   };
 }
 

@@ -48,15 +48,20 @@ function compactEnvelope(provider: CompactProviderFields): string {
 // (3) Every RequestOptions field name, presented as a closed, complete
 // list — codemode's own declared interface omits headers/bodyBase64/
 // multipart/returnAs, which reads as closed and is actively misleading.
-// `returnAs` is annotated when staging is off: it hard-throws server-side
-// (request-handler.ts) rather than being silently ignored, so listing it
-// bare on a no-staging server would read as usable when it isn't.
+// `composed` and `returnAs` are annotated (with one shared marker, to save
+// budget) when staging is off: both hard-throw server-side (request-handler.ts)
+// rather than being silently ignored, so listing them bare on a no-staging
+// server would read as usable when they aren't.
 function compactFieldList(stagingEnabled: boolean): string {
-  const returnAsEntry = stagingEnabled ? "returnAs" : "returnAs (requires staging; disabled here)";
+  const stagingOnly = stagingEnabled
+    ? "composed, returnAs"
+    : "composed, returnAs (both need staging; disabled here)";
   return (
     "## codemode.request(options) — complete field list (nothing else exists)\n" +
-    `method, path, query, body, contentType, rawBody, headers, bodyBase64, multipart, ${returnAsEntry}.\n` +
-    "Binary body: use bodyBase64 or multipart — a raw Uint8Array/ArrayBuffer in body throws. " +
+    `method, path, query, body, contentType, rawBody, headers, bodyBase64, multipart, ${stagingOnly}.\n` +
+    (stagingEnabled
+      ? "Binary body: bodyBase64, multipart or composed (staged file) — raw Uint8Array/ArrayBuffer in body throws. "
+      : "Binary body: use bodyBase64 or multipart — a raw Uint8Array/ArrayBuffer in body throws. ") +
     "Full reference: docs \"request-options\".\n\n"
   );
 }
@@ -70,7 +75,7 @@ function compactStagingPointer(sectionNames: readonly string[]): string {
   const downloadsRef = sectionNames.includes("downloads") ? ", \"downloads\"" : "";
   return (
     "## Attachments & downloads\n" +
-    "Upload TO upstream: call the `register_file_handle` tool first — never inline bytes. " +
+    "Upload TO upstream: `register_file_handle` first, then `composed` — never inline bytes. " +
     "Download FROM upstream: use `returnAs: \"stage\"` or the __stagingHost capability. " +
     `Details: docs "staging"${downloadsRef}.\n\n`
   );
@@ -131,8 +136,9 @@ export function buildCompactRegisterFileHandleDescription(): string {
     "1. Call this tool → { upload_url, token, file_handle, upload_ttl_seconds, fetch_ttl_seconds }.\n" +
     "2. POST the file bytes to upload_url with `Authorization: Bearer <token>`, out-of-band — your " +
     "host does this, not execute(). Must happen within upload_ttl_seconds; a 204 confirms the upload.\n" +
-    "3. Inside execute(), read the bytes via `const f = await __stagingHost.getFile(file_handle, token)` " +
-    "and forward them to the upstream API (readable for fetch_ttl_seconds after upload).\n\n" +
+    "3. Inside execute(), send it by reference — `composed: { segments: [{ staged: { file_handle, token }, encoding }] }` " +
+    "or a multipart part's `staged` — usable for fetch_ttl_seconds after upload. `__stagingHost.getFile` only " +
+    "reads small files (≤ 8 MiB) into execute().\n\n" +
     "For this provider's exact Step-3 forwarding snippet, call the `docs` tool with section \"attachments\"."
   );
 }

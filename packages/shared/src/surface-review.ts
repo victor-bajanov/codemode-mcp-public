@@ -27,6 +27,23 @@ export interface InspectMultipartPart {
   contentType?: string;
   value?: string;
   bodyBase64?: string;
+  /** Present when the part's bytes come from a staged file the host attaches
+   *  at send time. The bytes themselves are never shown to an inspector; only
+   *  this metadata (filename sanitised, contentType from the part or the row). */
+  staged?: { byteLength: number; contentType: string; filename: string | null };
+}
+
+/**
+ * Metadata for one staged-file slot of a host-assembled (`composed`) body. In
+ * the inspection view's `rawBody` each staged slot is a single U+FFFC (OBJECT
+ * REPLACEMENT CHARACTER); `index` is the segment index in `composed.segments`.
+ */
+export interface InspectStaged {
+  index: number;
+  byteLength: number;
+  contentType: string;
+  filename: string | null;
+  encoding: "base64-lines" | "base64" | "identity";
 }
 
 /**
@@ -46,6 +63,12 @@ export interface InspectRequest {
   contentType?: string;
   rawBody?: ArrayBuffer | string | Uint8Array;
   multipart?: InspectMultipartPart[];
+  /** Staged-file slots of a `composed` body, in segment order. Present only
+   *  when the effective payload is host-assembled. */
+  staged?: ReadonlyArray<InspectStaged>;
+  /** Exact byte length of the assembled outbound body (composed or staged
+   *  multipart), staged slots expanded in their encoding. */
+  assembledByteLength?: number;
 }
 
 export interface InspectResult {
@@ -114,6 +137,18 @@ export interface SurfaceReviewEntry {
    *  request it cannot confidently improve. Only the parsed JSON channel is
    *  normalized — rawBody/bodyBase64/multipart payloads pass through untouched. */
   normalizeBody?: (body: unknown) => unknown;
+  /** Opt in to host-assembled bodies (`composed` or `multipart[].staged`).
+   *  On an inspected or `elicit` operation without it, any staged reference
+   *  is denied `staged-not-supported` before the inspector runs: an inspector
+   *  written for JSON or inline parts must not be asked to judge a body whose
+   *  bytes it cannot see. Bare-allow operations are unaffected. */
+  acceptsStaged?: true;
+  /** Best-effort normaliser for a `composed` body, applied to the text that
+   *  precedes the first staged segment (all text segments before it, joined).
+   *  Same contract as `normalizeBody`: presentation repair only, fail-open,
+   *  `undefined` = no change. A no-op when the body is a sole identity
+   *  segment. */
+  normalizeComposedText?: (text: string) => string | undefined;
   /** Per-op override; runs ahead of `provider.elicitRenderers[category]`. */
   elicit?: ElicitRenderer;
 }

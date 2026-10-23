@@ -12,6 +12,8 @@ import { getOrRefreshAccessToken } from "../refresh";
 import { ToolError } from "../elicit";
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { SurfaceReview } from "@local/shared";
+import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
+import { FakeR2 } from "../staging/__tests__/__fixtures__/fake-r2";
 
 const SPEC: OpenApiSpec = {
   openapi: "3.0.0",
@@ -699,6 +701,22 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
     });
   }
 
+  function makeStore(maxBytes = 1024 * 1024) {
+    const d1 = new FakeD1();
+    const r2 = new FakeR2();
+    return {
+      d1,
+      r2,
+      stagingStore: {
+        STAGING_D1: d1 as unknown as D1Database,
+        STAGING_R2: r2 as unknown as R2Bucket,
+        config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes },
+        uploadOrigin: "https://x.test",
+        now: () => 1_700_000_000,
+      },
+    };
+  }
+
   it("happy path: stages 2xx bytes, returns file-handle envelope, bypasses truncate", async () => {
     const raw = new Uint8Array([1, 2, 3, 4, 5]);
     const upstreamResp = new Response(raw, {
@@ -710,21 +728,13 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
     });
     vi.stubGlobal("fetch", makeBinaryFetchSpy(upstreamResp));
     captureAudit();
-
-    const putFile = vi.fn(async () => ({
-      ok: true as const,
-      file_handle: "fh_x",
-      token: "stg_y",
-      fetch_url: "https://x.test/staging/fetch/fh_x",
-      expires_at: 999,
-      byte_length: 5,
-    }));
+    const { r2, stagingStore } = makeStore();
 
     const result = (await handleUpstreamRequest({
       ...baseArgs,
       props: { refreshToken: "RT-1", userId: "test-user" },
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
-      putFile,
+      stagingStore,
     })) as {
       success: boolean;
       status: number;
@@ -734,41 +744,31 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
 
     expect(result.success).toBe(true);
     expect(result.status).toBe(200);
-    expect(result.result.file_handle).toBe("fh_x");
-    expect(result.result.token).toBe("stg_y");
-    expect(result.result.fetch_url).toBe("https://x.test/staging/fetch/fh_x");
-    expect(result.result.expires_at).toBe(999);
+    expect(String(result.result.file_handle)).toMatch(/^fh_/);
+    expect(String(result.result.token)).toMatch(/^stg_/);
+    expect(result.result.fetch_url).toBe(`https://x.test/staging/fetch/${String(result.result.file_handle)}`);
+    expect(result.result.expires_at).toBe(1_700_000_000 + 3600);
     expect(result.result.byte_length).toBe(5);
     expect(result.result.contentType).toBe("application/pdf");
     expect(result.result.filename).toBe("file.pdf");
     expect(result.errors).toEqual([]);
-
-    expect(putFile).toHaveBeenCalledTimes(1);
-    // Base64 of [1,2,3,4,5]
-    let s = "";
-    for (const b of raw) s += String.fromCharCode(b);
-    const expectedB64 = btoa(s);
-    expect(putFile).toHaveBeenCalledWith(expectedB64, "application/pdf", "file.pdf");
+    expect(r2.store.size).toBe(1);
   });
 
-  it("non-2xx upstream: putFile NOT called; falls through to normal error envelope", async () => {
+  it("non-2xx upstream: nothing staged; falls through to normal error envelope", async () => {
     const upstreamResp = new Response(JSON.stringify({ error: "not found" }), {
       status: 404,
       headers: { "content-type": "application/json" },
     });
     vi.stubGlobal("fetch", makeBinaryFetchSpy(upstreamResp));
     captureAudit();
-
-    const putFile = vi.fn(async () => ({
-      ok: true as const,
-      file_handle: "x", token: "y", fetch_url: "z", expires_at: 0, byte_length: 0,
-    }));
+    const { r2, stagingStore } = makeStore();
 
     const result = (await handleUpstreamRequest({
       ...baseArgs,
       props: { refreshToken: "RT-1", userId: "test-user" },
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
-      putFile,
+      stagingStore,
     })) as {
       success: boolean;
       status: number;
@@ -776,32 +776,28 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
       errors: Array<{ code: number; message: string }>;
     };
 
-    expect(putFile).not.toHaveBeenCalled();
+    expect(r2.store.size).toBe(0);
     expect(result.success).toBe(false);
     expect(result.status).toBe(404);
     expect(result.errors.length).toBe(1);
     expect(result.errors[0]!.code).toBe(404);
   });
 
-  it("stage failure: putFile returns {ok:false} → error envelope with stage_failed", async () => {
-    const upstreamResp = new Response(new Uint8Array([0xff, 0xfe]), {
-      status: 200,
-      headers: { "content-type": "application/octet-stream" },
-    });
-    vi.stubGlobal("fetch", makeBinaryFetchSpy(upstreamResp));
+  it("stage failure (over the staging cap) → error envelope with stage_failed", async () => {
+    // A fresh body per call: cancelling one branch of a cloned (teed) body
+    // waits for the other branch.
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (url: RequestInfo | URL) =>
+      String(url).includes("/token")
+        ? new Response(JSON.stringify({ access_token: "AT-x", expires_in: 3600 }), { status: 200 })
+        : new Response(new Uint8Array(64), { status: 200, headers: { "content-type": "application/octet-stream" } })));
     captureAudit();
-
-    const putFile = vi.fn(async () => ({
-      ok: false as const,
-      status: 413,
-      message: "too large",
-    }));
+    const { stagingStore } = makeStore(16);
 
     const result = (await handleUpstreamRequest({
       ...baseArgs,
       props: { refreshToken: "RT-1", userId: "test-user" },
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
-      putFile,
+      stagingStore,
     })) as {
       success: boolean;
       status: number;
@@ -813,10 +809,10 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
     expect(result.status).toBe(413);
     expect(result.result.error).toBe("stage_failed");
     expect(result.errors[0]!.code).toBe(413);
-    expect(result.errors[0]!.message).toBe("too large");
+    expect(result.errors[0]!.message).toBe("payload too large");
   });
 
-  it("missing putFile dep: returnAs:\"stage\" without args.putFile → throws ToolError", async () => {
+  it("missing staging store: returnAs:\"stage\" without args.stagingStore → throws ToolError", async () => {
     const upstreamResp = new Response(new Uint8Array([1, 2, 3]), {
       status: 200,
       headers: { "content-type": "application/octet-stream" },
@@ -828,7 +824,7 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
       ...baseArgs,
       props: { refreshToken: "RT-1", userId: "test-user" },
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
-    })).rejects.toThrow(/putFile|staging/);
+    })).rejects.toThrow(/staging/);
   });
 
   it("filename omitted when Content-Disposition absent", async () => {
@@ -838,27 +834,20 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
     });
     vi.stubGlobal("fetch", makeBinaryFetchSpy(upstreamResp));
     captureAudit();
-
-    const putFile = vi.fn(async () => ({
-      ok: true as const,
-      file_handle: "fh_n",
-      token: "tk_n",
-      fetch_url: "https://x.test/staging/fetch/fh_n",
-      expires_at: 1,
-      byte_length: 3,
-    }));
+    const { d1, stagingStore } = makeStore();
 
     const result = (await handleUpstreamRequest({
       ...baseArgs,
       props: { refreshToken: "RT-1", userId: "test-user" },
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
-      putFile,
+      stagingStore,
     })) as { result: Record<string, unknown> };
 
     expect("filename" in result.result).toBe(false);
     expect(result.result.contentType).toBe("image/png");
-    // putFile called with filename=null
-    expect(putFile).toHaveBeenCalledWith(expect.any(String), "image/png", null);
+    const row = [...d1.rows.values()][0] as unknown as { filename: string | null; content_type: string };
+    expect(row.filename).toBeNull();
+    expect(row.content_type).toBe("image/png");
   });
 });
 
@@ -1250,9 +1239,14 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
     vi.stubGlobal("fetch", fetchSpy);
     const audit = captureAudit();
     const elicitInput = vi.fn(async () => ({ action: "accept", content: {} }));
-    const putFile = vi.fn(async () => ({
-      ok: true as const, file_handle: "fh", token: "t", fetch_url: "https://x/f", expires_at: 1, byte_length: 1,
-    }));
+    const r2 = new FakeR2();
+    const putFile = vi.spyOn(r2, "put");
+    const stagingStore = {
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      STAGING_R2: r2 as unknown as R2Bucket,
+      config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 * 1024 },
+      uploadOrigin: "https://x.test",
+    };
     return {
       fetchSpy,
       audit,
@@ -1274,7 +1268,7 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
           userIdAccessor: (p: Record<string, unknown>) => p.userId as string | undefined,
           broker: makeFakeBroker(),
         },
-        putFile,
+        stagingStore,
       },
     };
   }

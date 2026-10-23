@@ -2,6 +2,7 @@ import type { ApiProvider } from "@local/scaffold";
 import { mergeOpenApiSpecs, type OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import gmailSpecJson from "./spec.json" with { type: "json" };
 import calendarSpecJson from "./calendar.spec.json" with { type: "json" };
+import gmailUploadSpecJson from "./gmail-upload.spec.json" with { type: "json" };
 import { surfaceReview } from "./surface-review.js";
 import { gmailElicitRenderers } from "./elicit-renderers.js";
 
@@ -10,67 +11,78 @@ import { gmailElicitRenderers } from "./elicit-renderers.js";
 // (Gmail at /gmail/v1/..., Calendar at /calendar/v3/...), keeping the
 // request-handler's single-origin invariance guard intact. Schema-name
 // collisions throw at import time (see mergeOpenApiSpecs).
+// gmail-upload.spec.json is hand-written: the Discovery normaliser drops the
+// media-upload protocols, so the three /upload/ operations (messages.send,
+// drafts.create, drafts.update with uploadType=media) are declared there. Both
+// Google hosts serve /upload/, so they stay on the shared origin.
 const spec = mergeOpenApiSpecs(
-  [gmailSpecJson as unknown as OpenApiSpec, calendarSpecJson as unknown as OpenApiSpec],
+  [
+    gmailSpecJson as unknown as OpenApiSpec,
+    calendarSpecJson as unknown as OpenApiSpec,
+    gmailUploadSpecJson as unknown as OpenApiSpec,
+  ],
   { title: "Google (Gmail + Calendar)", version: "v1", serverUrl: "https://www.googleapis.com" },
 );
 
-// Provider-specific Step-3 guidance for the staging workflow. Gmail accepts attachments
-// only inside an RFC 822 message body (multipart/mixed), base64url-encoded and posted
-// as { raw } to messages.send or { message: { raw } } to drafts.create. There is no
-// raw-octet upload endpoint and no multipart/form-data endpoint — the LLM must NOT
-// reach for codemode.request's bodyBase64 or multipart modes here. This snippet is the
-// only path that works.
+// Provider-specific Step-3 guidance for the staging workflow (issue #59).
+// Gmail takes attachments only inside an RFC 822 MIME message. The media-upload
+// endpoints (gmail-upload.spec.json) accept that message as raw bytes, so the
+// sandbox writes the headers and MIME structure as text and the host splices
+// the staged file in through `composed` — the file's bytes never cross into
+// execute(). getFile + base64url `{ raw }` used to be the recipe; it cannot
+// carry a large file and is no longer taught.
 const GMAIL_ATTACHMENT_HINT =
-  "Step 3 — Gmail has NO raw-octet or multipart/form-data upload endpoint. Attachments ride inside an RFC 822 MIME message, " +
-  "base64url-encoded, sent as JSON `{ raw }` to /gmail/v1/users/me/messages/send (or `{ message: { raw } }` to /drafts).\n\n" +
-  "Build the MIME message in execute() yourself — do not try `bodyBase64`, `multipart`, or `rawBody` on these endpoints (the API rejects them):\n\n" +
-  "  const f = await __stagingHost.getFile(file_handle, token);\n" +
-  "  if (!f.ok) throw new Error(`staging fetch: ${f.status} ${f.message}`);\n" +
-  "  const boundary = \"----cm-\" + Math.random().toString(36).slice(2) + Date.now().toString(36);\n" +
-  "  const wrapped = f.bytesBase64.match(/.{1,76}/g).join(\"\\r\\n\");  // RFC 822 76-char line wrap\n" +
-  "  // UTF-8-safe base64: btoa() needs a binary (Latin-1) string and THROWS on any code point > 255,\n" +
-  "  // so convert text -> UTF-8 bytes EXACTLY ONCE. NEVER also wrap with encodeURIComponent/unescape and\n" +
-  "  // NEVER run this twice — double-encoding is exactly what turns an em dash (—) into \"Ã¢Â€Â\".\n" +
-  "  const b64 = (text) => { const u = new TextEncoder().encode(text); let s = \"\"; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };\n" +
+  "Step 3 — send the staged file through Gmail's media-upload endpoint. Write the RFC 822 headers and MIME structure as text, " +
+  "and put a `{ staged }` segment where the attachment's base64 goes; the host splices the file in, so its bytes never enter execute():\n\n" +
+  "  // UTF-8-safe base64 for SHORT header text only (never for file data). btoa() THROWS on code points > 255,\n" +
+  "  // so convert text -> UTF-8 bytes EXACTLY ONCE; never also wrap with encodeURIComponent/unescape.\n" +
+  "  const b64 = (text) => { const u = new TextEncoder().encode(text); let s = \"\"; for (const x of u) s += String.fromCharCode(x); return btoa(s); };\n" +
   "  // Non-ASCII HEADER values (Subject, display names) MUST be RFC 2047 encoded-words; a raw UTF-8 byte\n" +
   "  // in an unlabelled header is what a mail client re-reads as CP1252 (mojibake). ASCII passes through.\n" +
   "  const encHeader = (text) => /[^\\x00-\\x7F]/.test(text) ? `=?UTF-8?B?${b64(text)}?=` : text;\n" +
-  "  const mime = [\n" +
+  "  const boundary = \"----cm-\" + Math.random().toString(36).slice(2) + Date.now().toString(36);\n" +
+  "  const head = [\n" +
   "    `From: me`,\n" +
   "    `To: recipient@example.com`,\n" +
   "    `Subject: ${encHeader(subject)}`,   // subject is your plain string; encHeader RFC 2047-encodes it only if non-ASCII\n" +
   "    `MIME-Version: 1.0`,\n" +
   "    `Content-Type: multipart/mixed; boundary=\"${boundary}\"`,\n" +
-  "    ``,\n" +
+  "    ``,                                  // blank line: the header block MUST end here, before the first staged segment\n" +
   "    `--${boundary}`,\n" +
   "    `Content-Type: text/plain; charset=\"UTF-8\"`,\n" +
   "    ``,\n" +
   "    `<email body text>`,\n" +
   "    ``,\n" +
   "    `--${boundary}`,\n" +
-  "    `Content-Type: ${f.contentType ?? \"application/octet-stream\"}; name=\"${f.filename ?? \"file\"}\"`,\n" +
-  "    `Content-Disposition: attachment; filename=\"${f.filename ?? \"file\"}\"`,\n" +
+  "    `Content-Type: application/pdf; name=\"q.pdf\"`,   // the type and filename you registered\n" +
+  "    `Content-Disposition: attachment; filename=\"q.pdf\"`,\n" +
   "    `Content-Transfer-Encoding: base64`,\n" +
   "    ``,\n" +
-  "    wrapped,\n" +
-  "    ``,\n" +
-  "    `--${boundary}--`,\n" +
+  "    ``,                                  // ends in a blank line + CRLF: the base64 starts on the next line\n" +
   "  ].join(\"\\r\\n\");\n" +
-  "  // base64url-encode the whole MIME (UTF-8 bytes -> standard base64 via b64() -> URL-safe, strip padding):\n" +
-  "  const raw = b64(mime).replace(/\\+/g, \"-\").replace(/\\//g, \"_\").replace(/=+$/, \"\");\n" +
   "  await codemode.request({\n" +
   "    method: \"POST\",\n" +
-  "    path: \"/gmail/v1/users/me/messages/send\",   // or /drafts with body: { message: { raw } }\n" +
-  "    body: { raw },\n" +
+  "    path: \"/upload/gmail/v1/users/me/messages/send\",   // drafts: POST /upload/gmail/v1/users/me/drafts, PUT /upload/gmail/v1/users/me/drafts/{id}\n" +
+  "    query: { uploadType: \"media\" },\n" +
+  "    contentType: \"message/rfc822\",\n" +
+  "    composed: { segments: [\n" +
+  "      { text: head },\n" +
+  "      { staged: { file_handle, token }, encoding: \"base64-lines\" },   // 76-char lines, CRLF after every line incl. the last\n" +
+  "      { text: `--${boundary}--\\r\\n` },\n" +
+  "    ] },\n" +
   "  });\n\n" +
   "Notes:\n" +
-  "- `raw` is base64url (URL-safe, NO padding). Build it from UTF-8 bytes via the `b64` helper above — do NOT call bare `btoa(mime)` (it throws on any non-ASCII char) and do NOT double-encode.\n" +
-  "- Recipients must pass the send inspector's allowlist (see gmail.users.messages.send surface entry).\n" +
-  "- For HTML body, change the first inner part to `Content-Type: text/html; charset=\"UTF-8\"`. For both, wrap text+html in a nested `multipart/alternative`.\n" +
-  "- UNICODE (don't ship mojibake): non-ASCII in HEADERS (Subject, display names) must be wrapped with `encHeader` (RFC 2047 encoded-word) as shown — an unlabelled UTF-8 byte in a header is re-read as CP1252 and renders as mojibake (an em dash — becomes \"Ã¢Â€Â\"). Non-ASCII in the BODY is fine as long as the part declares `charset=\"UTF-8\"` (above), since the whole MIME is UTF-8-encoded into `raw` exactly once. Apply the UTF-8->bytes step ONCE: never wrap it with encodeURIComponent/unescape on top, and never base64 an already-base64'd string.\n\n" +
+  "- The body is the raw RFC 822 message: no base64url, no `{ raw }`, no JSON. `composed` cannot be combined with `body`, `rawBody`, `bodyBase64` or `multipart`, and the JSON endpoint /gmail/v1/users/me/messages/send refuses it — use the /upload/ path.\n" +
+  "- Every header, including all of To/Cc/Bcc, and the blank line that ends them must come before the first staged segment; a staged segment before the header block ends is denied.\n" +
+  "- Recipients must pass the send inspector's allowlist (see the gmail.users.messages.send.media surface entry). Drafts are not recipient-checked until they are sent.\n" +
+  "- Several attachments: repeat the `--${boundary}` part headers as text, each followed by its own staged segment (at most 32 segments in all).\n" +
+  "- For an HTML body, change the first inner part to `Content-Type: text/html; charset=\"UTF-8\"`. For both, wrap text+html in a nested `multipart/alternative`.\n" +
+  "- UNICODE (don't ship mojibake): non-ASCII in HEADERS (Subject, display names) must be wrapped with `encHeader` (RFC 2047 encoded-word) as shown — an unlabelled UTF-8 byte in a header is re-read as CP1252 and renders as mojibake (an em dash — becomes \"Ã¢Â€Â\"). Non-ASCII in the BODY text is fine as long as the part declares `charset=\"UTF-8\"`; text segments are sent as UTF-8 exactly once. Never base64 an already-base64'd string.\n" +
+  "- `__stagingHost.getFile` is for reading small files in code (parse a CSV, read a PDF's text), not for sending them: it is capped at 8 MiB by default, while the composed path above is limited only by the 35 MiB message cap below.\n\n" +
   "## Send size limit\n\n" +
-  "The JSON `{ raw }` path above is the ONLY send channel for Gmail — no `/upload/...` path is registered (it resolves to a denied no-op), and the scaffold's `bodyBase64`/`multipart` body modes do not work on Gmail send endpoints (see Step 3 above). An inspected send whose effective JSON body exceeds 50 MB is denied before it is sent, so keep the whole request under 50 MB. Note the attachment is base64-encoded twice on this path (once as the MIME part, once when the whole MIME becomes `raw`), inflating original bytes ~1.8x, so the practical ceiling is roughly 28 MB of original attachment content — this 50 MB cap binds before Gmail's own ~35 MB messages.send limit does. If a send is denied for size, shrink or drop the attachment; do not try an alternate upload channel (there isn't one).";
+  "The whole assembled message (headers, text and the base64 attachment, about 1.37x the file's size) may be at most 35 MiB (36 700 160 bytes, Gmail's media-upload limit); a larger send is denied before anything is uploaded. " +
+  "That makes the practical ceiling about 25 MiB of original attachment content. If a send is denied for size, shrink or drop the attachment. " +
+  "The JSON `{ raw }` send still works for messages without attachments.";
 
 // Provider-specific download guidance for the staging workflow (issue #41):
 // the opposite direction of GMAIL_ATTACHMENT_HINT above, wired to

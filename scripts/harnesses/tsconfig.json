@@ -1,0 +1,14 @@
+{
+  // Typecheck for the operator harnesses (run by `pnpm test:harness`). They
+  // run under tsx, not a bundler, and are not part of any workspace package.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": ["./**/*.ts"]
+}

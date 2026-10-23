@@ -420,6 +420,7 @@ function decideRecipients(
   recipients: string[],
   allowlist: readonly string[],
   getSubject: () => string,
+  extraSummary: Record<string, string> = {},
 ): InspectResult {
   for (const r of recipients) {
     if (!isPlainAddrSpec(r.trim().toLowerCase())) {
@@ -447,6 +448,7 @@ function decideRecipients(
           recipients.slice(0, 3).join(", ") + (recipients.length > 3 ? ` (+${recipients.length - 3})` : ""),
         subject: String(subject ?? "").slice(0, 200),
         count: recipients.length,
+        ...extraSummary,
       },
     };
   }
@@ -683,4 +685,224 @@ export function inspectDraftSend(req: InspectRequest, env?: InspectEnv): Inspect
     };
   }
   return inspectOutboundMessage(req, env);
+}
+
+// ---------------------------------------------------------------------------
+// Media-upload send (gmail.users.messages.send.media, issue #59)
+// ---------------------------------------------------------------------------
+
+/** Gmail's media-upload ceiling for messages.send (the discovery document's
+ *  `mediaUpload.maxSize`, 35 MiB). Checked against the exact assembled length
+ *  so an oversize send is refused before any staged file is opened. */
+export const GMAIL_MEDIA_MAX_BYTES = 36_700_160;
+
+/** U+FFFC OBJECT REPLACEMENT CHARACTER: the scaffold's stand-in for a staged
+ *  segment in a composed body's inspection view. */
+const STAGED_SLOT = "\uFFFC";
+
+/** Query parameters the media send may carry. `uploadType` (required, checked
+ *  separately) and `upload_protocol` (absent or "raw") select how Google
+ *  parses the body, so anything else there could change what is sent from
+ *  what was inspected. `fields`, `prettyPrint` and `quotaUser` only shape the
+ *  response or quota accounting. Everything else is refused: `alt`,
+ *  `callback` and `$.xgafv` change the response format the scaffold parses,
+ *  and `key`/`access_token`/`oauth_token` are credentials the host supplies,
+ *  never the sandbox. */
+const MEDIA_SEND_QUERY_KEYS: ReadonlySet<string> = new Set([
+  "uploadType",
+  "upload_protocol",
+  "fields",
+  "prettyPrint",
+  "quotaUser",
+]);
+
+/** True for `message/rfc822`, in any case, with no parameter other than an
+ *  optional `charset` token (quoted or not). A `boundary=` or any other
+ *  parameter could change how Google's media parser reads the body. */
+function isPlainRfc822ContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  const [type, ...params] = contentType.split(";");
+  if (type!.trim().toLowerCase() !== "message/rfc822") return false;
+  return params.every((p) => {
+    const t = p.trim();
+    return t.length === 0 || /^charset\s*=\s*(?:[A-Za-z0-9._-]+|"[A-Za-z0-9._-]+")$/i.test(t);
+  });
+}
+
+/** First `max` code points of a string, never splitting a surrogate pair. */
+function codePointPrefix(text: string, max: number): string {
+  let out = "";
+  let n = 0;
+  for (const ch of text) {
+    if (n++ >= max) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** UTF-8 byte length of a string without allocating its encoding. A lone
+ *  surrogate counts as the 3-byte U+FFFD `TextEncoder` would write. */
+function utf8Length(text: string): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) {
+      const d = text.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        n += 4;
+        i++;
+      } else n += 3;
+    } else n += 3;
+  }
+  return n;
+}
+
+/** Byte length of the outbound media body: the scaffold's exact assembled
+ *  length for a composed body, else the length of the plain rawBody. */
+function mediaBodyLength(req: InspectRequest): number {
+  if (typeof req.assembledByteLength === "number") return req.assembledByteLength;
+  const raw = req.rawBody;
+  if (raw === undefined) return 0;
+  if (typeof raw === "string") return utf8Length(raw);
+  return raw.byteLength;
+}
+
+/** Offset just past the blank line that ends the header block (CRLF or bare
+ *  LF line endings, as `parseHeaders` reads them), or -1 when the text has no
+ *  such line. A text beginning with a line ending has an empty header block. */
+function headerBlockEnd(text: string): number {
+  const lineEnd = /\r?\n/g;
+  let start = 0;
+  let m: RegExpExecArray | null;
+  while ((m = lineEnd.exec(text)) !== null) {
+    const end = m.index + m[0].length;
+    if (m.index === start) return end;
+    start = end;
+  }
+  return -1;
+}
+
+/** Display form of a staged file's name for the approval summary: Unicode
+ *  format characters (bidi overrides, zero-width marks) removed; C0/C1
+ *  controls and line/paragraph separators collapsed to a space; capped at 100
+ *  code points. */
+function summaryFilename(name: string | null): string {
+  if (name === null) return "(unnamed)";
+  const clean = codePointPrefix(
+    name
+      .replace(/\p{Cf}/gu, "")
+      .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ")
+      .trim(),
+    100,
+  );
+  return clean.length > 0 ? clean : "(unnamed)";
+}
+
+/**
+ * Inspector for `gmail.users.messages.send.media` (POST
+ * /upload/gmail/v1/users/{userId}/messages/send?uploadType=media). The body
+ * is the raw RFC 822 message — either a plain `rawBody`, or a composed body
+ * whose inspection view replaces each staged file with U+FFFC and carries the
+ * files' metadata in `staged` and the exact wire length in
+ * `assembledByteLength`. In order:
+ *
+ *   1. `uploadType` must be exactly `media` → else deny/upload-type-not-media;
+ *   2. the content type must be `message/rfc822` → else deny/media-content-type;
+ *   3. the body must fit Gmail's 35 MiB media limit → else deny/message-too-large;
+ *   4. no staged slot may sit before the end of the header block (or with no
+ *      header block at all) → else deny/attachment-before-header-end. Staged
+ *      bytes are base64 (or, for a sole identity segment, the whole message),
+ *      so after the blank line they cannot become headers; before it they
+ *      could carry recipients the inspector never saw;
+ *   5. recipients are then read from the header block and decided exactly as
+ *      for the JSON send (`inspectOutboundMessage`'s non-JSON path), the
+ *      mass-send summary listing the staged attachments.
+ *
+ * A JSON or multipart body on this endpoint has no readable message and is
+ * denied.
+ */
+export function inspectOutboundMessageMedia(req: InspectRequest, env?: InspectEnv): InspectResult {
+  const query = req.query ?? {};
+  const protocol = query["upload_protocol"];
+  if (query["uploadType"] !== "media" || (protocol !== undefined && protocol !== "raw")) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "upload-type-not-media",
+      message:
+        "The Gmail media-upload send needs query { uploadType: \"media\" } (and upload_protocol, if given, must be \"raw\")",
+    };
+  }
+  const stray = Object.keys(query).filter((k) => query[k] !== undefined && !MEDIA_SEND_QUERY_KEYS.has(k));
+  if (stray.length > 0) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "media-query-param",
+      message:
+        "The Gmail media-upload send accepts only the query parameters uploadType, upload_protocol, fields, " +
+        "prettyPrint and quotaUser",
+    };
+  }
+  if (!isPlainRfc822ContentType(req.contentType)) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "media-content-type",
+      message:
+        "The Gmail media-upload send needs contentType \"message/rfc822\" (the raw RFC 822 message), " +
+        "with no parameter other than an optional charset",
+    };
+  }
+  const size = mediaBodyLength(req);
+  if (size > GMAIL_MEDIA_MAX_BYTES) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "message-too-large",
+      message:
+        `The assembled message is ${size} bytes; Gmail accepts at most ${GMAIL_MEDIA_MAX_BYTES} ` +
+        "bytes (35 MiB) on a media-upload send. Shrink or drop the attachment.",
+    };
+  }
+  if (req.body !== undefined || req.multipart !== undefined || req.rawBody === undefined) {
+    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
+  }
+  if (typeof req.rawBody === "string") {
+    const slot = req.rawBody.indexOf(STAGED_SLOT);
+    if (slot >= 0) {
+      const end = headerBlockEnd(req.rawBody);
+      if (end < 0 || slot < end) {
+        return {
+          decision: "deny",
+          category: "malformed",
+          reason: "attachment-before-header-end",
+          message:
+            "A staged file is placed before the message's header block has ended. Put every header, " +
+            "and the blank line that ends them, before the first staged segment.",
+        };
+      }
+    }
+  }
+
+  const allowlist = outboundAllowlistFromEnv(env);
+  const text = rfc822FromNonJson(req);
+  if (text === null) {
+    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
+  }
+  const parsed = recipientsFromRfc822(text);
+  if ("deny" in parsed) return parsed.deny;
+  if (parsed.recipients.length === 0) {
+    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
+  }
+  const extra: Record<string, string> = {};
+  if (req.staged !== undefined && req.staged.length > 0) {
+    extra["attachments"] = codePointPrefix(
+      req.staged.map((f) => `${summaryFilename(f.filename)} (${f.byteLength} bytes)`).join(", "),
+      500,
+    );
+  }
+  return decideRecipients(parsed.recipients, allowlist, () => subjectFromRfc822(text), extra);
 }

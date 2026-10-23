@@ -5,7 +5,13 @@
  * don't have to construct a full `ProviderEnv` to use them.
  */
 
-import type { StagingConfig } from "./staging/types";
+import {
+  DEFAULT_COMPOSE_MAX_BYTES,
+  DEFAULT_GETFILE_MAX_BYTES,
+  DEFAULT_MAX_CONCURRENT_TRANSFERS,
+  DEFAULT_TRANSFER_TIMEOUT_MS,
+  type StagingConfig,
+} from "./staging/types";
 
 export function allowPiiInLogs(env: { ALLOW_PII_IN_LOGS?: string }): boolean {
   return env.ALLOW_PII_IN_LOGS === "true";
@@ -85,6 +91,14 @@ export function readStagingConfig(env: Record<string, unknown>): StagingConfig {
     uploadTtlSeconds: parsePositiveIntVar(env, "STAGING_UPLOAD_TTL_SECONDS", DEFAULT_UPLOAD_TTL_SECONDS),
     fetchTtlSeconds: parsePositiveIntVar(env, "STAGING_FETCH_TTL_SECONDS", DEFAULT_FETCH_TTL_SECONDS),
     maxBytes: parsePositiveIntVar(env, "STAGING_MAX_BYTES", DEFAULT_MAX_BYTES),
+    getFileMaxBytes: parsePositiveIntVar(env, "STAGING_GETFILE_MAX_BYTES", DEFAULT_GETFILE_MAX_BYTES),
+    composeMaxBytes: parsePositiveIntVar(env, "STAGING_COMPOSE_MAX_BYTES", DEFAULT_COMPOSE_MAX_BYTES),
+    maxConcurrentTransfers: parsePositiveIntVar(
+      env,
+      "STAGING_MAX_CONCURRENT_TRANSFERS",
+      DEFAULT_MAX_CONCURRENT_TRANSFERS,
+    ),
+    transferTimeoutMs: parsePositiveIntVar(env, "STAGING_TRANSFER_TIMEOUT_MS", DEFAULT_TRANSFER_TIMEOUT_MS),
   };
 }
 

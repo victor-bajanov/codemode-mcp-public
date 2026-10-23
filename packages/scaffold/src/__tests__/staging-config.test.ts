@@ -7,6 +7,10 @@ describe("readStagingConfig", () => {
       uploadTtlSeconds: 300,
       fetchTtlSeconds: 3600,
       maxBytes: 50 * 1024 * 1024,
+      getFileMaxBytes: 8_388_608,
+      composeMaxBytes: 75_497_472,
+      maxConcurrentTransfers: 2,
+      transferTimeoutMs: 60_000,
     });
   });
 
@@ -17,7 +21,35 @@ describe("readStagingConfig", () => {
         STAGING_FETCH_TTL_SECONDS: "120",
         STAGING_MAX_BYTES: "1024",
       }),
-    ).toEqual({ uploadTtlSeconds: 60, fetchTtlSeconds: 120, maxBytes: 1024 });
+    ).toMatchObject({ uploadTtlSeconds: 60, fetchTtlSeconds: 120, maxBytes: 1024 });
+  });
+
+  it("parses the staged-transfer v2 vars", () => {
+    expect(
+      readStagingConfig({
+        STAGING_GETFILE_MAX_BYTES: "1000",
+        STAGING_COMPOSE_MAX_BYTES: "2000",
+        STAGING_MAX_CONCURRENT_TRANSFERS: "3",
+        STAGING_TRANSFER_TIMEOUT_MS: "5000",
+      }),
+    ).toMatchObject({
+      getFileMaxBytes: 1000,
+      composeMaxBytes: 2000,
+      maxConcurrentTransfers: 3,
+      transferTimeoutMs: 5000,
+    });
+  });
+
+  it("rejects invalid staged-transfer v2 vars", () => {
+    for (const name of [
+      "STAGING_GETFILE_MAX_BYTES",
+      "STAGING_COMPOSE_MAX_BYTES",
+      "STAGING_MAX_CONCURRENT_TRANSFERS",
+      "STAGING_TRANSFER_TIMEOUT_MS",
+    ]) {
+      expect(() => readStagingConfig({ [name]: "0" })).toThrow(new RegExp(name));
+      expect(() => readStagingConfig({ [name]: "1.5" })).toThrow(new RegExp(name));
+    }
   });
 
   it("throws on non-numeric input", () => {

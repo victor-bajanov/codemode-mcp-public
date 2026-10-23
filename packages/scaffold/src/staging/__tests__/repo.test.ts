@@ -66,13 +66,13 @@ describe("atomicClaim", () => {
     const r1 = await atomicClaim(d1 as unknown as D1Database, {
       token_hash: TOKEN_HASH, iv: new Uint8Array(12).fill(1),
       content_type: "application/octet-stream", byte_len: 5, r2_key: "abc",
-      claimed_at: 200, new_expires_at: 200 + 3600, now: 200,
+      claimed_at: 200, new_expires_at: 200 + 3600, now: 200, enc_version: 1,
     });
     expect(r1).toEqual({ file_handle: HANDLE });
     const r2 = await atomicClaim(d1 as unknown as D1Database, {
       token_hash: TOKEN_HASH, iv: new Uint8Array(12).fill(2),
       content_type: "application/octet-stream", byte_len: 5, r2_key: "def",
-      claimed_at: 250, new_expires_at: 250 + 3600, now: 250,
+      claimed_at: 250, new_expires_at: 250 + 3600, now: 250, enc_version: 1,
     });
     expect(r2).toBeNull();
   });
@@ -85,7 +85,7 @@ describe("atomicClaim", () => {
     });
     const r = await atomicClaim(d1 as unknown as D1Database, {
       token_hash: TOKEN_HASH, iv: new Uint8Array(12), content_type: "x",
-      byte_len: 1, r2_key: "k", claimed_at: 300, new_expires_at: 3900, now: 300,
+      byte_len: 1, r2_key: "k", claimed_at: 300, new_expires_at: 3900, now: 300, enc_version: 1,
     });
     expect(r).toBeNull();
   });
@@ -94,7 +94,7 @@ describe("atomicClaim", () => {
     const d1 = new FakeD1();
     const r = await atomicClaim(d1 as unknown as D1Database, {
       token_hash: TOKEN_HASH, iv: new Uint8Array(12), content_type: "x",
-      byte_len: 1, r2_key: "k", claimed_at: 300, new_expires_at: 3900, now: 300,
+      byte_len: 1, r2_key: "k", claimed_at: 300, new_expires_at: 3900, now: 300, enc_version: 1,
     });
     expect(r).toBeNull();
   });
@@ -189,6 +189,7 @@ describe("insertClaimed", () => {
       created_at: 100,
       claimed_at: 100,
       expires_at: 100 + 3600,
+      enc_version: 1,
     });
     const row = await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH);
     expect(row).not.toBeNull();
@@ -212,14 +213,74 @@ describe("insertClaimed", () => {
     await insertClaimed(d1 as unknown as D1Database, {
       token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv,
       content_type: "application/octet-stream", byte_len: 0, filename: null,
-      created_at: 1, claimed_at: 1, expires_at: 3601,
+      created_at: 1, claimed_at: 1, expires_at: 3601, enc_version: 1,
     });
     await expect(
       insertClaimed(d1 as unknown as D1Database, {
         token_hash: TOKEN_HASH, file_handle: "fh_zz", r2_key: "stg/b", iv,
         content_type: "application/octet-stream", byte_len: 0, filename: null,
-        created_at: 2, claimed_at: 2, expires_at: 3602,
+        created_at: 2, claimed_at: 2, expires_at: 3602, enc_version: 1,
       }),
     ).rejects.toThrow(/UNIQUE/);
+  });
+});
+
+describe("enc_version (v2 at-rest format)", () => {
+  it("insertClaimed writes enc_version and lookupByHash returns it", async () => {
+    const d1 = new FakeD1();
+    await insertClaimed(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv: new Uint8Array(8),
+      content_type: "application/pdf", byte_len: 10, filename: null,
+      created_at: 1, claimed_at: 1, expires_at: 3601, enc_version: 2,
+    });
+    const row = await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH);
+    expect(row!.enc_version).toBe(2);
+  });
+
+  it("atomicClaim sets enc_version", async () => {
+    const d1 = new FakeD1();
+    await insertPending(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
+      expected_byte_len: null, filename: null, created_at: 100, expires_at: 400,
+    });
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.enc_version).toBe(1);
+    await atomicClaim(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, iv: new Uint8Array(8), content_type: "x",
+      byte_len: 1, r2_key: "k", claimed_at: 200, new_expires_at: 3800, now: 200, enc_version: 2,
+    });
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.enc_version).toBe(2);
+  });
+
+  it("a row without the column (pre-migration shape) reads back as 1", async () => {
+    const fake: unknown = {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => ({
+            token_hash: new Uint8Array(32), file_handle: HANDLE, state: "claimed",
+            r2_key: "k", iv: new Uint8Array(12), content_type_hint: null,
+            content_type: "x", expected_byte_len: null, byte_len: 1, filename: null,
+            created_at: 1, claimed_at: 1, expires_at: 2,
+          }),
+        }),
+      }),
+    };
+    const row = await lookupByHash(fake as D1Database, TOKEN_HASH);
+    expect(row!.enc_version).toBe(1);
+  });
+
+  it("FakeD1 maps INSERT values by the SQL column list, not by argument count", async () => {
+    const d1 = new FakeD1();
+    await d1
+      .prepare(
+        `INSERT INTO staging (file_handle, token_hash, state, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .bind(HANDLE, TOKEN_HASH, "pending", 5, 50)
+      .run();
+    const row = await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH);
+    expect(row!.file_handle).toBe(HANDLE);
+    expect(row!.created_at).toBe(5);
+    expect(row!.expires_at).toBe(50);
+    expect(row!.enc_version).toBe(1);
   });
 });

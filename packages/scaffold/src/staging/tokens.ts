@@ -4,20 +4,37 @@ import {
   TOKEN_SECRET_BYTES,
   HANDLE_BYTES,
 } from "./types";
+import { decodeBase64Into, decodedLength } from "./codec";
 
+const URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+// Unpadded base64url of a short random value (tokens and handles only).
 function b64urlEncode(bytes: Uint8Array): string {
   let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  for (let i = 0; i < bytes.byteLength; i += 3) {
+    const n = Math.min(3, bytes.byteLength - i);
+    const v = (bytes[i]! << 16) | ((n > 1 ? bytes[i + 1]! : 0) << 8) | (n > 2 ? bytes[i + 2]! : 0);
+    s += URL_CHARS[v >>> 18]! + URL_CHARS[(v >>> 12) & 63]!;
+    if (n > 1) s += URL_CHARS[(v >>> 6) & 63]!;
+    if (n > 2) s += URL_CHARS[v & 63]!;
+  }
+  return s;
 }
 
+// Strict unpadded base64url: no whitespace, no padding, url alphabet only.
 function b64urlDecode(s: string): Uint8Array {
-  const pad = s.length % 4 === 0 ? 0 : 4 - (s.length % 4);
-  const padded = s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(pad);
-  const bin = atob(padded);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  if (s.includes("=")) throw new Error("invalid base64url");
+  const out = new Uint8Array(decodedLength(s, 0, s.length, "url"));
+  decodeBase64Into(s, 0, s.length, out, 0, "url");
   return out;
+}
+
+/** Constant-time (for equal lengths) string comparison. */
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 function randomBytes(n: number): Uint8Array {

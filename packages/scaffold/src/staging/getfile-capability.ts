@@ -1,11 +1,16 @@
-import type { StagingConfig } from "./types";
-import { handleFetch } from "./fetch-handler";
+import { DEFAULT_GETFILE_MAX_BYTES, type StagingConfig } from "./types";
+import { Base64Encoder } from "./codec";
+import { openStagedFile } from "./staged-file";
+import { sanitiseRowFilename } from "./sanitise-filename";
+import { withTransferGate, type TransferGateDeps } from "./gate-dep";
 
-export interface GetFileCapabilityDeps {
+export type GetFileCapabilityDeps = GetFileStoreDeps & TransferGateDeps;
+
+export interface GetFileStoreDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
-  /** Test seam: override the clock used by the inner `handleFetch`. */
+  /** Test seam: override the clock. */
   now?: () => number;
 }
 
@@ -16,85 +21,73 @@ export interface SandboxFileBody {
   bytesBase64: string; // wire-safe; the child re-wraps as Uint8Array
 }
 
+export type GetFileResult =
+  | ({ ok: true } & SandboxFileBody)
+  | { ok: false; status: number; message: string };
+
 /**
- * Host-side function called by the codemode child Worker via `__stagingHost.getFile`.
+ * Host-side function called by the codemode child Worker via
+ * `__stagingHost.getFile(handle, token)`.
  *
- * Codemode 0.3.5 API surface — relevant findings (see report for full context):
- *
- *   - There is NO `executor.registerCapability(...)` method. The executor is a
- *     plain `DynamicWorkerExecutor` whose only public method is
- *     `execute(code, providersOrFns: ResolvedProvider[] | Record<string, fn>)`.
- *   - Host capabilities are injected at the `execute()` call-site as
- *     `ResolvedProvider[]`, each `{ name, fns, positionalArgs? }`. In the
- *     sandbox they become globals named after `name` (so `name: "__stagingHost"`
- *     yields `globalThis.__stagingHost.getFile(...)` in LLM-written code).
- *   - The `__openapiHost` capability is wired *inside* `openApiMcpServer()` —
- *     the `execute` MCP tool callback constructs the providers array
- *     `[{ name: "__openapiHost", fns: { request } }]` itself. There is no
- *     public hook on `openApiMcpServer` to append additional providers.
- *   - There is NO sandbox prelude / modules-prepend mechanism that runs before
- *     LLM code in the OpenAPI execute path (codemode's `modules` option
- *     applies only to `executor.execute` invocations the caller controls — the
- *     OpenAPI `execute` tool doesn't expose it). Consequently the sandbox
- *     cannot transparently re-wrap `bytesBase64` into a `Response`-like
- *     object; LLM code must decode it itself.
+ * Its job is *processing* small files in sandbox code (parse a CSV, read a
+ * PDF's text). Sending a staged file upstream does not need the bytes in the
+ * sandbox: `codemode.request({ composed })` and `multipart[].staged` have the
+ * host assemble the body. So rows above `STAGING_GETFILE_MAX_BYTES` (default
+ * 8 MiB) are refused from D1 metadata alone, before any R2 read, and the
+ * whole read holds a transfer-gate slot when a gate is supplied (D8).
  *
  * Wire form (host → child):
  *   { ok: true, contentType, byteLength, filename, bytesBase64 }
  *   | { ok: false, status, message }
  *
- * The child code in the sandbox can wrap `bytesBase64` into bytes via:
- *   const raw = atob(out.bytesBase64);
- *   const buf = new Uint8Array(raw.length);
- *   for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+ * The base64 text is produced block by block (codec.ts) and joined once per
+ * block; there is no per-byte string building.
  */
 export function createGetFileCapability(deps: GetFileCapabilityDeps) {
-  return async function getFile(
-    handle: string,
-    token: string,
-  ): Promise<
-    | {
-        ok: true;
-        contentType: string;
-        byteLength: number;
-        filename: string | null;
-        bytesBase64: string;
-      }
-    | { ok: false; status: number; message: string }
-  > {
+  const maxBytes = deps.config.getFileMaxBytes ?? DEFAULT_GETFILE_MAX_BYTES;
+  return async function getFile(handle: string, token: string): Promise<GetFileResult> {
     if (typeof handle !== "string" || typeof token !== "string") {
       return { ok: false, status: 400, message: "handle and token must be strings" };
     }
-    // Synthesize an internal request that `handleFetch` already knows how to process.
-    const url = `https://internal.invalid/staging/fetch/${encodeURIComponent(handle)}`;
-    const req = new Request(url, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const res = await handleFetch(req, {
-      STAGING_D1: deps.STAGING_D1,
-      STAGING_R2: deps.STAGING_R2,
-      config: deps.config,
-      ...(deps.now ? { now: deps.now } : {}),
-    });
-    if (res.status !== 200) {
-      return { ok: false, status: res.status, message: await res.text() };
+    const opened = await openStagedFile(deps, { file_handle: handle, token });
+    if (!opened.ok) return opened;
+    const { meta } = opened.file;
+    if (meta.byteLength > maxBytes) {
+      return {
+        ok: false,
+        status: 413,
+        message:
+          `file is ${meta.byteLength} bytes; getFile returns at most ${maxBytes}. ` +
+          "To send a staged file upstream, pass { file_handle, token } in codemode.request's " +
+          "`composed` segments or a `multipart[].staged` part instead of reading the bytes.",
+      };
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    return {
-      ok: true,
-      contentType: res.headers.get("Content-Type") ?? "application/octet-stream",
-      byteLength: buf.byteLength,
-      filename: res.headers.get("X-Filename"),
-      bytesBase64: bytesToBase64(buf),
-    };
+    const gated = await withTransferGate(deps, async (): Promise<GetFileResult> => {
+      const encoder = new Base64Encoder("plain");
+      const decoder = new TextDecoder("latin1");
+      const parts: string[] = [];
+      const emit = async (ascii: Uint8Array) => {
+        parts.push(decoder.decode(ascii));
+      };
+      try {
+        await opened.file.readBlocks((plain) => encoder.push(plain, emit));
+        await encoder.finish(emit);
+      } catch (err) {
+        const status = (err as { status?: unknown }).status;
+        return {
+          ok: false,
+          status: status === 410 ? 410 : 500,
+          message: status === 410 ? "stored file is corrupt" : "staging read failed",
+        };
+      }
+      return {
+        ok: true,
+        contentType: meta.contentType,
+        byteLength: meta.byteLength,
+        filename: sanitiseRowFilename(meta.filename),
+        bytesBase64: parts.join(""),
+      };
+    });
+    return gated.ok ? gated.value : gated;
   };
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let s = "";
-  // noUncheckedIndexedAccess: bytes[i] is `number | undefined`; the loop bound
-  // guarantees defined, so a non-null assertion is correct here.
-  for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]!);
-  return btoa(s);
 }

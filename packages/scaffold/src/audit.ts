@@ -24,6 +24,18 @@ export interface AuditEntry {
    *  (429) — which limit was hit and how long it asked us to wait. Operational
    *  metadata, no PII. */
   rateLimit?: UpstreamRateLimit;
+  /** Host-assembled sends (`composed` / `multipart[].staged`): how many
+   *  staged files were attached, their plaintext bytes, and the exact
+   *  outbound body length. Counters only — never a token or handle. */
+  stagedCount?: number;
+  stagedBytes?: number;
+  assembledBytes?: number;
+  /** Bytes of the assembled body the upstream connection accepted before it
+   *  answered, and whether that was all of `assembledBytes`. A false
+   *  `bodyComplete` with a 2xx `upstreamStatus` is a truncated send the
+   *  upstream nonetheless accepted. */
+  bodyBytesSent?: number;
+  bodyComplete?: boolean;
   /** Authenticated principal (OAuth `sub` or equivalent). */
   principalId?: string;
   /** Provider-specific identifier blob (e.g. { tenantId: "..." } for Xero). */

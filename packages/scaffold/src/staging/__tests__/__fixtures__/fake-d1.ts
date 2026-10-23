@@ -43,6 +43,7 @@ export class FakeD1 {
       created_at: stored.created_at,
       claimed_at: stored.claimed_at,
       expires_at: stored.expires_at,
+      enc_version: stored.enc_version,
     };
   }
 }
@@ -88,72 +89,70 @@ class FakeD1Statement {
   private exec(): { rows: unknown[]; written: number; read: number } {
     const sql = this.sql.replace(/\s+/g, " ").trim();
     if (sql.startsWith("INSERT INTO staging")) {
-      const key = hex(this.args[0] as Uint8Array);
-      if (this.db.rows.has(key)) throw new Error("UNIQUE constraint failed: staging.token_hash");
-
-      // Support both insertPending (8 args) and insertClaimed (13 args)
-      if (this.args.length === 8) {
-        // insertPending: token_hash, file_handle, state, content_type_hint, expected_byte_len, filename, created_at, expires_at
-        const [
-          token_hash, file_handle, state, content_type_hint,
-          expected_byte_len, filename, created_at, expires_at,
-        ] = this.args as [Uint8Array, string, string, string | null, number | null, string | null, number, number];
-        this.db.rows.set(key, {
-          token_hash_hex: key,
-          file_handle,
-          state: state as StagingRow["state"],
-          r2_key: null,
-          iv_hex: null,
-          content_type_hint: content_type_hint ?? null,
-          content_type: null,
-          expected_byte_len: expected_byte_len ?? null,
-          byte_len: null,
-          filename: filename ?? null,
-          created_at,
-          claimed_at: null,
-          expires_at,
-        });
-      } else if (this.args.length === 13) {
-        // insertClaimed: token_hash, file_handle, state, r2_key, iv, content_type_hint, content_type, expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at
-        const [
-          token_hash, file_handle, state, r2_key, iv, content_type_hint,
-          content_type, expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at,
-        ] = this.args as [Uint8Array, string, string, string, Uint8Array, string | null, string, number | null, number, string | null, number, number, number];
-        this.db.rows.set(key, {
-          token_hash_hex: key,
-          file_handle,
-          state: state as StagingRow["state"],
-          r2_key,
-          iv_hex: hex(iv),
-          content_type_hint: content_type_hint ?? null,
-          content_type,
-          expected_byte_len: expected_byte_len ?? null,
-          byte_len,
-          filename: filename ?? null,
-          created_at,
-          claimed_at,
-          expires_at,
-        });
-      } else {
-        throw new Error(`FakeD1: unexpected INSERT argument count: ${this.args.length}`);
+      // Map values to columns by parsing the SQL's column and VALUES lists, so
+      // adding a column never silently shifts every bound argument.
+      const m = sql.match(/^INSERT INTO staging \(([^)]*)\) VALUES \(([^)]*)\)$/);
+      if (!m) throw new Error(`FakeD1: unparseable INSERT: ${sql}`);
+      const cols = m[1]!.split(",").map((c) => c.trim());
+      const vals = m[2]!.split(",").map((v) => v.trim());
+      if (cols.length !== vals.length) throw new Error("FakeD1: INSERT column/value count mismatch");
+      const record: Record<string, unknown> = {};
+      let argIndex = 0;
+      for (let i = 0; i < cols.length; i++) {
+        const v = vals[i]!;
+        if (v === "?") record[cols[i]!] = this.args[argIndex++];
+        else if (/^'.*'$/.test(v)) record[cols[i]!] = v.slice(1, -1);
+        else if (v === "NULL") record[cols[i]!] = null;
+        else record[cols[i]!] = Number(v);
       }
+      if (argIndex !== this.args.length) {
+        throw new Error(`FakeD1: INSERT bound ${this.args.length} args for ${argIndex} placeholders`);
+      }
+      const token_hash = record.token_hash as Uint8Array;
+      const key = hex(token_hash);
+      if (this.db.rows.has(key)) throw new Error("UNIQUE constraint failed: staging.token_hash");
+      const get = <T>(c: string, d: T): T => (record[c] === undefined ? d : (record[c] as T));
+      const iv = get<Uint8Array | null>("iv", null);
+      this.db.rows.set(key, {
+        token_hash_hex: key,
+        file_handle: record.file_handle as string,
+        state: record.state as StagingRow["state"],
+        r2_key: get<string | null>("r2_key", null),
+        iv_hex: iv ? hex(iv) : null,
+        content_type_hint: get<string | null>("content_type_hint", null),
+        content_type: get<string | null>("content_type", null),
+        expected_byte_len: get<number | null>("expected_byte_len", null),
+        byte_len: get<number | null>("byte_len", null),
+        filename: get<string | null>("filename", null),
+        created_at: record.created_at as number,
+        claimed_at: get<number | null>("claimed_at", null),
+        expires_at: record.expires_at as number,
+        enc_version: get<StagingRow["enc_version"]>("enc_version", 1),
+      });
       return { rows: [], written: 1, read: 0 };
     }
     if (sql.startsWith("UPDATE staging SET state='claimed'") || sql.startsWith("UPDATE staging SET state = 'claimed'")) {
-      const [iv, content_type, byte_len, r2_key, claimed_at, new_expires, token_hash, now] =
-        this.args as [Uint8Array, string, number, string, number, number, Uint8Array, number];
+      // SET list is parsed so the bound arguments map to named columns.
+      const m = sql.match(/^UPDATE staging SET state ?= ?'claimed', (.*) WHERE token_hash=\? AND state='pending' AND expires_at>\? RETURNING file_handle$/);
+      if (!m) throw new Error(`FakeD1: unparseable claim UPDATE: ${sql}`);
+      const cols = m[1]!.split(",").map((a) => a.trim().replace(/ ?= ?\?$/, ""));
+      const set: Record<string, unknown> = {};
+      cols.forEach((c, i) => { set[c] = this.args[i]; });
+      const token_hash = this.args[cols.length] as Uint8Array;
+      const now = this.args[cols.length + 1] as number;
       const key = hex(token_hash);
       const row = this.db.rows.get(key);
       if (!row || row.state !== "pending" || row.expires_at <= now) {
         return { rows: [], written: 0, read: 0 };
       }
       row.state = "claimed";
-      row.iv_hex = hex(iv);
-      row.content_type = content_type;
-      row.byte_len = byte_len;
-      row.r2_key = r2_key;
-      row.claimed_at = claimed_at;
-      row.expires_at = new_expires;
+      row.iv_hex = hex(set.iv as Uint8Array);
+      row.content_type = set.content_type as string;
+      row.byte_len = set.byte_len as number;
+      row.r2_key = set.r2_key as string;
+      row.claimed_at = set.claimed_at as number;
+      row.expires_at = set.expires_at as number;
+      if (set.enc_version !== undefined) row.enc_version = set.enc_version as StagingRow["enc_version"];
       return { rows: [{ file_handle: row.file_handle }], written: 1, read: 1 };
     }
     if (sql.startsWith("UPDATE staging SET state='corrupt'") || sql.startsWith("UPDATE staging SET state = 'corrupt'")) {

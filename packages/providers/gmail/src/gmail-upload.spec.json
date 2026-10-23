@@ -1,0 +1,130 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Gmail media upload (hand-written)", "version": "v1" },
+  "servers": [{ "url": "https://www.googleapis.com" }],
+  "paths": {
+    "/upload/gmail/v1/users/{userId}/messages/send": {
+      "post": {
+        "operationId": "gmail.users.messages.send.media",
+        "description": "Media-upload variant of messages.send: the request body is the whole RFC 822 message as raw bytes (Content-Type message/rfc822, uploadType=media), not JSON and not base64url. Use it to send a message with a staged attachment via codemode.request's `composed` channel. Gmail's limit is 35 MiB for the whole message.",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The user's email address. The special value `me` can be used to indicate the authenticated user."
+          },
+          {
+            "name": "uploadType",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["media"] },
+            "description": "Must be `media`: the body is the raw RFC 822 message."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "message/rfc822": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Message" } } }
+          }
+        },
+        "x-google-scopes": [
+          "https://mail.google.com/",
+          "https://www.googleapis.com/auth/gmail.addons.current.action.compose",
+          "https://www.googleapis.com/auth/gmail.compose",
+          "https://www.googleapis.com/auth/gmail.modify",
+          "https://www.googleapis.com/auth/gmail.send"
+        ]
+      }
+    },
+    "/upload/gmail/v1/users/{userId}/drafts": {
+      "post": {
+        "operationId": "gmail.users.drafts.create.media",
+        "description": "Media-upload variant of drafts.create: the request body is the whole RFC 822 message as raw bytes (Content-Type message/rfc822, uploadType=media), not JSON and not base64url. Use it to create a draft with a staged attachment via codemode.request's `composed` channel. Gmail's limit is 35 MiB for the whole message.",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The user's email address. The special value `me` can be used to indicate the authenticated user."
+          },
+          {
+            "name": "uploadType",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["media"] },
+            "description": "Must be `media`: the body is the raw RFC 822 message."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "message/rfc822": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Draft" } } }
+          }
+        },
+        "x-google-scopes": [
+          "https://mail.google.com/",
+          "https://www.googleapis.com/auth/gmail.addons.current.action.compose",
+          "https://www.googleapis.com/auth/gmail.compose",
+          "https://www.googleapis.com/auth/gmail.modify"
+        ]
+      }
+    },
+    "/upload/gmail/v1/users/{userId}/drafts/{id}": {
+      "put": {
+        "operationId": "gmail.users.drafts.update.media",
+        "description": "Media-upload variant of drafts.update: replaces the draft's content with the RFC 822 message carried as raw bytes (Content-Type message/rfc822, uploadType=media), not JSON and not base64url. Use it to put a staged attachment into an existing draft via codemode.request's `composed` channel. Gmail's limit is 35 MiB for the whole message.",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The user's email address. The special value `me` can be used to indicate the authenticated user."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The ID of the draft to update."
+          },
+          {
+            "name": "uploadType",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["media"] },
+            "description": "Must be `media`: the body is the raw RFC 822 message."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "message/rfc822": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Draft" } } }
+          }
+        },
+        "x-google-scopes": [
+          "https://mail.google.com/",
+          "https://www.googleapis.com/auth/gmail.addons.current.action.compose",
+          "https://www.googleapis.com/auth/gmail.compose",
+          "https://www.googleapis.com/auth/gmail.modify"
+        ]
+      }
+    }
+  },
+  "components": { "schemas": {} }
+}

@@ -189,6 +189,10 @@ export interface RunElicitationArgs {
   category?: string;
   reason?: string;
   inspectorSummary?: Record<string, Primitive>;
+  /** Staged files the host will attach (host-assembled bodies): a
+   *  pre-sanitised "name (N bytes); …" line appended to the dialog message,
+   *  whatever renderer runs. Never contains a token, a handle or file bytes. */
+  attachments?: string;
   entry: SurfaceReviewEntry;
   /** Forwarded from HandleArgs; passed to elicitInput as relatedRequestId so
    *  the server-initiated elicit routes through the originating POST stream. */
@@ -259,7 +263,7 @@ export async function runElicitation(args: RunElicitationArgs): Promise<void> {
       ...(input.inspectorSummary ? { inspectorSummary: input.inspectorSummary } : {}),
     }));
 
-  const rendered =
+  const renderedBase =
     args.opaquePayload !== undefined
       ? {
           message:
@@ -273,6 +277,10 @@ export async function runElicitation(args: RunElicitationArgs): Promise<void> {
           ...(args.query !== undefined ? { query: args.query } : {}),
           ...(args.inspectorSummary ? { inspectorSummary: args.inspectorSummary } : {}),
         });
+  const rendered =
+    args.attachments !== undefined && args.attachments !== ""
+      ? { ...renderedBase, message: `${renderedBase.message}\nAttachments: ${args.attachments}` }
+      : renderedBase;
   const requestedSchema = buildRequestedSchema(rendered.fields);
   const fields = rendered.fields;
 

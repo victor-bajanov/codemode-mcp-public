@@ -12,6 +12,8 @@ import { getOrRefreshAccessToken } from "../refresh";
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { SurfaceReview } from "@local/shared";
 import type { UpstreamRateLimit } from "../rate-limit";
+import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
+import { FakeR2 } from "../staging/__tests__/__fixtures__/fake-r2";
 
 const SPEC: OpenApiSpec = {
   openapi: "3.0.0",
@@ -211,14 +213,12 @@ describe("handleUpstreamRequest — upstream rate limits", () => {
       ...baseArgs,
       ctx: { method: "GET", path: "/widgets", returnAs: "stage" },
       readRateLimit: reader,
-      putFile: async () => ({
-        ok: true as const,
-        file_handle: "fh_x",
-        token: "stg_y",
-        fetch_url: "https://x.test/staging/fetch/fh_x",
-        expires_at: 999,
-        byte_length: 3,
-      }),
+      stagingStore: {
+        STAGING_D1: new FakeD1() as unknown as D1Database,
+        STAGING_R2: new FakeR2() as unknown as R2Bucket,
+        config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 * 1024 },
+        uploadOrigin: "https://x.test",
+      },
     })) as Envelope;
 
     expect(env.success).toBe(true);

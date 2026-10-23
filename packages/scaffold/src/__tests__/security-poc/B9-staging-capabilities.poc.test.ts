@@ -3,17 +3,26 @@
 //   getFile(handle, token): both must match one row; token is 32 random bytes,
 //     handle 16 random bytes, lookup is by SHA-256(token) then constant-time
 //     handle compare, so cross-user enumeration is infeasible. (REFUTED)
+//     Since staged-transfer v2 (issue #59) getFile is a capped convenience for
+//     processing small files: rows over STAGING_GETFILE_MAX_BYTES are refused
+//     from D1 metadata (413, no R2 read) and the base64 is produced block by
+//     block — see D1 (M6) and D3 for the cap and the transfer gate.
 //   putFile: base64 used to be fully decoded BEFORE the size cap was applied,
 //     so an over-cap payload cost host CPU/memory first. The string length is
-//     now bounded before decoding. (FIXED, F-24)
+//     now bounded before decoding. (FIXED, F-24) In v2 the decode is strict
+//     and blockwise, straight into the AES-GCM block encrypter — there is no
+//     whole-file plaintext and no `atob` (see D1 M7, D4).
 //   stageFromUpstreamJson: `requestOpts` used to be spread into the handler
 //     ctx, so fields outside StageRequestOpts (headers, returnAs, multipart,
 //     ...) rode through. Only the declared fields are now forwarded. (FIXED,
 //     F-24; relatedRequestId was never injectable — separate HandleArgs field.)
+//     The v2 body channels (`composed`, `multipart[].staged`) are NOT added to
+//     the declared list and are dropped the same way (D5 I3).
 //
 // Status: FIXED (F-24) — putFile length-checks before decoding and
 // stageFromUpstreamJson forwards only declared fields; getFile isolation
-// stays REFUTED.
+// stays REFUTED. The probes below are unchanged by v2: the capabilities keep
+// their sandbox-facing signatures, over the blockwise store.
 import { describe, it, expect, vi } from "vitest";
 import { createPutFileCapability } from "../../staging/putfile-capability";
 import { createGetFileCapability } from "../../staging/getfile-capability";

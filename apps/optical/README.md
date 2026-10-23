@@ -82,6 +82,7 @@ once. Before doing so, complete the **prerequisites** below.
    - the PKCE client id and client secret
 
 
+
 ### Bootstrap
 
 ```bash
@@ -108,8 +109,9 @@ secrets to both environments, and deploys.
 
 - **Refresh-token rotation** — optical rotates the refresh token on every
   `/oauth/token` exchange and revokes the prior pair. The scaffold's
-  TokenBroker Durable Object serialises rotations per `userId` so concurrent
-  tool calls cannot race. Same behaviour as the Xero provider.
+  per-`userId` TokenBroker Durable Object keeps one in-flight refresh per
+  grant, so concurrent tool calls share a single rotation instead of racing.
+  Same behaviour as the Xero provider.
 - **90-day idle expiry** — if the operator stops using the connector for
   90+ days, the refresh expires and the next tool call returns a structured
   re-auth required error. Re-running the first `/authorize` flow restores

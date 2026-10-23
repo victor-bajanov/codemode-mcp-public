@@ -31,13 +31,18 @@ repo wraps them into a turn-key, single-operator **provider scaffold**:
   `stageFromUpstreamJson` — same function, task-shaped name) so LLM code can
   pass multi-MB binaries (Gmail attachments,
   Xero documents) by reference instead of base64-inlining them into the
-  context. Bytes are HKDF/AES-GCM encrypted at rest in R2; a cron sweep
-  expires both rows and objects. See
+  context. `codemode.request` attaches staged files to an outbound body by
+  reference (`composed`, `multipart[].staged`), assembled on the host, so
+  file bytes never enter the sandbox. Bytes are HKDF/AES-GCM encrypted at
+  rest in R2 in 1 MiB blocks; a cron sweep expires both rows and objects. See
   [`packages/scaffold/src/staging/`](./packages/scaffold/src/staging/).
 - **Shared TokenBroker Durable Object** — refresh-token rotation runs in
-  a single-writer DO addressed by `userId`, so concurrent tool calls
-  can't race on a rotated refresh token. KV stores the slot; the DO is
-  the only writer.
+  a DO addressed by `userId`, which keeps one in-flight refresh per grant:
+  concurrent tool calls on a grant share a single upstream refresh, so they
+  can't race on a rotated refresh token. The DO's own storage holds each
+  grant's sealed slot, so a rotated refresh token survives the DO being
+  evicted; KV keeps a copy, and `/callback` seeds the first slot there
+  with the sign-in access token.
 - **OpenTofu module** for the per-app infra — one KV namespace plus a
   Cloudflare Access policy gating the MCP endpoint to a single operator.
   One `tofu apply` per provider.
@@ -367,8 +372,10 @@ Access policy by hitting the deployed `/authorize` URL.
   classifying every `operationId` as `allow` / `elicit` / `deny`. New ops
   added by a spec re-sync are implicit-deny until classified.
 - **Refresh-token rotation**: minted inside a per-`userId` TokenBroker
-  Durable Object (`packages/scaffold/src/token-broker.ts`) which serialises
-  refresh + slot persistence; the underlying rotation logic lives in
+  Durable Object (`packages/scaffold/src/token-broker.ts`) which runs at
+  most one refresh + slot persistence per grant at a time (concurrent
+  callers on that grant wait for and share its result; the DO input gate
+  alone would not serialise them); the underlying rotation logic lives in
   `packages/scaffold/src/refresh.ts`. Xero rotates on every use (60-day
   idle expiry), as does Optical (90-day idle expiry); Google's are long-lived.
 - **Attachment staging** (optional): provider apps that bind R2 + D1 +
@@ -470,6 +477,58 @@ and Claude Code, already meet both.
   `__stagingHost` and it carries `readOnlyHint: true`.
 - Refresh failures read `Refresh failed <status> (<error>)` with no
   upstream body.
+
+## Staged file transfer v2 (issue #59)
+
+Staged files now reach upstream APIs by reference: sandbox code passes
+`{ file_handle, token }` in `codemode.request`'s `composed.segments` or a
+`multipart[].staged` part, and the host decrypts, encodes and streams
+the bytes into the outbound body itself. File bytes no longer cross the
+sandbox boundary, and files up to `STAGING_MAX_BYTES` (50 MiB) are
+sent without holding more than a few MiB at once. The operator detail
+(at-rest format, caps, transfer gate, log fields) is in
+[`packages/scaffold/SECURITY.md`](./packages/scaffold/SECURITY.md) §7.8.
+
+**New optional vars** (all positive integers; omit for the default):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STAGING_COMPOSE_MAX_BYTES` | `75497472` (72 MiB) | Largest host-assembled request body (`composed` or staged multipart). |
+| `STAGING_GETFILE_MAX_BYTES` | `8388608` (8 MiB) | Largest file `__stagingHost.getFile` returns; also the size limit for reading files staged before this release. |
+| `STAGING_MAX_CONCURRENT_TRANSFERS` | `2` | Staged transfers running at once per isolate. Lower it to `1` if Workers Logs show `exceededMemory`. |
+| `STAGING_TRANSFER_TIMEOUT_MS` | `60000` | Absolute timeout for one staged transfer. |
+
+**Behaviour changes.**
+
+- `__stagingHost.getFile` is for reading small files in sandbox code
+  (parse a CSV, read a PDF's text). Files over
+  `STAGING_GETFILE_MAX_BYTES` get a 413 telling the model to send by
+  reference instead.
+- Gmail sends and saves mail with attachments through three media
+  operations on `/upload/gmail/v1/…` (`messages.send.media`,
+  `drafts.create.media`, `drafts.update.media`; `uploadType=media`,
+  `message/rfc822`). Send is inspected as before, plus a 35 MiB cap,
+  and its approval dialog lists the attachment names. `composed` on the
+  JSON `messages.send` is refused (`staged-not-supported`).
+- Xero's attachment hints send by reference and state Xero's 10 MB
+  request ceiling.
+- Each execution may run one staged transfer at a time with one more
+  waiting (await each before starting the next); a busy server answers
+  "retry shortly".
+
+**Upgrading.** Migration `0002_enc_version.sql` must be applied to each
+deployment's remote `STAGING_D1` before its new code goes live (wrangler
+does not apply D1 migrations on deploy).
+`scripts/upgrade/2026-10-15-staging-v2.sh` applies it and deploys, one
+deployment at a time; see [`infra/README.md`](./infra/README.md).
+Before upgrading from v1.1.0 or earlier, wait until every file staged
+by the old version has expired: at most `STAGING_FETCH_TTL_SECONDS`
+(default 3600, one hour) after the last file was uploaded or staged.
+Files staged by older versions are refused with 410 ("stored in a legacy
+format; re-stage the file") and must be staged again. For a
+live check after upgrading a dev deployment, run the drafts-only
+staging ladder in
+[`scripts/harnesses/README.md`](./scripts/harnesses/README.md).
 
 ## Adding a new provider
 

@@ -249,3 +249,80 @@ describe("handleFetch", () => {
     });
   });
 });
+
+describe("handleFetch — v2 streaming", () => {
+  const BLOCK = 1_048_576;
+  const pat = (n: number) => {
+    const a = new Uint8Array(n);
+    for (let i = 0; i < n; i++) a[i] = (i * 13 + 1) & 0xff;
+    return a;
+  };
+  const get = (d: { d1: FakeD1; r2: FakeR2; token: string; handle: string }, now: number, cfg: StagingConfig = CFG) =>
+    handleFetch(
+      new Request(`https://x.test/staging/fetch/${d.handle}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${d.token}` },
+      }),
+      { STAGING_D1: d.d1 as unknown as D1Database, STAGING_R2: d.r2 as unknown as R2Bucket, config: cfg, now: () => now + 2 },
+    );
+
+  it("streams a multi-block body with Content-Length = byte_len", async () => {
+    const now = 1_000_000;
+    const x = pat(2 * BLOCK + 7);
+    const d = await seed(now, x, "application/pdf");
+    const res = await get(d, now);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Length")).toBe(String(x.byteLength));
+    expect(res.body).toBeInstanceOf(ReadableStream);
+    expect(Buffer.from(await res.arrayBuffer()).equals(Buffer.from(x))).toBe(true);
+  });
+
+  it("an object of the wrong size → 410 + corrupt before any 200", async () => {
+    const now = 1_000_000;
+    const d = await seed(now, pat(BLOCK + 1));
+    const [k, v] = [...d.r2.store.entries()][0]!;
+    d.r2.store.set(k, v.subarray(0, v.byteLength - 1));
+    const res = await get(d, now);
+    expect(res.status).toBe(410);
+    const row = await lookupByHash(d.d1 as unknown as D1Database, await sha256Bearer(d.token));
+    expect(row!.state).toBe("corrupt");
+  });
+
+  it("a tamper in block 2 → the body errors after block 1 (never a clean EOF); row corrupt", async () => {
+    const now = 1_000_000;
+    const d = await seed(now, pat(2 * BLOCK + 7));
+    const [, v] = [...d.r2.store.entries()][0]!;
+    v[BLOCK + 16 + 5] = v[BLOCK + 16 + 5]! ^ 1;
+    const res = await get(d, now);
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    let got = 0;
+    const err = await (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return null;
+        got += value.byteLength;
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(got).toBe(BLOCK);
+    const row = await lookupByHash(d.d1 as unknown as D1Database, await sha256Bearer(d.token));
+    expect(row!.state).toBe("corrupt");
+  });
+
+  it("refuses a v1 row of any size with 410 and never reads R2", async () => {
+    const { seedV1Row } = await import("./__fixtures__/v1-row");
+    const now = 1_000_000;
+    const d1 = new FakeD1();
+    const r2 = new FakeR2();
+    const small = await seedV1Row(d1, r2, pat(32), { now, contentType: "text/plain" });
+    const big = await seedV1Row(d1, r2, pat(33), { now });
+    const cfg = { ...CFG, getFileMaxBytes: 32 };
+    for (const row of [small, big]) {
+      const res = await get({ d1, r2, token: row.token, handle: row.handle }, now, cfg);
+      expect(res.status).toBe(410);
+      expect(await res.text()).toBe("gone");
+    }
+    expect(r2.getCalls).toBe(0);
+  });
+});

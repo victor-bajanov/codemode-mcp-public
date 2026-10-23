@@ -43,19 +43,35 @@ export const RATE_LIMIT_BLOCK =
 
 // Splice into the codemode `execute` tool's description when this server has
 // staging bindings (STAGING_D1 + STAGING_R2 + STAGING_UPLOAD_ORIGIN). Documents
-// the register_file_handle → bytes-out-of-band → __stagingHost.getFile workflow
-// plus the three modes for returning large binary payloads from execute().
+// the register_file_handle → bytes-out-of-band → send-by-reference (`composed`
+// / `multipart[].staged`) workflow, the capped `__stagingHost.getFile` read
+// path, and the three modes for returning large binary payloads from execute().
 export const STAGING_BLOCK =
   "\n## Attachments / file uploads — ALWAYS use `register_file_handle` first (upload direction: sending bytes TO the upstream API)\n\n" +
   "When the user wants to attach, upload, or send a file TO the upstream API, " +
   "this workflow is fixed and non-negotiable:\n\n" +
   "  1. Call the `register_file_handle` tool (NOT codemode.request) → get { upload_url, token, file_handle }.\n" +
   "  2. POST the file bytes to upload_url out-of-band, with `Authorization: Bearer <token>` (your runtime/host does this — bytes never enter execute()).\n" +
-  "  3. Inside execute(), read the bytes via the sandbox capability:\n" +
-  "       const f = await __stagingHost.getFile(file_handle, token);\n" +
+  "  3. Inside execute(), SEND the file by reference — the host reads, decrypts and assembles the bytes itself; they never enter execute():\n" +
+  "       await codemode.request({ method: \"POST\", path: \"/...\", contentType: \"…\",\n" +
+  "         composed: { segments: [\n" +
+  "           { text: \"…headers / MIME preamble you write…\" },\n" +
+  "           { staged: { file_handle, token }, encoding: \"base64-lines\" },  // or \"base64\" / \"identity\"\n" +
+  "           { text: \"…closing boundary…\" },\n" +
+  "         ] },\n" +
+  "       });\n" +
+  "       // \"base64-lines\": 76-char lines, CRLF after every line incl. the last (MIME attachments). \"base64\": one unbroken run.\n" +
+  "       // \"identity\": the raw file bytes — allowed only as the SOLE segment (the whole body is the file).\n" +
+  "       // multipart/form-data endpoints: `multipart: [{ name: \"file\", staged: { file_handle, token } }]` instead.\n" +
+  "       // `composed` excludes body / bodyBase64 / rawBody / multipart. Up to 32 segments and 4 MiB of text in total; text must not contain U+FFFC.\n" +
+  "       // The assembled body is capped at 72 MiB by default — a larger one is refused (composed-too-large) before any file is read.\n" +
+  "       // An inspected operation that does not accept staged files (e.g. a JSON send endpoint taking `body`) refuses `composed` and\n" +
+  "       // `multipart[].staged` with staged-not-supported; use the endpoint the provider snippet names (often an /upload/ media variant).\n" +
+  "  4. Use the provider-specific snippet below (docs \"attachments\") for the exact endpoint and segments.\n\n" +
+  "To READ a small staged file's contents inside execute() (parse a CSV, extract a PDF's text) — not to send it:\n" +
+  "       const f = await __stagingHost.getFile(file_handle, token);   // capped at 8 MiB by default; larger files → 413\n" +
   "       // f = { ok: true, contentType, byteLength, filename, bytesBase64 } | { ok: false, status, message }\n" +
-  "       // __stagingHost is a sandbox-scope local (NOT on codemode.*, NOT on globalThis).\n" +
-  "  4. Forward `f.bytesBase64` to the upstream API per the provider-specific snippet below.\n\n" +
+  "       // __stagingHost is a sandbox-scope local (NOT on codemode.*, NOT on globalThis).\n\n" +
   "Downloading or exporting bytes FROM the upstream API is the opposite direction — skip `register_file_handle` entirely and use one of the three modes documented below instead.\n\n" +
   "Do NOT try to read files from disk, embed bytes literally in code, fetch URLs into Uint8Array, or pass Uint8Array/ArrayBuffer through codemode.request — none of those paths reach the host as binary. A Uint8Array/ArrayBuffer anywhere in codemode.request `body`, `query` or `multipart` (with or without `rawBody`) is rejected by the host with an error. Use `register_file_handle` (above) or `bodyBase64`/`multipart` (below) instead.\n\n" +
   "## Returning large binary payloads from execute() — three modes\n\n" +
@@ -91,10 +107,11 @@ export const STAGING_BLOCK =
   "That response carries `Content-Type` and `Content-Disposition: attachment`; when the staging recorded a filename, it also carries `X-Filename` and a `filename=` clause.\n\n" +
   "Notes:\n" +
   "- The token is short-lived (default 60 min, matches getFile). After expiry the row is swept and the URL returns 410.\n" +
-  "- A later turn in this same conversation can re-pull the bytes via `__stagingHost.getFile(file_handle, token)` if needed.\n\n";
+  "- A later turn in this same conversation can send the same file again (or read it, if small) with the same file_handle and token until it expires.\n\n";
 
 // Always-included codemode.request body-modes block. Documents the JSON / text
-// rawBody / bodyBase64 / multipart escape hatches. A Uint8Array/ArrayBuffer in
+// rawBody / bodyBase64 / multipart escape hatches and the host-assembled
+// staged-file channels (`composed`, `multipart[].staged`). A Uint8Array/ArrayBuffer in
 // `body`, `query` or `multipart` is rejected by the host with an error (with
 // or without rawBody; see request-handler.ts); use bodyBase64/multipart.
 export const BODY_MODES_BLOCK =
@@ -105,9 +122,10 @@ export const BODY_MODES_BLOCK =
   "  • Default (JSON):       `body: {...}` → serialised; Content-Type defaults to application/json.\n" +
   "  • Text body:            `body: \"…\", rawBody: true, contentType: \"…\"` (e.g. application/xml). Do NOT use rawBody with binary.\n" +
   "  • Binary octet-stream:  `bodyBase64: \"<base64>\", contentType: \"…\"` — host decodes base64 before fetching.\n" +
-  "  • multipart/form-data:  `multipart: [{ name, filename?, contentType?, value? | bodyBase64? }, …]` — host generates the boundary and Content-Type; do NOT set `contentType` yourself.\n" +
+  "  • multipart/form-data:  `multipart: [{ name, filename?, contentType?, value? | bodyBase64? | staged? }, …]` — host generates the boundary and Content-Type; do NOT set `contentType` yourself.\n" +
+  "  • Staged file (servers with staging only): `composed: { segments: [{ text } | { staged: { file_handle, token }, encoding }] }`, or a multipart part's `staged: { file_handle, token }` — the host assembles the body from a file uploaded via `register_file_handle`; the bytes never enter execute(). See 'Staging'.\n" +
   "  • contentType is forwarded (edge whitespace trimmed) for body / bodyBase64 / rawBody; only `multipart` overrides it.\n" +
-  "  • Use exactly one of `body`, `bodyBase64` and `multipart`. On operations that are inspected or need approval, two are refused, and bytes under a JSON content-type (including text/json) must parse: they are judged and sent as that parsed JSON.\n\n";
+  "  • Use exactly one of `body`, `bodyBase64`, `multipart` and `composed`. `composed` alongside any of the others (or `rawBody`) is refused on every operation; on operations that are inspected or need approval, any two are refused, and bytes under a JSON content-type (including text/json) must parse: they are judged and sent as that parsed JSON.\n\n";
 
 /**
  * codemode truncates every `search` / `execute` result at this many characters
@@ -210,7 +228,8 @@ export const ACCESS_CONVENTION_BLOCK =
 // register-tool → descriptions/compact → descriptions/docs would otherwise
 // close an import cycle back into register-tool.
 export const GENERIC_STEP_THREE =
-  "Step 3 — forward the bytes to the upstream API in the same execute() call.\n" +
-  "  • Binary endpoints (PUT/POST raw bytes): pass `bodyBase64: f.bytesBase64` and set `contentType`; the host decodes before fetching.\n" +
-  "  • JSON endpoints that take base64 inline (e.g. an attachment field): place `f.bytesBase64` directly in the JSON body.\n" +
-  "  • multipart/form-data endpoints: use `multipart: [{ name, filename, contentType, bodyBase64 }, ...]` (the host generates the boundary; do NOT set contentType yourself for multipart).";
+  "Step 3 — send the file to the upstream API by reference in one execute() call; the host reads and assembles the bytes, which never enter the sandbox.\n" +
+  "  • Binary endpoints (PUT/POST raw bytes, the whole body is the file): `composed: { segments: [{ staged: { file_handle, token }, encoding: \"identity\" }] }` and set `contentType`.\n" +
+  "  • Text bodies that embed the file (e.g. a MIME message): alternate `{ text }` segments with `{ staged: { file_handle, token }, encoding: \"base64-lines\" }` (or \"base64\").\n" +
+  "  • multipart/form-data endpoints: `multipart: [{ name, staged: { file_handle, token } }, ...]` — filename/contentType default from the upload; the host generates the boundary, so do NOT set contentType yourself.\n" +
+  "  • JSON endpoints that take base64 inline (e.g. an attachment field) have no by-reference form: read the file with `__stagingHost.getFile(file_handle, token)` (8 MiB cap by default) and place `f.bytesBase64` in the JSON body.";

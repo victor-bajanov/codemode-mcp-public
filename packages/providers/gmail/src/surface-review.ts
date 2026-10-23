@@ -1,7 +1,7 @@
 import type { SurfaceReview } from "@local/shared";
 import { inspectFilterCreate } from "./inspectors/filters.js";
-import { inspectOutboundMessage, inspectDraftSend } from "./inspectors/outbound.js";
-import { normalizeOutboundMessage } from "./inspectors/normalize-subject.js";
+import { inspectOutboundMessage, inspectDraftSend, inspectOutboundMessageMedia } from "./inspectors/outbound.js";
+import { normalizeOutboundMessage, repairRfc822Text } from "./inspectors/normalize-subject.js";
 // NB: `inspectSendAsCreate` (./inspectors/sendas.js) is deliberately NOT
 // imported — sendAs.create is denied outright, and a static deny short-circuits
 // before `inspect` is read. The inspector is retained as the reference
@@ -99,6 +99,31 @@ export const surfaceReview: SurfaceReview = {
                                                 "OUTBOUND_RECIPIENT_ALLOWLIST var; unset means every send is denied), " +
                                                 "written as a bare addr@host or Name <addr@host> with no quotes or " +
                                                 "comments, and more than 25 of them needs interactive approval." },
+  // === Media upload (issue #59): raw RFC 822 bodies, host-assembled from staged files via `composed`.
+  // Hand-written operations (gmail-upload.spec.json). Only these three accept staged bodies; the JSON
+  // send/draft entries above lack `acceptsStaged`, so the scaffold refuses `composed` on them by rule.
+  "gmail.users.messages.send.media":       { decision: "allow", inspect: inspectOutboundMessageMedia, acceptsStaged: true,
+                                              normalizeComposedText: repairRfc822Text,
+                                              reasoning: "Same recipient gate as messages.send, read from the header block of the composed inspection view. Staged files are spliced in as base64 after the header block, so they cannot carry headers; a staged slot before the header block ends (including a sole identity segment, i.e. a pre-built message) is denied. Capped at Gmail's 35 MiB media limit from the exact assembled length.",
+                                              clientNote:
+                                                "Query `uploadType: \"media\"` and contentType `message/rfc822` (no parameter but " +
+                                                "an optional charset) are required; other query parameters beyond " +
+                                                "upload_protocol=raw, fields, prettyPrint and quotaUser are denied. " +
+                                                "Every To/Cc/Bcc recipient must be on this deployment's outbound allowlist " +
+                                                "(OUTBOUND_RECIPIENT_ALLOWLIST; unset means every send is denied); one " +
+                                                "off-allowlist address denies the send. All headers, and the blank line ending " +
+                                                "them, must come before the first staged `composed` segment; a staged file " +
+                                                "placed earlier, or a whole pre-built message sent as " +
+                                                "one staged segment, is denied. Write each recipient as a bare addr@host or " +
+                                                "Name <addr@host> with no quotes or comments. The whole message may be at most " +
+                                                "36700160 bytes (35 MiB). More than 25 recipients needs interactive approval." },
+  "gmail.users.drafts.create.media":       { decision: "allow", category: "standard_write", acceptsStaged: true,
+                                              normalizeComposedText: repairRfc822Text,
+                                              reasoning: "Deliberately uninspected, same rationale as drafts.create: a draft is inert until sent, and recipients are gated at send time (messages.send(.media) and drafts.send). Subject normalisation applies to the leading composed text segment. A sole identity segment (a staged, pre-built RFC 822 file) creates a draft that is neither inspected nor normalised — the same send-time-gating design as drafts.create today (red-team R-8): drafts.send by id is denied, so such a draft can only leave through the Gmail UI." },
+  "gmail.users.drafts.update.media":       { decision: "allow", category: "standard_write", acceptsStaged: true,
+                                              normalizeComposedText: repairRfc822Text,
+                                              reasoning: "Deliberately uninspected, same rationale as drafts.update and drafts.create.media: recipient gating happens at send time, not draft time. A sole identity segment (a staged, pre-built RFC 822 file) replaces the draft with content that is neither inspected nor normalised — accepted under the same send-time-gating design (red-team R-8)." },
+
   "gmail.users.messages.import":           { decision: "elicit", category: "external_data_flow" },
   "gmail.users.messages.delete":           { decision: "elicit", category: "irreversible" },
   "gmail.users.messages.batchDelete":      { decision: "elicit", category: "bulk_destructive",

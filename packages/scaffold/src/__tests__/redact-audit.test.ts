@@ -119,4 +119,22 @@ describe("redactAuditEntry", () => {
       countValue: 0,
     });
   });
+
+  it("leaves the staged-transfer counters intact (operational, not PII)", () => {
+    const entry: AuditEntry = {
+      ...base,
+      stagedCount: 2,
+      stagedBytes: 1234,
+      assembledBytes: 2000,
+      bodyBytesSent: 1000,
+      bodyComplete: false,
+      elicitFields: { subject: "hi" },
+    };
+    const result = redactAuditEntry(entry);
+    expect(result.stagedCount).toBe(2);
+    expect(result.stagedBytes).toBe(1234);
+    expect(result.assembledBytes).toBe(2000);
+    expect(result.bodyBytesSent).toBe(1000);
+    expect(result.bodyComplete).toBe(false);
+  });
 });

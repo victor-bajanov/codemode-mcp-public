@@ -11,7 +11,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run && pnpm run test:memory",
+    "test:memory": "NODE_OPTIONS=--expose-gc vitest run src/staging/__tests__/memory-ladder.test.ts"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

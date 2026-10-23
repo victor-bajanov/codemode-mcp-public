@@ -8,27 +8,31 @@ import { readXeroRateLimit } from "./rate-limit.js";
 const spec = specJson as unknown as OpenApiSpec;
 
 const XERO_ATTACHMENT_HINT =
-  "Step 3 — forward `f.bytesBase64` to the upstream Xero endpoint matching your operation.\n\n" +
-  "Invoice attachment by filename (raw octet-stream PUT):\n" +
+  "Step 3 — send the staged file to Xero by reference in one execute() call. Pass `{ file_handle, token }`; " +
+  "the host reads, decrypts and assembles the bytes itself, so they never enter the sandbox (no `getFile` needed).\n\n" +
+  "Invoice attachment by filename (raw octet-stream PUT — the whole body is the file, so one `identity` segment):\n" +
   "  await codemode.request({\n" +
   "    method: \"PUT\",\n" +
-  "    path: `/api.xro/2.0/Invoices/${invoiceId}/Attachments/${encodeURIComponent(f.filename ?? \"file.pdf\")}`,\n" +
-  "    contentType: f.contentType ?? \"application/pdf\",   // forwarded verbatim\n" +
-  "    bodyBase64: f.bytesBase64,                          // host decodes before fetching\n" +
+  "    path: `/api.xro/2.0/Invoices/${invoiceId}/Attachments/${encodeURIComponent(fileName)}`,\n" +
+  "    contentType: \"application/pdf\",   // the file's MIME type; forwarded verbatim\n" +
+  "    composed: { segments: [{ staged: { file_handle, token }, encoding: \"identity\" }] },\n" +
   "  });\n\n" +
   "Files API upload (multipart/form-data POST /files.xro/1.0/Files):\n" +
   "  await codemode.request({\n" +
   "    method: \"POST\",\n" +
   "    path: \"/files.xro/1.0/Files\",\n" +
   "    multipart: [\n" +
-  "      { name: \"Name\", value: f.filename ?? \"upload.pdf\" },\n" +
-  "      { name: \"file\", filename: f.filename ?? \"upload.pdf\", contentType: f.contentType ?? \"application/pdf\", bodyBase64: f.bytesBase64 },\n" +
+  "      { name: \"Name\", value: fileName },\n" +
+  "      { name: \"file\", staged: { file_handle, token } },   // filename/contentType default from the upload\n" +
   "    ],\n" +
   "    // Do NOT set contentType here — the host generates the multipart boundary + Content-Type header.\n" +
   "  });\n\n" +
   "Notes:\n" +
+  "- `file_handle` and `token` are what register_file_handle returned. `fileName` is the name Xero should show for the attachment — normally the `filename` you passed to register_file_handle (it is URL-encoded into the path; Files API `Name` must match it).\n" +
+  "- Xero refuses a request body of 10,240,000 bytes or more with 413 (attachments and Files alike), so check the file size before sending. A Files upload has about 1 KB less room, because the multipart framing counts toward the limit.\n" +
+  "- Xero rejects some file extensions, such as .bin (Files returns 400; an invoice attachment fails with a generic 500), so keep the file's real extension.\n" +
   "- Both operations are allowed by the Xero surface review (createInvoiceAttachmentByFileName, updateInvoiceAttachmentByFileName, xero.files.uploadFile).\n" +
-  "- Never pass `f.bytesBase64` through `rawBody` — that path is for text/XML and will silently corrupt binary.";
+  "- `composed` and `multipart` are mutually exclusive with `body`/`bodyBase64`/`rawBody`; never pass file bytes through `rawBody` — that path is for text/XML and corrupts binary.";
 
 // Provider-specific download guidance for the staging workflow (issue #41
 // follow-up): the opposite direction of XERO_ATTACHMENT_HINT above, wired to
