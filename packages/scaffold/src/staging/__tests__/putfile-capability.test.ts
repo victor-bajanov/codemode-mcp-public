@@ -320,3 +320,107 @@ describe("createPutFileCapability — backend failures", () => {
     expect(r2.store.size).toBe(0);
   });
 });
+
+describe("createPutFileCapability — v2", () => {
+  it("writes a v2 row through a streamed R2 put", async () => {
+    const { d1, r2, putFile } = makeDeps(1_700_000_000);
+    const bytes = new Uint8Array(1_048_576 + 3).fill(5);
+    const out = await putFile(Buffer.from(bytes).toString("base64"), "application/pdf", "a.pdf");
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(r2.putKinds).toEqual(["stream"]);
+    const { lookupByHash } = await import("../repo");
+    const { sha256Bearer } = await import("../crypto");
+    const row = await lookupByHash(d1 as unknown as D1Database, await sha256Bearer(out.token));
+    expect(row!.enc_version).toBe(2);
+    expect(row!.byte_len).toBe(bytes.byteLength);
+  });
+
+  it("never calls atob", async () => {
+    const { putFile } = makeDeps(1_700_000_000);
+    const spy = vi.spyOn(globalThis, "atob");
+    const out = await putFile(Buffer.from(new Uint8Array(300).fill(1)).toString("base64"), "x/y", null);
+    expect(out.ok).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("acquires and releases the transfer gate when one is supplied", async () => {
+    const { FakeGate } = await import("./__fixtures__/fake-gate");
+    const gate = new FakeGate();
+    const runKey = {};
+    const putFile = createPutFileCapability({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      STAGING_R2: new FakeR2() as unknown as R2Bucket,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+      transferGate: gate,
+      currentRun: () => ({ runKey, signal: new AbortController().signal }),
+    });
+    expect((await putFile("aGk=", "text/plain", null)).ok).toBe(true);
+    expect(gate.acquired).toHaveLength(1);
+    expect(gate.acquired[0]!.runKey).toBe(runKey);
+    expect(gate.released).toBe(1);
+    gate.rejectWith = new Error("staged transfers are busy; retry shortly");
+    expect(await putFile("aGk=", "text/plain", null)).toMatchObject({ ok: false, status: 429 });
+  });
+});
+
+describe("createPutFileCapability — contentType validation (F5)", () => {
+  it.each([
+    ["CR/LF", "text/plain\r\nX-Evil: 1"],
+    ["a char above 0x7E", "text/plain; name=\u00e9"],
+    ["a char above 0xFF", "text/\u4e2d"],
+    ["a control char", "text/plain\u0000"],
+    ["256 chars", "a/" + "b".repeat(254)],
+  ])("rejects %s with 400 and writes nothing", async (_l, ct) => {
+    const { r2, d1, putFile } = makeDeps(1_700_000_000);
+    expect(await putFile("aGk=", ct, null)).toMatchObject({ ok: false, status: 400 });
+    expect(r2.store.size).toBe(0);
+    expect(d1.rows.size).toBe(0);
+  });
+
+  it("accepts 255 printable ASCII chars", async () => {
+    const { putFile } = makeDeps(1_700_000_000);
+    expect((await putFile("aGk=", "a/" + "b".repeat(253), null)).ok).toBe(true);
+  });
+});
+
+describe("gate deps typing (F6)", () => {
+  it("transferGate without currentRun does not typecheck", async () => {
+    const { FakeGate } = await import("./__fixtures__/fake-gate");
+    const base = {
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      STAGING_R2: new FakeR2() as unknown as R2Bucket,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    };
+    // @ts-expect-error a gate needs the run context it is keyed by
+    createPutFileCapability({ ...base, transferGate: new FakeGate() });
+    // Both, or neither, are fine.
+    createPutFileCapability({ ...base, transferGate: new FakeGate(), currentRun: () => undefined });
+    createPutFileCapability(base);
+  });
+});
+
+describe("createPutFileCapability — whitespace guidance (review item 3)", () => {
+  it("base64 with a line break → 400 telling the caller to remove line breaks/whitespace", async () => {
+    const { putFile, r2 } = makeDeps(1_700_000_000);
+    const out = await putFile("QUJD\nREVG", "text/plain", null);
+    expect(out).toMatchObject({ ok: false, status: 400 });
+    expect(out.ok ? "" : out.message).toMatch(/line breaks|whitespace/);
+    expect(r2.store.size).toBe(0);
+  });
+});
+
+describe("createPutFileCapability — undeterminable-length base64 while the slot is busy (re-review 2)", () => {
+  it.each(["AAAAA", "+/-_AAAA"])("%j → 400, not 503, while the unknown-length slot is held", async (b64) => {
+    const { tryAcquireUnknownLengthSlot } = await import("../unknown-length-slot");
+    const { putFile } = makeDeps(1_700_000_000);
+    const release = tryAcquireUnknownLengthSlot()!;
+    try {
+      expect(await putFile(b64, "text/plain", null, "url")).toMatchObject({ ok: false, status: 400 });
+    } finally {
+      release();
+    }
+  });
+});

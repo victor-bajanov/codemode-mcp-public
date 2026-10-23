@@ -64,9 +64,17 @@ import { resolveEndpoints } from "./config";
 import { handleUpstreamRequest, type HandleArgs, type UpstreamCtx } from "./request-handler";
 import { ToolError } from "./elicit";
 import { readExecutionLimits, type ExecutionLimits } from "./execution-limits";
+import { principalOf } from "./principal";
 import type { TokenBrokerStub } from "./token-broker";
 import { createGetFileCapability } from "./staging/getfile-capability";
-import { createPutFileCapability } from "./staging/putfile-capability";
+import { createPutFileCapability, type PutFileCapabilityDeps } from "./staging/putfile-capability";
+import { createStagedFileOpener, type OpenStagedResult, type StagedRef } from "./staging/staged-file";
+import type { RunContext } from "./staging/gate-dep";
+import {
+  DEFAULT_MAX_CONCURRENT_TRANSFERS,
+  type StagingConfig,
+} from "./staging/types";
+import { TransferGate } from "./compose/gate";
 import {
   createStageFromUpstreamJsonCapability,
   type StageRequestOpts,
@@ -314,10 +322,68 @@ const STAGING_UPSTREAM_FNS = ["stageFromUpstreamJson", "stageFromAttachment"] as
  * convenience API — openApiMcpServer never uses it — and is forwarded
  * unchanged, still under the deadline.
  */
+/** The fields sandbox code may set on a `codemode.request` ctx (D11).
+ *  Anything else — notably the internal `bypassTruncate` — is dropped before
+ *  the handler sees it. */
+const SANDBOX_CTX_FIELDS = [
+  "method",
+  "path",
+  "query",
+  "body",
+  "headers",
+  "contentType",
+  "rawBody",
+  "bodyBase64",
+  "multipart",
+  "returnAs",
+  "composed",
+] as const satisfies ReadonlyArray<keyof UpstreamCtx>;
+
+/** Whitelist a sandbox-supplied request ctx: own properties among
+ *  SANDBOX_CTX_FIELDS only. A non-object becomes `{}`, which the handler
+ *  refuses as malformed. */
+export function pickSandboxCtx(ctx: unknown): UpstreamCtx {
+  const picked: Record<string, unknown> = {};
+  if (ctx !== null && typeof ctx === "object" && !Array.isArray(ctx)) {
+    const src = ctx as Record<string, unknown>;
+    for (const field of SANDBOX_CTX_FIELDS) {
+      if (Object.hasOwn(src, field) && src[field] !== undefined) picked[field] = src[field];
+    }
+  }
+  return picked as unknown as UpstreamCtx;
+}
+
+/** Run context attached by createGuardedExecutor to each upstream call's ctx
+ *  object. codemode forwards only the first argument of `request`, so the
+ *  ctx object itself carries the association (a WeakMap: nothing on the
+ *  object the sandbox could forge or read). */
+const RUN_CONTEXT = new WeakMap<object, RunContext>();
+
+/** The execute run a `codemode.request` ctx came from, if any. */
+export function runContextOf(ctx: unknown): RunContext | undefined {
+  return ctx !== null && typeof ctx === "object" ? RUN_CONTEXT.get(ctx) : undefined;
+}
+
+/** One transfer gate per isolate (D8): the memory budget it protects is the
+ *  isolate's, shared by every session DO it hosts. Sized from the first
+ *  config seen; deployments set one value per Worker. */
+let isolateTransferGate: TransferGate | undefined;
+function transferGateFor(config: StagingConfig): TransferGate {
+  isolateTransferGate ??= new TransferGate({
+    maxConcurrent: config.maxConcurrentTransfers ?? DEFAULT_MAX_CONCURRENT_TRANSFERS,
+    maxWaiting: 4,
+    perRunInFlight: 1,
+    perRunWaiting: 1,
+  });
+  return isolateTransferGate;
+}
+
 export function createGuardedExecutor(
   base: SandboxExecutor,
   opts: {
-    stagingProvider: HostProvider | null;
+    /** A fixed provider, or a factory called once per execute run with that
+     *  run's context (so file-sized capabilities hold the per-run gate). */
+    stagingProvider: HostProvider | ((run: RunContext) => HostProvider) | null;
     docsProvider: HostProvider;
     limits: ExecutionLimits;
   },
@@ -326,9 +392,20 @@ export function createGuardedExecutor(
   return {
     execute: async (code, providersOrFns) => {
       const run = { calls: 0, expired: false };
+      // One controller and key per run: the controller aborts every staged
+      // transfer in flight when the deadline fires (D3a); the key is the
+      // transfer gate's per-run identity (D8).
+      const runController = new AbortController();
+      const runCtx: RunContext = { runKey: {}, signal: runController.signal };
       const wrapUpstream =
         (fn: (...args: unknown[]) => Promise<unknown>) =>
         async (...args: unknown[]): Promise<unknown> => {
+          const first = args[0];
+          if (first !== null && typeof first === "object" && !Array.isArray(first)) {
+            const tagged = { ...(first as Record<string, unknown>) };
+            RUN_CONTEXT.set(tagged, runCtx);
+            args[0] = tagged;
+          }
           if (run.expired) {
             throw new ToolError(
               "this execution passed its host-side deadline; further upstream calls are refused",
@@ -356,6 +433,9 @@ export function createGuardedExecutor(
       const deadline = new Promise<SandboxExecuteResult>((resolve) => {
         timer = setTimeout(() => {
           run.expired = true;
+          runController.abort(
+            new ToolError("staged transfer aborted: this execution passed its host-side deadline"),
+          );
           resolve({
             result: undefined,
             error: `Execution exceeded the host-side deadline of ${limits.hostTimeoutMs} ms and was abandoned`,
@@ -373,7 +453,11 @@ export function createGuardedExecutor(
           forwarded = base.execute(patchCodemodeDocsAlias(code), [
             ...providers,
             ...(isExecute && stagingProvider
-              ? [{ ...stagingProvider, fns: wrapNamed(stagingProvider.fns, STAGING_UPSTREAM_FNS) }]
+              ? [
+                  ((p: HostProvider) => ({ ...p, fns: wrapNamed(p.fns, STAGING_UPSTREAM_FNS) }))(
+                    typeof stagingProvider === "function" ? stagingProvider(runCtx) : stagingProvider,
+                  ),
+                ]
               : []),
             docsProvider,
           ]);
@@ -420,21 +504,6 @@ export function createProviderMcpAgent<
   P extends Record<string, unknown>,
   Env extends ProviderEnv = ProviderEnv,
 >(provider: ApiProvider<P, Env>) {
-  /** The principal a set of props resolves to: the provider's audit accessor
-   *  when it has one, else a string `props.userId`; null when neither yields
-   *  one. Single definition shared by the session binding (F-16) and the
-   *  broker addressing in buildUpstreamArgs. A closure rather than a method so
-   *  it adds nothing to the Durable Object's RPC surface. */
-  const principalOf = (props: P | undefined): string | null => {
-    if (props === undefined || props === null) return null;
-    return (
-      provider.audit?.principalIdAccessor?.(props) ??
-      (typeof (props as Record<string, unknown>).userId === "string"
-        ? ((props as Record<string, unknown>).userId as string)
-        : null)
-    );
-  };
-
   return class ProviderMCP extends McpAgent<Env, Record<string, never>, P> {
     server: McpServer = new McpServer({
       name: provider.name,
@@ -462,7 +531,7 @@ export function createProviderMcpAgent<
         const stored = await this.ctx.storage.get<{ principal: string | null }>(
           SESSION_PRINCIPAL_KEY,
         );
-        if (stored !== undefined && principalOf(props) !== stored.principal) {
+        if (stored !== undefined && principalOf(provider, props) !== stored.principal) {
           throw new Error(
             "mcp-session-principal-mismatch: this MCP session belongs to a different user",
           );
@@ -481,7 +550,7 @@ export function createProviderMcpAgent<
         SESSION_PRINCIPAL_KEY,
       );
       if (stored === undefined) {
-        this.sessionPrincipal = principalOf(this.props);
+        this.sessionPrincipal = principalOf(provider, this.props);
         await this.ctx.storage.put(SESSION_PRINCIPAL_KEY, {
           principal: this.sessionPrincipal,
         });
@@ -533,51 +602,92 @@ export function createProviderMcpAgent<
       // The late-bound `buildUpstreamArgs` is referenced through
       // `buildUpstreamArgsRef` by the staging IIFE — see that indirection
       // further down for why it can't simply be assigned inline.
-      // putFileCapability is hoisted out of the staging IIFE so it can be
-      // threaded into HandleArgs.putFile (enables returnAs:"stage" in the
-      // request handler) AND consumed by the stageFromUpstreamJson sandbox
-      // capability constructed below. Same instance — single source of truth.
-      let putFileCapability:
-        | ReturnType<typeof createPutFileCapability>
+      // Staged-file wiring, set inside the staging IIFE and threaded into
+      // HandleArgs by buildUpstreamArgs: the UNGATED store (the request
+      // handler holds the transfer gate itself for returnAs:"stage"), the
+      // reference opener for `composed`/`multipart[].staged`, the isolate's
+      // transfer gate, and the compose/transfer limits.
+      let stagedWiring:
+        | {
+            store: PutFileCapabilityDeps;
+            openStaged: (ref: StagedRef) => Promise<OpenStagedResult>;
+            transferGate: TransferGate;
+            limits: { composeMaxBytes?: number; transferTimeoutMs?: number };
+          }
         | undefined;
       // Late binding: stageFromUpstreamJson's upstreamRequest closure needs
-      // `buildUpstreamArgs`, which itself closes over `putFileCapability`
-      // (set inside the IIFE). To avoid TDZ, the closure dereferences this
-      // ref at call time. The ref is assigned synchronously below — long
-      // before sandbox code can invoke __stagingHost.stageFromUpstreamJson.
-      const buildUpstreamArgsRef: { current: (ctx: UpstreamCtx) => HandleArgs<P> } = {
+      // `buildUpstreamArgs`, defined further down. To avoid TDZ, the closure
+      // dereferences this ref at call time. The ref is assigned synchronously
+      // below — long before sandbox code can invoke
+      // __stagingHost.stageFromUpstreamJson.
+      const buildUpstreamArgsRef: { current: (ctx: UpstreamCtx, run?: RunContext) => HandleArgs<P> } = {
         current: () => {
           throw new Error("buildUpstreamArgs not yet initialised");
         },
       };
-      const stagingProvider: {
-        name: string;
-        fns: Record<string, (...args: unknown[]) => Promise<unknown>>;
-      } | null =
+      // A factory: the guarded executor builds the capabilities once per
+      // execute run, so getFile/putFile/stageFromUpstreamJson hold the
+      // transfer gate under that run's key and deadline signal (D8).
+      const stagingProvider: ((run: RunContext) => HostProvider) | null =
         this.env.STAGING_D1 && this.env.STAGING_R2 && this.env.STAGING_UPLOAD_ORIGIN
           ? await (async () => {
               const { readStagingConfig } = await import("./config.js");
               const config = readStagingConfig(this.env as unknown as Record<string, unknown>);
-              const getFile = createGetFileCapability({
-                STAGING_D1: this.env.STAGING_D1 as D1Database,
-                STAGING_R2: this.env.STAGING_R2 as R2Bucket,
-                config,
-              });
-              putFileCapability = createPutFileCapability({
+              const store: PutFileCapabilityDeps = {
                 STAGING_D1: this.env.STAGING_D1 as D1Database,
                 STAGING_R2: this.env.STAGING_R2 as R2Bucket,
                 config,
                 uploadOrigin: this.env.STAGING_UPLOAD_ORIGIN as string,
-              });
-              const putFile = putFileCapability;
-              const stageFromUpstreamJson = createStageFromUpstreamJsonCapability({
-                putFile,
-                upstreamRequest: (ctx) =>
-                  handleUpstreamRequest(
-                    buildUpstreamArgsRef.current(ctx as unknown as UpstreamCtx),
-                  ) as Promise<UpstreamRequestResult>,
-              });
-              return buildStagingHostFns({ getFile, putFile, stageFromUpstreamJson });
+              };
+              const transferGate = transferGateFor(config);
+              stagedWiring = {
+                store,
+                openStaged: createStagedFileOpener({
+                  STAGING_D1: store.STAGING_D1,
+                  STAGING_R2: store.STAGING_R2,
+                  config,
+                }),
+                transferGate,
+                limits: {
+                  ...(config.composeMaxBytes !== undefined ? { composeMaxBytes: config.composeMaxBytes } : {}),
+                  ...(config.transferTimeoutMs !== undefined ? { transferTimeoutMs: config.transferTimeoutMs } : {}),
+                },
+              };
+              // stageFromUpstreamJson holds the gate across its upstream
+              // request, parse and store, so it gets an UNGATED putFile: a
+              // second acquisition for the same run would wait on the first.
+              const ungatedPutFile = createPutFileCapability(store);
+              return (run: RunContext) => {
+                const gateDeps = { transferGate, currentRun: () => run };
+                return buildStagingHostFns({
+                  getFile: createGetFileCapability({
+                    STAGING_D1: store.STAGING_D1,
+                    STAGING_R2: store.STAGING_R2,
+                    config,
+                    ...gateDeps,
+                  }),
+                  putFile: createPutFileCapability({ ...store, ...gateDeps }),
+                  stageFromUpstreamJson: createStageFromUpstreamJsonCapability({
+                    putFile: ungatedPutFile,
+                    ...gateDeps,
+                    // The inner request runs under this run's deadline and
+                    // key, and takes its gate slot through the capability's
+                    // lease (after approval + token mint), never the gate
+                    // directly: the capability holds that slot until it has
+                    // stored the file.
+                    upstreamRequest: (ctx, lease?: { acquire(): Promise<void> }) => {
+                      const { transferGate: _gate, ...innerArgs } = buildUpstreamArgsRef.current(
+                        ctx as unknown as UpstreamCtx,
+                        run,
+                      );
+                      return handleUpstreamRequest({
+                        ...innerArgs,
+                        ...(lease ? { gateLease: lease } : {}),
+                      }) as Promise<UpstreamRequestResult>;
+                    },
+                  }),
+                });
+              };
             })()
           : null;
 
@@ -630,8 +740,8 @@ export function createProviderMcpAgent<
       // Defence in depth for F-16: setName() above refuses a request whose
       // bearer resolves to a different principal; should props ever change
       // under a running session anyway, refuse to build upstream args for them.
-      const buildUpstreamArgs = (ctx: UpstreamCtx): HandleArgs<P> => {
-        const principal = principalOf(this.props as P);
+      const buildUpstreamArgs = (ctx: UpstreamCtx, run?: RunContext): HandleArgs<P> => {
+        const principal = principalOf(provider, this.props as P);
         if (principal !== this.sessionPrincipal) {
           throw new ToolError("MCP session principal changed; reconnect");
         }
@@ -666,7 +776,15 @@ export function createProviderMcpAgent<
             : {}),
           ...(provider.readRateLimit ? { readRateLimit: provider.readRateLimit } : {}),
           ...(provider.elicitRenderers ? { elicitRenderers: provider.elicitRenderers } : {}),
-          ...(putFileCapability ? { putFile: putFileCapability } : {}),
+          ...(stagedWiring
+            ? {
+                stagingStore: stagedWiring.store,
+                openStaged: stagedWiring.openStaged,
+                transferGate: stagedWiring.transferGate,
+                stagingLimits: stagedWiring.limits,
+              }
+            : {}),
+          ...(run ? { runKey: run.runKey, signal: run.signal } : {}),
           audit: {
             waitUntil: this.ctx.waitUntil.bind(this.ctx),
             ...(provider.audit?.principalIdAccessor
@@ -702,9 +820,12 @@ export function createProviderMcpAgent<
         // codemode forwards the originating MCP request context as the second
         // arg (codemode#1793). `context.requestId` lets elicit route its
         // server-initiated message back through that request's POST stream.
+        // The sandbox ctx is whitelisted (D11) — the internal
+        // `bypassTruncate` and any unknown key are dropped — and paired with
+        // the execute run it came from (deadline signal + gate key).
         request: (ctx, context?: { requestId?: string | number }) =>
           handleUpstreamRequest({
-            ...buildUpstreamArgs(ctx),
+            ...buildUpstreamArgs(pickSandboxCtx(ctx), runContextOf(ctx)),
             ...(context?.requestId !== undefined ? { relatedRequestId: context.requestId } : {}),
           }),
       });

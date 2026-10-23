@@ -15,11 +15,19 @@
 //     calls OAuthProvider.completeAuthorization and clears the cookie.
 //   - Token-exchange failure logs carry status + error code; the body only
 //     under ALLOW_PII_IN_LOGS (F-21).
+//   - /callback seeds the token broker's per-grant slot with the
+//     code-exchange access token (keyed by the broker's principal), skips
+//     an unusable token or lifetime, and survives a failed seed.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createOAuthHandler } from "../oauth-handler";
 import { sha256Base64Url } from "../pkce";
 import type { ApiProvider } from "../api-provider";
+import { decryptSlot, type SealedSlot } from "../encrypt-slot";
+import { SLOT_TTL_SECONDS, grantSlotKey } from "../grant-slot";
+import type { GrantSlot } from "../refresh";
+import { createTokenBrokerDO } from "../token-broker";
+import { makeDoState } from "./fake-do-state";
 
 interface TestProps extends Record<string, unknown> {
   refreshToken: string;
@@ -55,7 +63,12 @@ function makeKV() {
   return {
     data,
     puts,
-    async get(k: string): Promise<string | null> { return data.get(k)?.value ?? null; },
+    // Honours `{ type: "json" }` so the token broker can read seeded slots.
+    async get(k: string, opts?: { type?: string }): Promise<unknown> {
+      const v = data.get(k)?.value;
+      if (v === undefined) return null;
+      return opts?.type === "json" ? JSON.parse(v) : v;
+    },
     async put(k: string, v: string, opts?: unknown): Promise<void> {
       puts.push(k);
       data.set(k, { value: v, ...(opts ? { opts } : {}) });
@@ -615,5 +628,166 @@ describe("/callback (browser binding F-15, props F-23, logging F-21)", () => {
     expect(logged).not.toContain("code_verifier required");
     const pii = await failingExchange(body, { ALLOW_PII_IN_LOGS: "true" });
     expect(pii.logged).toContain(`body=${body}`);
+  });
+});
+
+describe("/callback seeds the token broker slot", () => {
+  const NOW = new Date("2026-10-16T00:00:00Z");
+
+  /** Decrypt the slot stored under `key`, sealed with the grant's refresh token. */
+  async function readSlot(KV: ReturnType<typeof makeKV>, key: string, refreshToken = "RT-fresh") {
+    const entry = KV.data.get(key);
+    if (!entry) return undefined;
+    const slot = await decryptSlot<GrantSlot>(refreshToken, JSON.parse(entry.value) as SealedSlot);
+    return { slot, opts: entry.opts };
+  }
+
+  /** Every KV key the callback wrote under the broker's `token-slot:` prefix. */
+  function slotKeys(KV: ReturnType<typeof makeKV>) {
+    return [...KV.data.keys()].filter((k) => k.startsWith("token-slot:"));
+  }
+
+  /** Token endpoint answering the code exchange with `tokenJson`; userinfo as stubUpstreamOk. */
+  function stubExchange(tokenJson: Record<string, unknown>) {
+    const fetchSpy = vi.fn<typeof fetch>(async (input: RequestInfo | URL) => {
+      const u = typeof input === "string" ? input : input.toString();
+      if (u.startsWith(TEST_PROVIDER.oauth.tokenUrl)) {
+        return new Response(JSON.stringify(tokenJson), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (u.startsWith(TEST_PROVIDER.oauth.userInfoUrl!)) {
+        return new Response(JSON.stringify({ sub: "subject-42", email: "u@example.com" }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    return fetchSpy;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+
+  it("writes the code-exchange access token, expiry and refresh token under the grant's slot key", async () => {
+    const { env, KV } = makeEnv();
+    const app = createOAuthHandler(TEST_PROVIDER);
+    stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+
+    const key = await grantSlotKey("subject-42", "RT-fresh");
+    expect(slotKeys(KV)).toEqual([key]);
+    const stored = await readSlot(KV, key);
+    expect(stored!.slot).toMatchObject({
+      currentRefreshToken: "RT-fresh",
+      accessToken: "AT-fresh",
+      accessExpiresAt: NOW.getTime() + 1800 * 1000,
+      lastUsedAt: NOW.getTime(),
+    });
+    expect(stored!.opts).toEqual({ expirationTtl: SLOT_TTL_SECONDS });
+  });
+
+  it("the broker then serves the seeded access token with no token-endpoint call", async () => {
+    const { env } = makeEnv();
+    const app = createOAuthHandler(TEST_PROVIDER);
+    const fetchSpy = stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+    fetchSpy.mockClear();
+
+    const Broker = createTokenBrokerDO({ ...TEST_PROVIDER, tokenRotation: "rotating" } as never);
+    const broker = new Broker(makeDoState(), env as never);
+    const token = await broker.getOrRefreshAccessToken({ userId: "subject-42", refreshToken: "RT-fresh" });
+    expect(token).toBe("AT-fresh");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("keys the slot by the provider's audit principal, not props.userId", async () => {
+    const { env, KV } = makeEnv();
+    const app = createOAuthHandler<TestProps>({
+      ...TEST_PROVIDER,
+      audit: { principalIdAccessor: (p) => (p.email ? `email:${p.email}` : undefined) },
+    });
+    stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+    expect(slotKeys(KV)).toEqual([await grantSlotKey("email:u@example.com", "RT-fresh")]);
+  });
+
+  it.each([
+    ["missing", { access_token: "AT-fresh", refresh_token: "RT-fresh" }],
+    ["zero", { access_token: "AT-fresh", refresh_token: "RT-fresh", expires_in: 0 }],
+    ["negative", { access_token: "AT-fresh", refresh_token: "RT-fresh", expires_in: -5 }],
+    ["non-numeric", { access_token: "AT-fresh", refresh_token: "RT-fresh", expires_in: "1800" }],
+    ["empty access_token", { access_token: "", refresh_token: "RT-fresh", expires_in: 1800 }],
+  ])("expires_in/access_token %s: no slot is written and sign-in still 302s", async (_label, tokenJson) => {
+    const { env, KV } = makeEnv();
+    const app = createOAuthHandler(TEST_PROVIDER);
+    stubExchange(tokenJson);
+    const { state, authCookiePair } = await approveFlow(app, env);
+    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+    expect(slotKeys(KV)).toEqual([]);
+  });
+
+  it("dates the seeded expiry from the code exchange, not from after userinfo", async () => {
+    const { env, KV } = makeEnv();
+    const app = createOAuthHandler(TEST_PROVIDER);
+    const fetchSpy = stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    const answer = fetchSpy.getMockImplementation()!;
+    fetchSpy.mockImplementation(async (input, init) => {
+      const u = typeof input === "string" ? input : input.toString();
+      // A slow userinfo: the clock moves on after the token response.
+      if (u.startsWith(TEST_PROVIDER.oauth.userInfoUrl!)) vi.setSystemTime(NOW.getTime() + 90_000);
+      return answer(input, init);
+    });
+    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+
+    const stored = await readSlot(KV, await grantSlotKey("subject-42", "RT-fresh"));
+    expect(stored!.slot!.accessExpiresAt).toBe(NOW.getTime() + 1800 * 1000);
+  });
+
+  it("a principal accessor that throws doesn't fail sign-in: no slot, one log line, still 302", async () => {
+    const { env, KV, oauth } = makeEnv();
+    // completeAuthorization is the OAuth library's and never sees the
+    // accessor, so the seed is the callback's only caller of it.
+    const app = createOAuthHandler<TestProps>({
+      ...TEST_PROVIDER,
+      audit: { principalIdAccessor: () => { throw new Error("accessor broke"); } },
+    });
+    stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await callback(app, env, state, authCookiePair);
+    expect(res.status).toBe(302);
+    expect(oauth.completeSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls).toEqual([["Test Provider token slot seed failed"]]);
+    expect(slotKeys(KV)).toEqual([]);
+  });
+
+  it("a failing slot write still 302s and logs one line with no token material", async () => {
+    const { env, KV, oauth } = makeEnv();
+    const app = createOAuthHandler(TEST_PROVIDER);
+    stubUpstreamOk();
+    const { state, authCookiePair } = await approveFlow(app, env);
+    const realPut = KV.put.bind(KV);
+    vi.spyOn(KV, "put").mockImplementation((async (k: string, v: string, o?: KVNamespacePutOptions) => {
+      if (k.startsWith("token-slot:")) throw new Error("KV put failed: RT-fresh AT-fresh");
+      return realPut(k, v, o);
+    }) as typeof KV.put);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const res = await callback(app, env, state, authCookiePair);
+    expect(res.status).toBe(302);
+    expect(oauth.completeSpy).toHaveBeenCalledTimes(1);
+    const lines = [...errSpy.mock.calls, ...warnSpy.mock.calls, ...logSpy.mock.calls]
+      .map((c) => c.map(String).join(" "));
+    expect(lines).toEqual(["Test Provider token slot seed failed"]);
+    expect(slotKeys(KV)).toEqual([]);
   });
 });

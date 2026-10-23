@@ -130,29 +130,28 @@ function headerEndOffset(bytes: Uint8Array): number {
   return -1;
 }
 
-/** Repair the Subject header inside one base64url-encoded RFC 822 message.
- *  Returns the re-encoded raw, or undefined when nothing needs changing (or
- *  the message can't be confidently interpreted — every failure bails to
- *  "no change"). */
-export function repairRawSubject(raw: string): string | undefined {
-  let bytes: Uint8Array;
-  try {
-    bytes = base64UrlToBytes(raw);
-  } catch {
-    return undefined;
+/** Index of the header/body blank-line separator in RFC 822 text (start of
+ *  "\r\n\r\n" or "\n\n"), or -1. Same rule as `headerEndOffset`; the
+ *  separators are ASCII, which UTF-8 never uses inside a multi-byte sequence,
+ *  so text and byte offsets find the same boundary. */
+function headerEndIndex(text: string): number {
+  for (let i = 0; i + 1 < text.length; i++) {
+    if (text.charCodeAt(i) === 0x0a && text.charCodeAt(i + 1) === 0x0a) return i;
+    if (text.startsWith("\r\n\r\n", i)) return i;
   }
-  const headerEnd = headerEndOffset(bytes);
-  if (headerEnd < 0) return undefined;
+  return -1;
+}
 
-  // Strict decode: a header section that isn't valid UTF-8 (e.g. true Latin-1
-  // bytes) can't be round-tripped losslessly through text — leave it alone.
-  let headerText: string;
-  try {
-    headerText = STRICT_UTF8.decode(bytes.subarray(0, headerEnd));
-  } catch {
-    return undefined;
-  }
-
+/** Repair the Subject header in an RFC 822 header section (the text before
+ *  the blank-line separator). Returns the rewritten header section, or
+ *  undefined when there is no Subject or it is already canonical.
+ *
+ *  Known residual: when it does rewrite, the header lines are re-joined with
+ *  one line ending (CRLF if any CRLF is present, else LF), so a header block
+ *  that mixed CRLF and bare LF comes back uniform. The send inspector denies
+ *  mixed endings anyway (ambiguous-line-ending); for an uninspected draft the
+ *  change only makes the header block more regular. */
+function repairHeaderSection(headerText: string): string | undefined {
   const eol = headerText.includes("\r\n") ? "\r\n" : "\n";
   const lines = headerText.split(/\r\n|\n/);
   let start = -1;
@@ -184,8 +183,52 @@ export function repairRawSubject(raw: string): string | undefined {
   // across continuation lines) must round-trip to "no change".
   if (canonical.split(`${eol} `).join(" ") === unfolded) return undefined;
 
-  const newLines = [...lines.slice(0, start), `Subject: ${canonical}`, ...lines.slice(endEx)];
-  const newHeaderBytes = new TextEncoder().encode(newLines.join(eol));
+  return [...lines.slice(0, start), `Subject: ${canonical}`, ...lines.slice(endEx)].join(eol);
+}
+
+/**
+ * Repair the Subject header of an RFC 822 message held as text — the
+ * composed channel's leading text segment (SurfaceReviewEntry
+ * .normalizeComposedText), which carries the header block in plain text
+ * rather than as base64url `raw`. Everything from the blank-line separator on
+ * is returned verbatim. Returns undefined when nothing needs changing or the
+ * header block cannot be found (every failure bails to "no change").
+ */
+export function repairRfc822Text(text: string): string | undefined {
+  const headerEnd = headerEndIndex(text);
+  if (headerEnd < 0) return undefined;
+  const newHeader = repairHeaderSection(text.slice(0, headerEnd));
+  return newHeader === undefined ? undefined : newHeader + text.slice(headerEnd);
+}
+
+/** Repair the Subject header inside one base64url-encoded RFC 822 message:
+ *  the base64url wrapper around `repairRfc822Text`'s header repair. Works on
+ *  bytes so the body (which need not be valid UTF-8) is spliced back
+ *  byte-for-byte. Returns the re-encoded raw, or undefined when nothing needs
+ *  changing (or the message can't be confidently interpreted — every failure
+ *  bails to "no change"). */
+export function repairRawSubject(raw: string): string | undefined {
+  let bytes: Uint8Array;
+  try {
+    bytes = base64UrlToBytes(raw);
+  } catch {
+    return undefined;
+  }
+  const headerEnd = headerEndOffset(bytes);
+  if (headerEnd < 0) return undefined;
+
+  // Strict decode: a header section that isn't valid UTF-8 (e.g. true Latin-1
+  // bytes) can't be round-tripped losslessly through text — leave it alone.
+  let headerText: string;
+  try {
+    headerText = STRICT_UTF8.decode(bytes.subarray(0, headerEnd));
+  } catch {
+    return undefined;
+  }
+
+  const newHeader = repairHeaderSection(headerText);
+  if (newHeader === undefined) return undefined;
+  const newHeaderBytes = new TextEncoder().encode(newHeader);
   const tail = bytes.subarray(headerEnd); // blank-line separator + body, verbatim
   const out = new Uint8Array(newHeaderBytes.length + tail.length);
   out.set(newHeaderBytes, 0);

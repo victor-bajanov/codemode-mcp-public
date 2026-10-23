@@ -19,9 +19,18 @@
  *   --check=audit-raw       same as audit-redacted but spawns with
  *                           `--var ALLOW_PII_IN_LOGS:true` and asserts the
  *                           AUDIT line carries the raw recipients/subject.
+ *   --check=execute         generic: runs the async-arrow JS in
+ *                           `--code-file=<path>` through the `execute` tool
+ *                           and prints the tool result. Usually paired with
+ *                           `--no-spawn --target=<deployed url>`.
  *
- * Token cache lives at `~/.codemode-mcp/mcp-token.json` so the OAuth dance
- * runs once per operator session. Delete that file to force a fresh dance.
+ * `connectWithOAuth` and `callExecute` are also exported for other harnesses
+ * (staging-ladder.ts); importing this module does not run its CLI.
+ *
+ * Token cache lives at `~/.codemode-mcp/mcp-token.json` (for any other
+ * `--target` than the default localhost:8787, `mcp-token.<host>.json`) so the
+ * OAuth dance runs once per operator session and target. Delete the file to
+ * force a fresh dance.
  *
  * This harness can't be exercised end-to-end in CI; running it requires:
  *   - a real Google Cloud OAuth client with http://localhost:8787/callback
@@ -34,13 +43,18 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { AddressInfo } from "node:net";
 
+import { fetch as undiciFetch } from "undici";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  StreamableHTTPClientTransport,
+  type StreamableHTTPClientTransportOptions,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   ElicitRequestSchema,
   type CallToolResult,
@@ -55,19 +69,24 @@ import type {
 import { spawnWrangler, type SpawnedWrangler } from "./lib/spawn-wrangler.js";
 import { dumpTail, printAssertions, summary, type Assertion } from "./lib/report.js";
 
-type CheckMode = "pkce" | "audit-redacted" | "audit-raw";
+type CheckMode = "pkce" | "audit-redacted" | "audit-raw" | "execute";
 
 interface Args {
   check: CheckMode;
   target: string;
   port: number;
   spawn: boolean;
+  codeFile?: string;
+  timeoutMs?: number;
 }
 
 const USAGE = `Usage: pnpm harness:mcp [options]
 
 Options:
-  --check=<mode>   pkce | audit-redacted (default) | audit-raw
+  --check=<mode>   pkce | audit-redacted (default) | audit-raw | execute
+  --code-file=<p>  (execute mode) file holding an async arrow function to run
+                   through the execute tool; the tool result is printed
+  --timeout-ms=<n> (execute mode) per-call request timeout. Default 180000
   --target=<url>   Base URL when --no-spawn is set. Default http://localhost:8787
   --port=<n>       Port for wrangler dev. Default 8787
   --no-spawn       Don't spawn wrangler dev; use --target instead. Only
@@ -83,6 +102,8 @@ function parseArgs(argv: readonly string[]): Args {
   let target = "http://localhost:8787";
   let port = 8787;
   let spawnFlag = true;
+  let codeFile: string | undefined;
+  let timeoutMs: number | undefined;
   for (const raw of argv) {
     if (raw === "--help" || raw === "-h") {
       process.stdout.write(USAGE);
@@ -106,7 +127,7 @@ function parseArgs(argv: readonly string[]): Args {
     const value = raw.slice(eq + 1);
     switch (key) {
       case "--check":
-        if (value !== "pkce" && value !== "audit-redacted" && value !== "audit-raw") {
+        if (value !== "pkce" && value !== "audit-redacted" && value !== "audit-raw" && value !== "execute") {
           throw new Error(`Unknown --check mode: ${value}\n${USAGE}`);
         }
         check = value;
@@ -114,6 +135,15 @@ function parseArgs(argv: readonly string[]): Args {
       case "--target":
         target = value;
         break;
+      case "--code-file":
+        codeFile = value;
+        break;
+      case "--timeout-ms": {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n <= 0) throw new Error(`Invalid --timeout-ms: ${value}`);
+        timeoutMs = n;
+        break;
+      }
       case "--port": {
         const n = Number.parseInt(value, 10);
         if (!Number.isFinite(n) || n <= 0 || n > 65535) {
@@ -126,7 +156,14 @@ function parseArgs(argv: readonly string[]): Args {
         throw new Error(`Unrecognised argument: ${raw}\n${USAGE}`);
     }
   }
-  return { check, target, port, spawn: spawnFlag };
+  if (check === "execute" && !codeFile) {
+    throw new Error(`--check=execute needs --code-file=<path>\n${USAGE}`);
+  }
+  return {
+    check, target, port, spawn: spawnFlag,
+    ...(codeFile ? { codeFile } : {}),
+    ...(timeoutMs ? { timeoutMs } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -159,21 +196,29 @@ interface CachedSession {
   codeVerifier?: string;
 }
 
-const TOKEN_CACHE_PATH = path.join(homedir(), ".codemode-mcp", "mcp-token.json");
+// One cache file per target: a client registration and tokens issued by one
+// deployment are meaningless to another. The default local target keeps the
+// historical file name.
+function tokenCachePath(targetUrl: string): string {
+  const dir = path.join(homedir(), ".codemode-mcp");
+  const host = new URL(targetUrl).host;
+  if (host === "localhost:8787") return path.join(dir, "mcp-token.json");
+  return path.join(dir, `mcp-token.${host.replace(/[^A-Za-z0-9.-]/g, "_")}.json`);
+}
 
-async function readCache(): Promise<CachedSession> {
-  if (!existsSync(TOKEN_CACHE_PATH)) return {};
+async function readCache(cachePath: string): Promise<CachedSession> {
+  if (!existsSync(cachePath)) return {};
   try {
-    const text = await readFile(TOKEN_CACHE_PATH, "utf8");
+    const text = await readFile(cachePath, "utf8");
     return JSON.parse(text) as CachedSession;
   } catch {
     return {};
   }
 }
 
-async function writeCache(session: CachedSession): Promise<void> {
-  await mkdir(path.dirname(TOKEN_CACHE_PATH), { recursive: true });
-  await writeFile(TOKEN_CACHE_PATH, JSON.stringify(session, null, 2), {
+async function writeCache(cachePath: string, session: CachedSession): Promise<void> {
+  await mkdir(path.dirname(cachePath), { recursive: true });
+  await writeFile(cachePath, JSON.stringify(session, null, 2), {
     mode: 0o600,
   });
 }
@@ -183,6 +228,7 @@ class HarnessOAuthProvider {
   constructor(
     private readonly redirectListenerUrl: string,
     cache: CachedSession,
+    private readonly cachePath: string,
   ) {
     this.cache = cache;
   }
@@ -207,7 +253,7 @@ class HarnessOAuthProvider {
 
   async saveClientInformation(info: OAuthClientInformation): Promise<void> {
     this.cache.clientInformation = info;
-    await writeCache(this.cache);
+    await writeCache(this.cachePath, this.cache);
   }
 
   tokens(): OAuthTokens | undefined {
@@ -216,12 +262,12 @@ class HarnessOAuthProvider {
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     this.cache.tokens = tokens;
-    await writeCache(this.cache);
+    await writeCache(this.cachePath, this.cache);
   }
 
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
     this.cache.codeVerifier = codeVerifier;
-    await writeCache(this.cache);
+    await writeCache(this.cachePath, this.cache);
   }
 
   codeVerifier(): string {
@@ -313,14 +359,39 @@ async function startCallbackListener(): Promise<CallbackListener> {
 // Connect with OAuth
 // ---------------------------------------------------------------------------
 
-async function connectWithOAuth(targetUrl: string): Promise<Client> {
-  const listener = await startCallbackListener();
-  const cache = await readCache();
-  const provider = new HarnessOAuthProvider(listener.redirectUrl, cache);
+/**
+ * The fetch every harness uses for MCP and raw HTTP: undici's (pinned root
+ * devDependency), not Node's built-in. With Node 26's built-in fetch (undici
+ * 8.x) the transport's tools/call POST is never sent while the SDK's
+ * standalone GET SSE stream is open, so every execute() timed out on the
+ * gmail-dev ladder run; undici 7.24.8's fetch does not stall.
+ */
+export const HARNESS_FETCH = undiciFetch as unknown as typeof fetch;
 
-  const transport = new StreamableHTTPClientTransport(new URL(`${targetUrl}/mcp`), {
-    authProvider: provider,
+/** The MCP transport for `targetUrl`, sending (and authenticating) through
+ *  `fetchImpl`. Exported so tests can prove which fetch it uses. */
+export function createHarnessTransport(
+  targetUrl: string,
+  authProvider: StreamableHTTPClientTransportOptions["authProvider"],
+  fetchImpl: typeof fetch = HARNESS_FETCH,
+): StreamableHTTPClientTransport {
+  return new StreamableHTTPClientTransport(new URL(`${targetUrl}/mcp`), {
+    ...(authProvider ? { authProvider } : {}),
+    fetch: fetchImpl,
   });
+}
+
+export async function connectWithOAuth(
+  targetUrl: string,
+  opts: { fetch?: typeof fetch } = {},
+): Promise<Client> {
+  const fetchImpl = opts.fetch ?? HARNESS_FETCH;
+  const listener = await startCallbackListener();
+  const cachePath = tokenCachePath(targetUrl);
+  const cache = await readCache(cachePath);
+  const provider = new HarnessOAuthProvider(listener.redirectUrl, cache, cachePath);
+
+  const transport = createHarnessTransport(targetUrl, provider, fetchImpl);
 
   const client = new Client(
     { name: "codemode-mcp-harness", version: "0.1.0" },
@@ -355,9 +426,7 @@ async function connectWithOAuth(targetUrl: string): Promise<Client> {
     listener.close();
     // After finishAuth, retry the connect on a fresh transport (the SDK does
     // not auto-retry the same instance).
-    const transport2 = new StreamableHTTPClientTransport(new URL(`${targetUrl}/mcp`), {
-      authProvider: provider,
-    });
+    const transport2 = createHarnessTransport(targetUrl, provider, fetchImpl);
     await client.connect(transport2 as unknown as Transport);
     return client;
   }
@@ -420,6 +489,35 @@ function findAuditLine(
     }
   }
   return undefined;
+}
+
+/** Default per-call request timeout for `execute`. The SDK's own default is
+ *  60 s, which a large staged transfer can exceed (gmail-dev ladder run). */
+export const DEFAULT_EXECUTE_TIMEOUT_MS = 180_000;
+
+export interface ExecuteCallOptions {
+  timeoutMs?: number;
+  /** Restart the timeout whenever the server reports progress (default true),
+   *  but never beyond `2 × timeoutMs` in total. */
+  resetTimeoutOnProgress?: boolean;
+}
+
+/** Run one async-arrow `code` string through the server's `execute` tool. */
+export async function callExecute(
+  client: Pick<Client, "callTool">,
+  code: string,
+  opts: ExecuteCallOptions = {},
+): Promise<CallToolResult> {
+  const timeout = opts.timeoutMs ?? DEFAULT_EXECUTE_TIMEOUT_MS;
+  return (await client.callTool(
+    { name: "execute", arguments: { code } },
+    undefined,
+    {
+      timeout,
+      resetTimeoutOnProgress: opts.resetTimeoutOnProgress ?? true,
+      maxTotalTimeout: 2 * timeout,
+    },
+  )) as CallToolResult;
 }
 
 async function callExecuteSend(client: Client, body: { raw: string }): Promise<CallToolResult> {
@@ -708,18 +806,55 @@ async function runAudit(args: Args): Promise<number> {
   }
 }
 
+async function runExecute(args: Args): Promise<number> {
+  let wrangler: SpawnedWrangler | undefined;
+  let client: Client | undefined;
+  try {
+    const code = await readFile(args.codeFile!, "utf8");
+    let target = args.target;
+    if (args.spawn) {
+      wrangler = spawnWrangler({ cwd: GMAIL_APP_CWD, port: args.port });
+      target = await wrangler.ready;
+    }
+    process.stderr.write(`[harness:execute] target=${target}\n`);
+    client = await connectWithOAuth(target);
+    const result = await callExecute(client, code, args.timeoutMs ? { timeoutMs: args.timeoutMs } : {});
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return result.isError ? 1 : 0;
+  } catch (err) {
+    process.stderr.write(`[harness:execute] error: ${err instanceof Error ? err.stack : String(err)}\n`);
+    if (wrangler) dumpTail("wrangler log", wrangler.getCapturedLines());
+    return 2;
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (wrangler) await wrangler.kill();
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   let code: number;
   if (args.check === "pkce") {
     code = await runPkce(args);
+  } else if (args.check === "execute") {
+    code = await runExecute(args);
   } else {
     code = await runAudit(args);
   }
   process.exit(code);
 }
 
-main().catch((err: unknown) => {
-  process.stderr.write(`[harness] fatal: ${err instanceof Error ? err.stack : String(err)}\n`);
-  process.exit(2);
-});
+// Run the CLI only when invoked directly, so other harnesses can import the
+// exported helpers without triggering it.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err: unknown) => {
+    process.stderr.write(`[harness] fatal: ${err instanceof Error ? err.stack : String(err)}\n`);
+    process.exit(2);
+  });
+}

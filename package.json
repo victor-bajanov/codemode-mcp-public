@@ -15,13 +15,15 @@
     "deploy:optical": "pnpm --filter @apps/optical run deploy",
     "deploy:optical:dev": "pnpm --filter @apps/optical run deploy:dev",
     "harness:mcp": "tsx scripts/harnesses/mcp-client.ts",
-    "harness:cookie": "tsx scripts/harnesses/cookie-absence.ts"
+    "harness:cookie": "tsx scripts/harnesses/cookie-absence.ts",
+    "test:harness": "tsc -p scripts/harnesses && node --import tsx --test scripts/harnesses/staging-ladder.test.ts scripts/harnesses/xero-ladder.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240924.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^22.19.17",
     "tsx": "^4.21.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "undici": "7.24.8"
   }
 }

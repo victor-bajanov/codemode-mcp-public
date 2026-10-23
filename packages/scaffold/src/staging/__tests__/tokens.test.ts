@@ -63,3 +63,34 @@ describe("decodeHandleBytes", () => {
     expect(() => decodeHandleBytes("fh_short")).toThrow();
   });
 });
+
+describe("strict decoding (codec-backed)", () => {
+  it("rejects a token or handle with embedded whitespace or padding", () => {
+    const t = mintToken();
+    const h = mintFileHandle();
+    expect(() => decodeTokenSecret(t.slice(0, 10) + " " + t.slice(10))).toThrow();
+    expect(() => decodeHandleBytes(h + "==")).toThrow();
+    expect(() => decodeHandleBytes(h.slice(0, 8) + "\n" + h.slice(8))).toThrow();
+  });
+
+  it("rejects standard-alphabet characters", () => {
+    const h = mintFileHandle();
+    expect(() => decodeHandleBytes(h.slice(0, -1) + "+")).toThrow();
+  });
+
+  it("round-trips minted values", () => {
+    for (let i = 0; i < 50; i++) {
+      expect(decodeTokenSecret(mintToken()).byteLength).toBe(32);
+      expect(decodeHandleBytes(mintFileHandle()).byteLength).toBe(16);
+    }
+  });
+});
+
+describe("timingSafeEqualStrings", () => {
+  it("compares strings for equality", async () => {
+    const { timingSafeEqualStrings } = await import("../tokens");
+    expect(timingSafeEqualStrings("fh_abc", "fh_abc")).toBe(true);
+    expect(timingSafeEqualStrings("fh_abc", "fh_abd")).toBe(false);
+    expect(timingSafeEqualStrings("fh_abc", "fh_ab")).toBe(false);
+  });
+});

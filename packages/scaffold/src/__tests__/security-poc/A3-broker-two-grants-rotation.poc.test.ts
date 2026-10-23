@@ -36,6 +36,7 @@ import { createTokenBrokerDO, type TokenBrokerArgs } from "../../token-broker";
 import type { ApiProvider } from "../../api-provider";
 import { encryptSlot, decryptSlot } from "../../encrypt-slot";
 import { hashRefreshToken, type GrantSlot } from "../../refresh";
+import { makeDoState, makeDoStorage, type FakeDoStorage } from "../fake-do-state";
 
 const provider = {
   name: "xero",
@@ -97,9 +98,9 @@ function makeRotatingUpstream(initiallyValid: string[]) {
   return { spy, valid, revoked, bodies };
 }
 
-function makeBroker(kv: KVNamespace) {
+function makeBroker(kv: KVNamespace, storage: FakeDoStorage = makeDoStorage()) {
   const TokenBrokerDO = createTokenBrokerDO(provider);
-  return new TokenBrokerDO({} as DurableObjectState, {
+  return new TokenBrokerDO(makeDoState(storage), {
     OAUTH_KV: kv, XERO_CLIENT_ID: "cid", XERO_CLIENT_SECRET: "csec",
   } as never);
 }

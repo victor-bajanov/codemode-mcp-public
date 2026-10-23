@@ -8,10 +8,16 @@
 //     truncateForReturn): a deeply nested ctx.body throws RangeError on the
 //     host. It is caught by ToolDispatcher and turned into an error string; no
 //     audit line is emitted for the attempt.
-//   • bypassTruncate is sandbox-settable: the full upstream JSON is returned
+//   • bypassTruncate WAS sandbox-settable: the full upstream JSON was returned
 //     to the sandbox. The sandbox is allowed to receive upstream bodies, and
 //     codemode's own __truncateResponse still caps what reaches the LLM, so
-//     this is a context-size matter rather than a disclosure.
+//     this was a context-size matter rather than a disclosure. Closed by the
+//     factory's ctx whitelist (issue #59, D11): `pickSandboxCtx` forwards only
+//     the documented request fields, so the flag no longer reaches the handler
+//     from LLM code (D9 proves it through the real sandbox pipeline). The
+//     direct-call probe below is kept as the handler-level control: the
+//     handler itself still honours the flag for the host-internal
+//     stageFromUpstreamJson path, which is why the whitelist is the control.
 //   • Per-run budget and host deadline (F-12, remediated 2026-10-08): a
 //     sandbox run is now capped at EXECUTE_MAX_UPSTREAM_CALLS upstream
 //     requests (default 1 000) and the host stops waiting after
@@ -21,8 +27,9 @@
 //     in mcp-agent-factory.ts, which these probes call beneath, so the
 //     assertions below are unchanged.
 //
-// Status: unchanged — the two observations above remain Informational and
-// contained to the caller's own sandbox call.
+// Status: the nested-body observation remains Informational and contained
+// to the caller's own sandbox call; the bypassTruncate observation is
+// FIXED (#59) at the factory boundary (see D9).
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { ToolDispatcher } from "@cloudflare/codemode";
 import { handleUpstreamRequest } from "../../request-handler";
@@ -57,7 +64,7 @@ describe("B10 — resource robustness (Informational)", () => {
     expect(logSpy.mock.calls.some((c) => String(c[0]).startsWith("AUDIT "))).toBe(false);
   });
 
-  it("bypassTruncate is honoured when set by the sandbox", async () => {
+  it("bypassTruncate is honoured by the handler when set on a direct call (the factory whitelist keeps it from the sandbox — D9)", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const big = { blob: "x".repeat(200_000) };
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(big), { status: 200 })));

@@ -76,8 +76,11 @@ function buildRequestOptionsText(stagingEnabled: boolean): string {
   const returnAsLine = stagingEnabled
     ? '    returnAs?: "stage";                  // bytes stream upstream → R2 server-side; the call resolves to a file-handle envelope instead of the JSON body — see \'Staging\'\n'
     : '    returnAs?: "stage";                  // requires staging bindings — NOT enabled on this server\n';
+  const composedComment = stagingEnabled
+    ? "                                          // host-assembled body: text you write + staged files sent by reference — see 'Staging'\n"
+    : "                                          // requires staging bindings — NOT enabled on this server\n";
   const closingCrossRefs = stagingEnabled
-    ? "See 'Body modes' for how `rawBody` / `bodyBase64` / `multipart` interact, and 'Staging' for `returnAs: \"stage\"`. This interface only covers the call's input — what `codemode.request()` resolves to (success or failure) is described in 'Response envelope'.\n\n"
+    ? "See 'Body modes' for how `rawBody` / `bodyBase64` / `multipart` / `composed` interact, and 'Staging' for `composed`, `multipart[].staged` and `returnAs: \"stage\"`. This interface only covers the call's input — what `codemode.request()` resolves to (success or failure) is described in 'Response envelope'.\n\n"
     : "See 'Body modes' for how `rawBody` / `bodyBase64` / `multipart` interact. This interface only covers the call's input — what `codemode.request()` resolves to (success or failure) is described in 'Response envelope'.\n\n";
   return (
     "## Request options\n\n" +
@@ -94,11 +97,13 @@ function buildRequestOptionsText(stagingEnabled: boolean): string {
     "                                          // or provider-set headers. Security-sensitive headers (method-override, authorization, cookie,\n" +
     "                                          // host, and similar) are REJECTED with a loud error — never silently dropped.\n" +
     "    bodyBase64?: string;                 // binary body as base64; host decodes before fetching upstream\n" +
-    "    multipart?: Array<{ name: string; filename?: string; contentType?: string; value?: string; bodyBase64?: string }>;\n" +
+    "    multipart?: Array<{ name: string; filename?: string; contentType?: string; value?: string; bodyBase64?: string; staged?: { file_handle: string; token: string } }>;\n" +
     "                                          // host builds multipart/form-data and sets the boundary/Content-Type — never set contentType yourself alongside this\n" +
+    '    composed?: { segments: Array<{ text: string } | { staged: { file_handle: string; token: string }; encoding: "base64-lines" | "base64" | "identity" }> };\n' +
+    composedComment +
     returnAsLine +
     "  }\n\n" +
-    "`method`, `path`, `query`, `body`, `contentType`, and `rawBody` are codemode's own base fields. `headers`, `bodyBase64`, `multipart`, and `returnAs` are extensions this server adds on top of them.\n\n" +
+    "`method`, `path`, `query`, `body`, `contentType`, and `rawBody` are codemode's own base fields. `headers`, `bodyBase64`, `multipart`, `composed`, and `returnAs` are extensions this server adds on top of them.\n\n" +
     closingCrossRefs
   );
 }

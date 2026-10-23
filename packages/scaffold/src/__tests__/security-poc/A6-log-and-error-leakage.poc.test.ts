@@ -25,6 +25,8 @@ import { sha256Base64Url } from "../../pkce";
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type { SurfaceReview } from "@local/shared";
 import { POC_PROVIDER, UPSTREAM_TOKEN_URL } from "./_harness-oauth-worker";
+import { FakeD1 } from "../../staging/__tests__/__fixtures__/fake-d1";
+import { FakeR2 } from "../../staging/__tests__/__fixtures__/fake-r2";
 
 const SPEC: OpenApiSpec = {
   openapi: "3.0.0",
@@ -43,7 +45,6 @@ const SR: SurfaceReview = {
 
 const ACCESS = "AT-SECRET-0xdeadbeef";
 const REFRESH = "RT-SECRET-0xcafebabe";
-const STG = "stg_SECRET-TOKEN-abcdef";
 
 function captureConsole() {
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -95,15 +96,24 @@ describe("A6 console and error-channel leakage", () => {
     const c = captureConsole();
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "application/pdf" } })));
     const broker = { getOrRefreshAccessToken: async () => ACCESS };
-    const putFile = vi.fn(async () => ({
-      ok: true as const, file_handle: "fh_x", token: STG, fetch_url: "https://w/staging/fetch/fh_x", expires_at: 1, byte_length: 3,
-    }));
+    // v2 (issue #59): the handler stages the body itself through
+    // `stagingStore` (the v1 `putFile` dep is gone) and mints the token, so
+    // the recognisable value is read back from the result instead of planted.
+    const stagingStore = {
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      STAGING_R2: new FakeR2() as unknown as R2Bucket,
+      config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 },
+      uploadOrigin: "https://w",
+    };
     const out = (await handleUpstreamRequest({
-      ...baseArgs(broker), putFile, ctx: { method: "GET", path: "/files/1", returnAs: "stage" },
-    })) as { result: { token: string } };
-    expect(out.result.token).toBe(STG); // by design: the sandbox hands fetch_url+token to the user
+      ...baseArgs(broker), stagingStore, ctx: { method: "GET", path: "/files/1", returnAs: "stage" },
+    })) as { result: { token: string; file_handle: string } };
+    expect(out.result.token).toMatch(/^stg_/); // by design: the sandbox hands fetch_url+token to the user
+    const stg = out.result.token;
     for (const l of c.all()) {
-      expect(l).not.toContain(STG);
+      expect(l).not.toContain(stg);
+      expect(l).not.toContain(stg.slice(4, 24));
+      expect(l).not.toContain(out.result.file_handle);
       expect(l).not.toContain(ACCESS);
     }
   });

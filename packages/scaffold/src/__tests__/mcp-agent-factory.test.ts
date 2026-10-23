@@ -7,6 +7,7 @@ import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { FakeD1 } from "../staging/__tests__/__fixtures__/fake-d1";
+import { FakeR2 } from "../staging/__tests__/__fixtures__/fake-r2";
 import { registerFileHandleTool } from "../staging";
 import {
   buildDocsHostFns,
@@ -16,11 +17,14 @@ import {
   CODEMODE_SANDBOX_ANCHOR,
   createGuardedExecutor,
   createProviderMcpAgent,
+  pickSandboxCtx,
+  runContextOf,
   RESPONSE_CHAR_CAP,
   SESSION_PRINCIPAL_KEY,
   type HostProvider,
   type SandboxExecuteResult,
 } from "../mcp-agent-factory";
+import type { RunContext } from "../staging/gate-dep";
 import { ToolError } from "../elicit";
 import { annotateSpecWithSurfaceReview } from "../annotate-spec";
 import type { ApiProvider } from "../api-provider";
@@ -1336,3 +1340,248 @@ describe("MCP session principal binding (F-16)", () => {
     await close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #59 (B6): sandbox ctx whitelist, per-run context, staged wiring.
+// ---------------------------------------------------------------------------
+
+describe("pickSandboxCtx (D11)", () => {
+  it("keeps only the documented request fields, own properties only", () => {
+    const proto = { method: "INHERITED" };
+    const ctx = Object.assign(Object.create(proto), {
+      path: "/x",
+      query: { a: 1 },
+      body: { b: 2 },
+      headers: { Accept: "x" },
+      contentType: "text/plain",
+      rawBody: true,
+      bodyBase64: "AA==",
+      multipart: [],
+      returnAs: "stage",
+      composed: { segments: [] },
+      bypassTruncate: true,
+      relatedRequestId: 7,
+      evil: 1,
+    });
+    expect(pickSandboxCtx(ctx)).toEqual({
+      path: "/x",
+      query: { a: 1 },
+      body: { b: 2 },
+      headers: { Accept: "x" },
+      contentType: "text/plain",
+      rawBody: true,
+      bodyBase64: "AA==",
+      multipart: [],
+      returnAs: "stage",
+      composed: { segments: [] },
+    });
+  });
+
+  it("a non-object ctx becomes an empty ctx (the handler then refuses it as malformed)", () => {
+    expect(pickSandboxCtx(null)).toEqual({});
+    expect(pickSandboxCtx("GET /x")).toEqual({});
+  });
+});
+
+describe("createGuardedExecutor — per-run context (D3a, D8)", () => {
+  it("tags each upstream call with one runKey per run and a signal aborted at the deadline", async () => {
+    const seen: Array<RunContext | undefined> = [];
+    let captured: HostProvider[] = [];
+    const base = {
+      execute: (_code: string, providersOrFns: HostProvider[] | Fns) => {
+        captured = providersOrFns as HostProvider[];
+        const req = host(captured, "__openapiHost").request!;
+        return (async () => {
+          await req({ method: "GET", path: "/a" });
+          await req({ method: "GET", path: "/b" });
+          return new Promise<SandboxExecuteResult>(() => {});
+        })();
+      },
+    };
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 30, maxUpstreamCalls: 200 },
+    });
+    await guarded.execute("c", [openapiHost(async (ctx) => void seen.push(runContextOf(ctx)))]);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.runKey).toBe(seen[1]!.runKey);
+    expect(seen[0]!.signal.aborted).toBe(true);
+
+    const seen2: Array<RunContext | undefined> = [];
+    const { base: base2 } = makeRecordingBase(async (providers) => {
+      await host(providers, "__openapiHost").request!({ method: "GET", path: "/c" });
+      return "done";
+    });
+    const g2 = createGuardedExecutor(base2, { stagingProvider: null, docsProvider: DOCS_PROVIDER, limits: LIMITS });
+    await g2.execute("c", [openapiHost(async (ctx) => void seen2.push(runContextOf(ctx)))]);
+    expect(seen2[0]!.runKey).not.toBe(seen[0]!.runKey);
+    expect(seen2[0]!.signal.aborted).toBe(false);
+  });
+
+  it("a staging provider factory is called once per execute run with that run's context", async () => {
+    const runs: RunContext[] = [];
+    const staging = fakeStagingProvider();
+    const { base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: (run: RunContext) => {
+        runs.push(run);
+        return staging.provider;
+      },
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+    });
+    await guarded.execute("c", [openapiHost(async () => "r")]);
+    await guarded.execute("c", [openapiHost(async () => "r")]);
+    await guarded.execute("c", []); // search: no staging
+    expect(runs).toHaveLength(2);
+    expect(runs[0]!.runKey).not.toBe(runs[1]!.runKey);
+  });
+});
+
+describe("init() wiring of the sandbox ctx and staged transfers (D11, B6)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const SPEC = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    paths: {
+      "/w": { get: { operationId: "listW", responses: {} } },
+      "/att/{n}": { put: { operationId: "attach", responses: {} } },
+    },
+  };
+  const provider = {
+    ...namedProvider,
+    spec: SPEC,
+    surfaceReview: {
+      listW: { decision: "allow", category: "standard_read" },
+      attach: { decision: "allow", category: "standard_write" },
+    },
+  } as unknown as ApiProvider;
+  const broker = { idFromName: (n: string) => n, get: () => ({ async getOrRefreshAccessToken() { return "AT"; } }) };
+  const props = { props: { userId: "u1", refreshToken: "RT" } };
+
+  it("a sandbox-supplied bypassTruncate: true does not reach the handler (result is truncated)", async () => {
+    stubExecutorWithNodeEval();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const big = "x".repeat(RESPONSE_CHAR_CAP * 4);
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      new Response(JSON.stringify({ big }), { status: 200, headers: { "content-type": "application/json" } })));
+    const { client, close } = await connectToAgentServer(provider, { TOKEN_BROKER: broker }, props);
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const r = await codemode.request({ method: "GET", path: "/w", bypassTruncate: true });
+        return JSON.stringify(r.result).length;
+      }`,
+    });
+    expect(Number(/\d+/.exec(out)![0])).toBeLessThan(big.length);
+    await close();
+  });
+
+  it("composed reaches the handler; staged sends use openStaged and the per-run gate", async () => {
+    stubExecutorWithNodeEval();
+    // Which send reaches the gate second is not fixed: here the second mint is
+    // slow, so the third send queues behind the first and the second is refused.
+    let mints = 0;
+    const slowSecondMint = {
+      idFromName: (n: string) => n,
+      get: () => ({
+        async getOrRefreshAccessToken() {
+          if (++mints === 2) await new Promise((r) => setTimeout(r, 10));
+          return "AT";
+        },
+      }),
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const sent: Uint8Array[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = init?.body as ReadableStream<Uint8Array>;
+      const chunks: Uint8Array[] = [];
+      const reader = body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      sent.push(new Uint8Array(Buffer.concat(chunks)));
+      // Slow upstream: all three sends reach the gate while the first is in flight.
+      await new Promise((r) => setTimeout(r, 50));
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const { client, close } = await connectToAgentServer(
+      provider,
+      {
+        TOKEN_BROKER: slowSecondMint,
+        STAGING_D1: new FakeD1() as unknown as D1Database,
+        STAGING_R2: new FakeR2() as unknown as R2Bucket,
+        STAGING_UPLOAD_ORIGIN: "https://x.test",
+      },
+      props,
+    );
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const put = await __stagingHost.putFile(btoa("hello"), "text/plain", "h.txt");
+        const ref = { file_handle: put.file_handle, token: put.token };
+        const send = () => codemode.request({ method: "PUT", path: "/att/h.txt",
+          composed: { segments: [{ staged: ref, encoding: "identity" }] } });
+        const results = await Promise.allSettled([send(), send(), send()]);
+        return results.map((r) => r.status === "rejected" ? "rejected: " + r.reason.message : "ok").join(" | ");
+      }`,
+    });
+    // One in flight, one waiting, the third refused (D8), in whatever order the
+    // sends reach the gate.
+    expect(String(out).split(" | ").sort()).toEqual([
+      "ok",
+      "ok",
+      "rejected: one staged transfer at a time per execution; await each before starting the next",
+    ]);
+    expect(sent.map((b) => new TextDecoder().decode(b))).toEqual(["hello", "hello"]);
+    await close();
+  });
+});
+
+describe("stageFromUpstreamJson inner request carries the run (code-review gate item 1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("the inner fetch is aborted when the run's host deadline fires, and never deadlocks on the gate", async () => {
+    stubExecutorWithNodeEval();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    let innerSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: RequestInit) => {
+      innerSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      });
+    }));
+    const provider = {
+      ...namedProvider,
+      spec: { openapi: "3.0.0", info: { title: "T", version: "1" }, paths: { "/a": { get: { operationId: "getA", responses: {} } } } },
+      surfaceReview: { getA: { decision: "allow", category: "standard_read" } },
+    } as unknown as ApiProvider;
+    const { client, close } = await connectToAgentServer(
+      provider,
+      {
+        EXECUTE_HOST_TIMEOUT_MS: "60",
+        TOKEN_BROKER: { idFromName: (n: string) => n, get: () => ({ async getOrRefreshAccessToken() { return "AT"; } }) },
+        STAGING_D1: new FakeD1() as unknown as D1Database,
+        STAGING_R2: new FakeR2() as unknown as R2Bucket,
+        STAGING_UPLOAD_ORIGIN: "https://x.test",
+      },
+      { props: { userId: "u1", refreshToken: "RT" } },
+    );
+    const out = await callToolText(client, "execute", {
+      code: `async () => __stagingHost.stageFromUpstreamJson({ method: "GET", path: "/a" }, "data")`,
+    });
+    expect(out).toMatch(/host-side deadline/);
+    expect(innerSignal).toBeDefined();
+    await vi.waitFor(() => expect(innerSignal!.aborted).toBe(true));
+    await close();
+  });
+});
+

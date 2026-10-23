@@ -23,6 +23,9 @@ importers:
       typescript:
         specifier: ^5.5.0
         version: 5.9.3
+      undici:
+        specifier: 7.24.8
+        version: 7.24.8
 
   apps/gmail:
     dependencies:

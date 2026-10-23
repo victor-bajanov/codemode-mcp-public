@@ -108,6 +108,65 @@ describe("buildProviderDocs", () => {
     expect(requestOptions).toContain("REJECTED with a loud error — never silently dropped");
   });
 
+  describe("staged transfer v2 channels (issue #59)", () => {
+    const COMPOSED_TYPE =
+      'composed?: { segments: Array<{ text: string } | { staged: { file_handle: string; token: string }; encoding: "base64-lines" | "base64" | "identity" }> };';
+
+    it("request-options declares the exact `composed` shape and `multipart[].staged`", () => {
+      const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
+      const requestOptions = sections["request-options"]!;
+      expect(requestOptions).toContain(COMPOSED_TYPE);
+      const multipartLine = requestOptions.split("\n").find((l) => l.includes("multipart?: Array<"));
+      expect(multipartLine).toContain("staged?: { file_handle: string; token: string }");
+    });
+
+    it("request-options marks `composed` as unavailable when staging is disabled", () => {
+      const { sections } = buildProviderDocs(stagingProvider, false, annotatedSpec);
+      const line = sections["request-options"]!.split("\n").find((l) => l.includes("composed?:"));
+      expect(line).toBeDefined();
+      expect(sections["request-options"]).toContain(COMPOSED_TYPE);
+      const comment = sections["request-options"]!.slice(sections["request-options"]!.indexOf(COMPOSED_TYPE));
+      expect(comment.split("\n").slice(0, 2).join("\n")).toContain("NOT enabled on this server");
+    });
+
+    it("staging Step 3 sends by reference through `composed`, and getFile is for reading files ≤ 8 MiB", () => {
+      const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
+      const staging = sections.staging!;
+      expect(staging).toContain("composed: { segments: [");
+      expect(staging).toContain('encoding: "base64-lines"');
+      expect(staging).toContain("staged: { file_handle, token }");
+      expect(staging).toMatch(/getFile[^\n]*8 MiB/);
+      // The v1 instruction to forward bytesBase64 upstream is gone.
+      expect(staging).not.toContain("Forward `f.bytesBase64`");
+    });
+
+    it("staging states the composed limits and the opt-in rule for inspected operations", () => {
+      const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
+      const staging = sections.staging!;
+      expect(staging).toMatch(/72 MiB/);                       // STAGING_COMPOSE_MAX_BYTES default
+      expect(staging).toMatch(/4 MiB of text/);                // total text-segment cap
+      expect(staging).toMatch(/staged-not-supported/);         // D10a
+      expect(staging).toMatch(/do(es)? not accept staged files/);
+    });
+
+    it("body-modes exclusivity sentence names `composed` alongside body / bodyBase64 / multipart", () => {
+      const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
+      expect(sections["body-modes"]).toMatch(/Use exactly one of `body`, `bodyBase64`, `multipart` and `composed`/);
+    });
+
+    it("generic Step-3 fallback (no attachmentHint) sends by reference, never via bytesBase64", () => {
+      const { sections } = buildProviderDocs(makeProvider(), true, annotatedSpec);
+      const attachments = sections.attachments!;
+      expect(attachments).toContain("composed");
+      expect(attachments).toContain("staged: { file_handle, token }");
+      // Binary and multipart endpoints no longer take the bytes back out of
+      // the sandbox; only JSON-inline-base64 endpoints (no by-reference form,
+      // a recorded non-goal) still point at getFile.
+      expect(attachments).not.toContain("bodyBase64: f.bytesBase64");
+      expect(attachments).toContain('encoding: "identity"');
+    });
+  });
+
   it("query is typed to allow undefined values, matching codemode/UpstreamCtx", () => {
     const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
     expect(sections["request-options"]).toContain("Record<string, string | number | boolean | undefined>");
@@ -133,7 +192,7 @@ describe("buildProviderDocs", () => {
   it("falls back to the generic Step-3 text when attachmentHint is an empty string, not just unset", () => {
     const provider = makeProvider({ attachmentHint: "" });
     const { sections } = buildProviderDocs(provider, true, annotatedSpec);
-    expect(sections.attachments).toContain("Step 3 — forward the bytes to the upstream API");
+    expect(sections.attachments).toContain("Step 3 — send the file to the upstream API by reference");
   });
 
   it("search-strategy relocates the codemode spec type dump (OpenApiSpec/PathItem/OperationObject) rather than dropping it", () => {

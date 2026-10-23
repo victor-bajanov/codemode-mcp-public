@@ -156,9 +156,18 @@ describe("buildCompactExecuteDescription", () => {
       "bodyBase64",
       "multipart",
       "returnAs",
+      "composed",
     ]) {
       expect(fieldListLine).toContain(field);
     }
+  });
+
+  it("the binary-body line points at composed only when staging is enabled", () => {
+    const withStaging = buildCompactExecuteDescription(gmailLike, true, sectionsFor(gmailLike, true));
+    const withoutStaging = buildCompactExecuteDescription(opticalLike, false, sectionsFor(opticalLike, false));
+    const line = (d: string) => d.split("\n").find((l) => l.startsWith("Binary body:"));
+    expect(line(withStaging)).toContain("composed");
+    expect(line(withoutStaging)).not.toContain("composed");
   });
 
   it("marks returnAs as staging-gated when staging is disabled, plain when enabled", () => {
@@ -167,8 +176,10 @@ describe("buildCompactExecuteDescription", () => {
     const lineWith = withStaging.split("\n").find((l) => l.startsWith("method, path, query"));
     const lineWithout = withoutStaging.split("\n").find((l) => l.startsWith("method, path, query"));
     expect(lineWith).toContain("returnAs");
-    expect(lineWith).not.toContain("requires staging");
-    expect(lineWithout).toContain("returnAs (requires staging");
+    expect(lineWith).not.toContain("staging");
+    // One shared marker for both staging-only fields (budget margin).
+    expect(lineWithout).toContain("composed, returnAs (both need staging; disabled here).");
+    expect(lineWithout!.match(/staging/g)).toHaveLength(1);
   });
 
   it("staging=true output points at register_file_handle and returnAs:\"stage\"", () => {
@@ -262,6 +273,14 @@ describe("buildCompactRegisterFileHandleDescription", () => {
     expect(desc).toContain("file_handle");
     expect(desc).toContain("__stagingHost.getFile");
     expect(desc).toContain("attachments");
+  });
+
+  it("points sending at `composed` (issue #59) and caps getFile to reading small files", () => {
+    // Staged transfer v2: bytes no longer cross the sandbox to be sent; the
+    // host assembles them from `{ file_handle, token }` references.
+    const desc = buildCompactRegisterFileHandleDescription();
+    expect(desc).toContain("composed");
+    expect(desc).toMatch(/getFile[^\n]*8 MiB|8 MiB[^\n]*getFile/);
   });
 
   it("does not splice in a provider-specific attachmentHint", () => {

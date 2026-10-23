@@ -10,9 +10,10 @@
 //   - rotation="rotating" + refresh response with new refresh_token: persist new currentRefreshToken.
 //   - rotation="static" + refresh response with new refresh_token: keep original currentRefreshToken.
 //   - Two distinct seed keys (multi-grant): produce independent slots; refreshing one does not touch the other.
+//   - The refresh POST carries a deadline signal (REFRESH_TIMEOUT_MS), so a hung endpoint rejects.
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getOrRefreshAccessToken, hashRefreshToken, oauthErrorCode } from "../refresh";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { getOrRefreshAccessToken, hashRefreshToken, oauthErrorCode, REFRESH_TIMEOUT_MS, RefreshFailedError } from "../refresh";
 
 type Slot = {
   seedKey: string;
@@ -286,5 +287,117 @@ describe("getOrRefreshAccessToken error hygiene (F-21)", () => {
     expect(oauthErrorCode('"invalid_grant"')).toBeUndefined();
     expect(oauthErrorCode("null")).toBeUndefined();
     expect(oauthErrorCode("not json")).toBeUndefined();
+  });
+});
+
+describe("getOrRefreshAccessToken deadline", () => {
+  beforeEach(() => vi.useRealTimers());
+
+  /** A token endpoint that never answers, but honours the request's abort signal. */
+  function hangingFetch() {
+    return vi.fn<typeof fetch>((_input, init) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+  }
+
+  it("rejects when the token endpoint doesn't answer within the deadline", async () => {
+    const fetcher = hangingFetch();
+    const attempt = getOrRefreshAccessToken({
+      storage: makeStorage(),
+      rotation: "rotating",
+      refreshToken: "RT-seed",
+      clientId: "cid",
+      clientSecret: "csec",
+      tokenUrl: TOKEN_URL,
+      fetcher,
+      timeoutMs: 20,
+    });
+    // A plain Error with a clear message, not a DOMException, crosses DO RPC.
+    const err = await attempt.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe("Error");
+    expect((err as Error).message).toBe("Refresh timed out after 20 ms");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("other fetch errors propagate unchanged", async () => {
+    const boom = new TypeError("network down");
+    const fetcher = vi.fn<typeof fetch>(async () => { throw boom; });
+    const attempt = getOrRefreshAccessToken({
+      storage: makeStorage(),
+      rotation: "rotating",
+      refreshToken: "RT-seed",
+      clientId: "cid",
+      clientSecret: "csec",
+      tokenUrl: TOKEN_URL,
+      fetcher,
+      timeoutMs: 20,
+    });
+    await expect(attempt).rejects.toBe(boom);
+  });
+
+  it("puts a deadline signal on the refresh POST by default (30 s)", async () => {
+    expect(REFRESH_TIMEOUT_MS).toBe(30_000);
+    const fetcher = makeFetchSpy([{ access_token: "AT-1", expires_in: 1800 }]);
+    await getOrRefreshAccessToken({
+      storage: makeStorage(),
+      rotation: "static",
+      refreshToken: "RT-seed",
+      clientId: "cid",
+      clientSecret: "csec",
+      tokenUrl: TOKEN_URL,
+      fetcher,
+    });
+    const init = fetcher.mock.calls[0]![1]!;
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal!.aborted).toBe(false);
+  });
+});
+
+// The broker recovers a rollback-stranded chain only on an upstream
+// `invalid_grant`, so the refresh failure is typed: status and OAuth code are
+// fields, and the message is unchanged.
+describe("RefreshFailedError", () => {
+  beforeEach(() => vi.useRealTimers());
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  function refreshWith(fetcher: typeof fetch, timeoutMs?: number) {
+    return getOrRefreshAccessToken({
+      storage: makeStorage(), rotation: "rotating", refreshToken: "RT-seed",
+      clientId: "cid", clientSecret: "csec", tokenUrl: TOKEN_URL, fetcher,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
+  }
+
+  it("a 400 invalid_grant is a RefreshFailedError carrying status 400 and code invalid_grant", async () => {
+    const err = await refreshWith(vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }),
+    )).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RefreshFailedError);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as RefreshFailedError).status).toBe(400);
+    expect((err as RefreshFailedError).code).toBe("invalid_grant");
+    expect((err as RefreshFailedError).message).toBe("Refresh failed 400 (invalid_grant)");
+  });
+
+  it("a non-JSON 401 is a RefreshFailedError with no code", async () => {
+    const err = await refreshWith(vi.fn<typeof fetch>(async () =>
+      new Response("<html>nope</html>", { status: 401 }),
+    )).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RefreshFailedError);
+    expect((err as RefreshFailedError).status).toBe(401);
+    expect((err as RefreshFailedError).code).toBeUndefined();
+    expect((err as RefreshFailedError).message).toBe("Refresh failed 401");
+  });
+
+  it("a timeout is not a RefreshFailedError", async () => {
+    const hanging = vi.fn<typeof fetch>((_input, init) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    const err = await refreshWith(hanging, 20).catch((e: unknown) => e);
+    expect((err as Error).message).toBe("Refresh timed out after 20 ms");
+    expect(err).not.toBeInstanceOf(RefreshFailedError);
   });
 });

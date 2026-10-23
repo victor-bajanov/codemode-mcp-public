@@ -1,5 +1,13 @@
 import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
-import type { Decision, ElicitRenderer, InspectRequest, InspectResult, SurfaceReview } from "@local/shared";
+import type {
+  Decision,
+  ElicitRenderer,
+  InspectMultipartPart,
+  InspectRequest,
+  InspectResult,
+  SurfaceReview,
+  SurfaceReviewEntry,
+} from "@local/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { hasUnsafePathSegment, matchOperation } from "./path-matcher";
 import { truncateForReturn } from "./truncate";
@@ -11,6 +19,44 @@ import { allowPiiInLogs, debugLog } from "./config";
 import { buildUpstreamUrl } from "./build-upstream-url";
 import type { PutFileResult } from "./staging/putfile-capability";
 import type { ReadRateLimit, UpstreamRateLimit } from "./rate-limit";
+import {
+  assembledLength,
+  base64ToBytes,
+  buildInspectionView,
+  compileStagedMultipart,
+  multipartPartHead,
+  newMultipartBoundary,
+  sanitiseStagedFilename,
+  stagedPartDefaults,
+} from "./compose/assemble";
+import {
+  COMPOSED_MAX_TEXT_BYTES,
+  STAGED_SENTINEL,
+  isWellFormedText,
+  parseStagedRef,
+  validateComposed,
+  type Segment,
+  type StagedEncoding,
+} from "./compose/validate";
+import {
+  platformSuppliesContentLength,
+  sendAssembled,
+  transferController,
+  transferFailure,
+  type TransferController,
+} from "./compose/transfer";
+import type { TransferGateLike } from "./staging/gate-dep";
+import {
+  blockSourceFromBytes,
+  blockSourceFromStream,
+  stageFromBlocks,
+  type OpenStagedFile,
+  type OpenStagedResult,
+  type StagedFileMeta,
+  type StagedRef,
+} from "./staging/staged-file";
+import type { PutFileCapabilityDeps } from "./staging/putfile-capability";
+import { DEFAULT_COMPOSE_MAX_BYTES, DEFAULT_TRANSFER_TIMEOUT_MS } from "./staging/types";
 
 export interface MultipartPart {
   /** Form-data field name (required). */
@@ -23,6 +69,17 @@ export interface MultipartPart {
   value?: string;
   /** Base64-encoded bytes for the part. Decoded server-side. Mutually exclusive with `value`. */
   bodyBase64?: string;
+  /** A staged file the host attaches as this part's bytes (never crossing
+   *  the sandbox). Mutually exclusive with `value`/`bodyBase64`;
+   *  `filename`/`contentType` default from the staged row. */
+  staged?: StagedRef;
+}
+
+export type ComposedSegmentInput =
+  | { text: string }
+  | { staged: StagedRef; encoding: StagedEncoding };
+export interface ComposedBody {
+  segments: ComposedSegmentInput[];
 }
 
 export interface UpstreamCtx {
@@ -60,25 +117,18 @@ export interface UpstreamCtx {
    *  HandleArgs.putFile to be supplied (else throws). Upstream non-2xx
    *  responses are NOT staged and fall through to the normal error envelope. */
   returnAs?: "stage";
+  /** Host-assembled body: text segments plus staged-file references, each
+   *  with an encoding. The host resolves the references, shows inspectors a
+   *  view with one U+FFFC per staged slot, and writes the bytes itself — they
+   *  never cross the sandbox. Mutually exclusive with `body`, `bodyBase64`,
+   *  `rawBody` and `multipart` on every operation. */
+  composed?: ComposedBody;
   /** Internal escape hatch for `__stagingHost.stageFromUpstreamJson`. When
    *  true, the parsed JSON result is returned WITHOUT `truncateForReturn` —
    *  so a downstream caller can pluck a large base64 field intact and stage
    *  it server-side. NOT documented in `executeAddendum` — internal use only.
    *  Ignored when `returnAs === "stage"`. */
   bypassTruncate?: boolean;
-}
-
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let bin = "";
-  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]!);
-  return btoa(bin);
 }
 
 /** JSON inspection parse cap — mirrors DEFAULT_MAX_BYTES in config.ts (50 MiB).
@@ -119,7 +169,18 @@ export type EffectiveBody =
   | { kind: "none" }
   | { kind: "json"; body: unknown; contentType: string }
   | { kind: "raw"; bytes: Uint8Array; contentType: string }
-  | { kind: "multipart"; parts: MultipartPart[] };
+  | { kind: "multipart"; parts: MultipartPart[] }
+  | {
+      /** Host-assembled: a `composed` body, or a multipart list with staged
+       *  parts compiled behind a host-random boundary (`multipartParts`). */
+      kind: "composed";
+      segments: Segment[];
+      files: OpenStagedFile[];
+      metas: StagedFileMeta[];
+      contentType: string;
+      length: number;
+      multipartParts?: MultipartPart[];
+    };
 
 /** Count of distinct body channels supplied. A legitimate request uses one. */
 export function bodyChannelCount(ctx: UpstreamCtx): number {
@@ -127,6 +188,7 @@ export function bodyChannelCount(ctx: UpstreamCtx): number {
   if (ctx.body !== undefined && ctx.body !== null) n++;
   if (typeof ctx.bodyBase64 === "string") n++;
   if (Array.isArray(ctx.multipart)) n++;
+  if (ctx.composed !== undefined) n++;
   return n;
 }
 
@@ -185,6 +247,9 @@ export function marshalBody(
     case "none":
       // No body; honour an explicit caller content-type if present (rare).
       return { bodyToSend: undefined, contentType: normaliseContentType(ctx.contentType) };
+    case "composed":
+      // The body is written by `sendAssembled` into a fixed-length sink.
+      return { bodyToSend: undefined, contentType: eff.contentType };
   }
 }
 
@@ -203,6 +268,12 @@ export interface DerivedInspect {
   sendAs?: EffectiveBody;
 }
 
+/** An inline (non-staged) part as the inspector sees it. */
+function inlinePart(p: MultipartPart): InspectMultipartPart {
+  const { staged: _staged, ...rest } = p;
+  return rest;
+}
+
 /** Build the canonical InspectRequest from the effective payload. */
 export function deriveInspectRequest(
   ctx: UpstreamCtx,
@@ -216,7 +287,36 @@ export function deriveInspectRequest(
     case "json":
       return { req: { ...base, body: eff.body, contentType: eff.contentType } };
     case "multipart":
-      return { req: { ...base, multipart: eff.parts, contentType: "multipart/form-data" } };
+      return { req: { ...base, multipart: eff.parts.map(inlinePart), contentType: "multipart/form-data" } };
+    case "composed": {
+      if (eff.multipartParts) {
+        let k = 0;
+        const multipart = eff.multipartParts.map((p): InspectMultipartPart => {
+          if (p.staged === undefined) return inlinePart(p);
+          const meta = eff.metas[k++]!;
+          const d = stagedPartDefaults(p, meta);
+          return {
+            name: p.name,
+            ...(d.filename !== null ? { filename: d.filename } : {}),
+            contentType: d.contentType,
+            staged: { byteLength: meta.byteLength, contentType: d.contentType, filename: d.filename },
+          };
+        });
+        return {
+          req: { ...base, multipart, contentType: "multipart/form-data", assembledByteLength: eff.length },
+        };
+      }
+      const view = buildInspectionView(eff.segments, eff.metas);
+      return {
+        req: {
+          ...base,
+          rawBody: view.rawBody,
+          contentType: eff.contentType,
+          staged: view.staged,
+          assembledByteLength: view.assembledByteLength,
+        },
+      };
+    }
     case "raw": {
       if (isJsonContentType(eff.contentType)) {
         if (eff.bytes.byteLength > maxBytes) {
@@ -280,6 +380,20 @@ function multipartPartsProblem(
         message: `multipart part ${i}: \`name\` must be a non-empty string`,
       };
     }
+    if (part.staged !== undefined) {
+      if (parseStagedRef(part.staged) === null) {
+        return {
+          reason: "multipart-part-malformed",
+          message: `multipart part ${i}: \`staged\` must be { file_handle, token } from register_file_handle or a staging call`,
+        };
+      }
+      if (part.value !== undefined || part.bodyBase64 !== undefined) {
+        return {
+          reason: "multipart-part-malformed",
+          message: `multipart part ${i}: \`staged\` cannot be combined with \`value\` or \`bodyBase64\``,
+        };
+      }
+    }
     for (const field of MULTIPART_OPTIONAL_STRING_FIELDS) {
       const v = part[field];
       if (v !== undefined && typeof v !== "string") {
@@ -327,28 +441,23 @@ function describeNonString(v: unknown): string {
   return String(v);
 }
 
-function buildMultipartBody(parts: MultipartPart[]): { body: Uint8Array; boundary: string } {
+export function buildMultipartBody(
+  parts: MultipartPart[],
+  boundary: string = newMultipartBoundary(),
+): { body: Uint8Array; boundary: string } {
   // Defence in depth: handler entry already refused these (with an audit line).
   const problem = multipartPartsProblem(parts);
   if (problem) throw new ToolError(problem.message);
-  // RFC 2046 §5.1.1: boundary is `1*70(bchars)`. Use 24 random bytes hex (48 chars).
-  const rb = new Uint8Array(24);
-  crypto.getRandomValues(rb);
-  const boundary = "----codemode-" + Array.from(rb, (b) => b.toString(16).padStart(2, "0")).join("");
   const enc = new TextEncoder();
   const chunks: Uint8Array[] = [];
   for (const p of parts) {
     if (!p.name) throw new ToolError("multipart part: name is required");
+    if (p.staged !== undefined) throw new ToolError("multipart part: staged parts are assembled by the host");
     if (p.value !== undefined && p.bodyBase64 !== undefined) {
       throw new ToolError(`multipart part "${p.name}": value and bodyBase64 are mutually exclusive`);
     }
-    const filenameAttr = p.filename ? `; filename="${p.filename.replace(/"/g, "")}"` : "";
     const defaultCt = p.bodyBase64 !== undefined ? "application/octet-stream" : "text/plain";
-    const headerStr =
-      `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="${p.name.replace(/"/g, "")}"${filenameAttr}\r\n` +
-      `Content-Type: ${p.contentType ?? defaultCt}\r\n\r\n`;
-    chunks.push(enc.encode(headerStr));
+    chunks.push(enc.encode(multipartPartHead(boundary, p.name, p.filename, p.contentType ?? defaultCt)));
     if (p.bodyBase64 !== undefined) {
       chunks.push(base64ToBytes(p.bodyBase64));
     } else if (typeof p.value === "string") {
@@ -414,10 +523,111 @@ export interface HandleArgs<P extends Record<string, unknown>> {
    *  Kept structural (not `ProviderEnv`) so tests can build minimal envs. */
   env: { ALLOW_PII_IN_LOGS?: string; DEBUG_ELICIT?: string };
 
-  /** Optional staging dep. When present, enables `ctx.returnAs === "stage"`.
-   *  Constructed by mcp-agent-factory from createPutFileCapability. */
-  putFile?: (bytesBase64: string, contentType: string, filename: string | null) =>
-    Promise<PutFileResult>;
+  /** Optional staging store (UNGATED putFile deps: the handler holds the
+   *  transfer gate itself). When present, enables `ctx.returnAs === "stage"`:
+   *  the upstream body is read block by block, encrypted and streamed to R2. */
+  stagingStore?: PutFileCapabilityDeps;
+
+  /** Resolves a `{ file_handle, token }` reference against D1 (no R2 read
+   *  until the blocks are pulled). When absent, `composed` and
+   *  `multipart[].staged` are refused. */
+  openStaged?: (ref: StagedRef) => Promise<OpenStagedResult>;
+
+  /** Gate lease of `__stagingHost.stageFromUpstreamJson` (the internal
+   *  `bypassTruncate` path): acquired after the request is approved and the
+   *  token minted, released by the capability after it has parsed and
+   *  stored the result. The handler never releases it. */
+  gateLease?: { acquire(): Promise<void> };
+
+  /** Transfer gate (D8) held across every file-sized send or download. */
+  transferGate?: TransferGateLike;
+
+  /** Aborted when the execute run's host-side deadline fires; aborts any
+   *  staged transfer in flight (D3a). */
+  signal?: AbortSignal;
+
+  /** One object per execute run: the gate's per-run key. Absent → each call
+   *  is its own run. */
+  runKey?: object;
+
+  /** `STAGING_COMPOSE_MAX_BYTES` / `STAGING_TRANSFER_TIMEOUT_MS`; defaults
+   *  apply when absent. */
+  stagingLimits?: { composeMaxBytes?: number; transferTimeoutMs?: number };
+}
+
+/** Status words for a staged reference that does not resolve; the opener's
+ *  own messages are token- and handle-free by contract. */
+function stagedRefFailure(where: string, r: { status: number; message: string }): string {
+  return `${where}: ${r.message} (HTTP ${r.status})`;
+}
+
+/** "name (N bytes)" per staged file, for the approval dialog. Filenames are
+ *  row-derived: control and Unicode format characters (bidi overrides) are
+ *  stripped so they cannot reorder the dialog text. */
+function attachmentsLine(metas: readonly StagedFileMeta[]): string {
+  return metas
+    .map((m) => `${sanitiseStagedFilename(m.filename, { stripFormat: true }) ?? "unnamed file"} (${m.byteLength} bytes)`)
+    .join("; ");
+}
+
+/** Strict `Content-Length` of an identity-encoded response, else null (a
+ *  decoded `Content-Encoding` body has a different length). */
+function declaredResponseLength(headers: Headers): number | null {
+  const enc = headers.get("content-encoding");
+  if (enc !== null && enc.trim().toLowerCase() !== "identity" && enc.trim() !== "") return null;
+  const v = headers.get("content-length");
+  if (v === null || !/^\d+$/.test(v.trim())) return null;
+  const n = Number(v.trim());
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/** Apply `normalizeComposedText` to the text before the first staged
+ *  segment. Fail-open: a throw, `undefined`, or a result that breaks the text
+ *  rules leaves the segments unchanged. */
+function normaliseComposed(entry: SurfaceReviewEntry, segments: Segment[]): Segment[] {
+  const fn = entry.normalizeComposedText;
+  if (!fn) return segments;
+  const firstStaged = segments.findIndex((s) => s.kind === "staged");
+  const leadEnd = firstStaged < 0 ? segments.length : firstStaged;
+  if (leadEnd === 0) return segments;
+  // ignoreBOM: a leading U+FEFF is part of the bytes sent and must survive.
+  const decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true });
+  let text = "";
+  for (let i = 0; i < leadEnd; i++) {
+    const seg = segments[i]!;
+    if (seg.kind === "text") {
+      text += decoder.decode(seg.bytes);
+    }
+  }
+  let replaced: string | undefined;
+  try {
+    replaced = fn(text);
+  } catch {
+    return segments;
+  }
+  if (typeof replaced !== "string" || replaced.includes(STAGED_SENTINEL) || !isWellFormedText(replaced)) {
+    return segments;
+  }
+  const bytes = new TextEncoder().encode(replaced);
+  let otherText = 0;
+  for (let i = leadEnd; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (seg.kind === "text") otherText += seg.bytes.byteLength;
+  }
+  if (bytes.byteLength + otherText > COMPOSED_MAX_TEXT_BYTES) return segments;
+  return [{ kind: "text", bytes }, ...segments.slice(leadEnd)];
+}
+
+const NEVER_ABORTED = new AbortController().signal;
+
+/** Best-effort, not awaited: cancelling a teed or stalled body can wait on
+ *  the other branch or the network, and nothing here depends on it. */
+function cancelQuietly(res: Response): void {
+  try {
+    res.body?.cancel().catch(() => {});
+  } catch {
+    /* locked or already consumed */
+  }
 }
 
 function emitAudit<P extends Record<string, unknown>>(
@@ -525,7 +735,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   if (
     containsBinaryValue(args.ctx.body) ||
     containsBinaryValue(args.ctx.query) ||
-    containsBinaryValue(args.ctx.multipart)
+    containsBinaryValue(args.ctx.multipart) ||
+    containsBinaryValue(args.ctx.composed)
   ) {
     emitAudit(args, {
       deployment: args.deploymentName,
@@ -554,6 +765,25 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       });
       throw new ToolError(problem.message);
     }
+  }
+  // `composed` is validated (shape, text rules, exclusivity with every other
+  // body channel) on every operation, before any storage access.
+  let composedSegments: Segment[] | undefined;
+  if (args.ctx.composed !== undefined) {
+    const v = validateComposed(args.ctx);
+    if (!v.ok) {
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: args.ctx.method,
+        path: args.ctx.path,
+        decision: "deny",
+        category: "malformed",
+        reason: v.reason,
+        ts: new Date().toISOString(),
+      });
+      throw new ToolError(v.message);
+    }
+    composedSegments = v.segments;
   }
   // Validate before any token mint / elicitation round: a doomed request must
   // not cost the user an approval dialog first.
@@ -698,6 +928,91 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     );
   }
 
+  // Host-assembled bodies (D7, D10a): refuse staged references on gated
+  // operations whose entry has not opted in, BEFORE any inspector runs (an
+  // inspector written for JSON or inline parts may fail open on a view it
+  // cannot read); then resolve each reference against D1 only, apply the
+  // normaliser, and enforce the exact assembled length. No R2 object is
+  // opened until the request is approved and the token minted.
+  const stagedParts = Array.isArray(ctx.multipart) && ctx.multipart.some((p) => p.staged !== undefined);
+  let stagedEff: Extract<EffectiveBody, { kind: "composed" }> | undefined;
+  if (composedSegments !== undefined || stagedParts) {
+    const auditDeny = (reason: string, cat?: string): void =>
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "deny",
+        ...(cat ? { category: cat } : {}),
+        reason,
+        ts: new Date().toISOString(),
+      });
+    // Staged multipart parts are a new channel with no legacy precedence: a
+    // second body channel alongside them is refused before any D1 read.
+    // (`composed` exclusivity was already enforced at entry.)
+    if (bodyChannelCount(ctx) > 1) {
+      auditDeny("multiple-body-channels", "malformed");
+      throw new ToolError("`multipart` with staged parts cannot be combined with `body` or `bodyBase64`");
+    }
+    if ((review.inspect !== undefined || review.decision === "elicit") && review.acceptsStaged !== true) {
+      auditDeny("staged-not-supported", "malformed");
+      throw new ToolError(
+        `Operation ${op.operationId} does not accept staged files (\`composed\` or \`multipart[].staged\`)`,
+      );
+    }
+    if (!args.openStaged) {
+      throw new ToolError("staged files are not available: server staging bindings are not configured");
+    }
+    const refs: Array<{ ref: StagedRef; where: string }> = [];
+    if (composedSegments !== undefined) {
+      for (const seg of composedSegments) {
+        if (seg.kind === "staged") refs.push({ ref: seg.ref, where: `composed segment ${seg.index}` });
+      }
+    } else {
+      ctx.multipart!.forEach((p, i) => {
+        if (p.staged !== undefined) refs.push({ ref: p.staged, where: `multipart part ${i}` });
+      });
+    }
+    const files: OpenStagedFile[] = [];
+    for (const { ref, where } of refs) {
+      const r = await args.openStaged(ref);
+      if (!r.ok) {
+        auditDeny("staged-ref-unresolved");
+        throw new ToolError(stagedRefFailure(where, r));
+      }
+      files.push(r.file);
+    }
+    const metas = files.map((f) => f.meta);
+    let segments: Segment[];
+    let contentType: string;
+    if (composedSegments !== undefined) {
+      segments = normaliseComposed(review, composedSegments);
+      contentType = normaliseContentType(ctx.contentType) ?? "application/octet-stream";
+    } else {
+      const boundary = newMultipartBoundary();
+      segments = compileStagedMultipart(ctx.multipart!, boundary, metas);
+      contentType = `multipart/form-data; boundary=${boundary}`;
+    }
+    const length = assembledLength(segments, metas);
+    const maxBytes = args.stagingLimits?.composeMaxBytes ?? DEFAULT_COMPOSE_MAX_BYTES;
+    if (length > maxBytes) {
+      auditDeny("composed-too-large");
+      throw new ToolError(
+        `composed-too-large: the assembled body would be ${length} bytes; the limit is ${maxBytes} bytes`,
+      );
+    }
+    stagedEff = {
+      kind: "composed",
+      segments,
+      files,
+      metas,
+      contentType,
+      length,
+      ...(composedSegments === undefined ? { multipartParts: ctx.multipart! } : {}),
+    };
+  }
+
   let decision: Decision = review.decision;
   let category: string | undefined = review.category;
   let reason: string | undefined;
@@ -728,7 +1043,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // reuse it for marshalling below — so the bytes inspected and the bytes sent
   // are one and the same. Can throw ToolError (rawBody + non-string body); that
   // propagation is correct, mirroring the other deny paths.
-  const eff = resolveEffective(nctx);
+  const eff: EffectiveBody = stagedEff ?? resolveEffective(nctx);
   // What is actually marshalled: `eff`, except on gated raw JSON, where it is
   // the canonical re-serialisation of what was inspected and approved (F-7).
   // Plain "allow" operations keep sending the original bytes.
@@ -774,10 +1089,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     } else {
       renderBody = undefined;
       if (!review.inspect) {
-        opaquePayload =
-          sendEff.kind === "raw"
-            ? `${sendEff.contentType.slice(0, 100)}, ${sendEff.bytes.byteLength} bytes`
-            : `multipart, ${sendEff.parts.length} part${sendEff.parts.length === 1 ? "" : "s"}`;
+        opaquePayload = describeOpaque(nctx, sendEff);
       }
     }
     if (review.inspect) {
@@ -835,6 +1147,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       ...(category ? { category } : {}),
       ...(reason ? { reason } : {}),
       ...(inspectResult?.summary ? { inspectorSummary: inspectResult.summary } : {}),
+      ...(stagedEff ? { attachments: attachmentsLine(stagedEff.metas) } : {}),
       entry: review,
       ...(args.elicitRenderers ? { elicitRenderers: args.elicitRenderers } : {}),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -899,8 +1212,100 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   const fetchOptions: RequestInit = { method: ctx.method, headers, redirect: "manual" };
   if (bodyToSend !== undefined) fetchOptions.body = bodyToSend;
 
-  const upstreamRes = await fetch(urlString, fetchOptions);
+  // File-sized work (a host-assembled send, or a staged download) holds a
+  // transfer-gate slot (D8) from here until the response has been handled.
+  // The gate comes after the token mint, so a refused or failed approval
+  // never queues.
+  // The stageFromUpstreamJson inner request (`bypassTruncate`) is file-sized
+  // too — its response may be a 50 MiB base64 field — but the capability owns
+  // that slot through `gateLease`, held until it has stored the file.
+  const viaLease = ctx.bypassTruncate === true && args.gateLease !== undefined;
+  const fileSized = sendEff.kind === "composed" || ctx.returnAs === "stage" || ctx.bypassTruncate === true;
+  if (viaLease) await args.gateLease!.acquire();
+  const release =
+    fileSized && !viaLease && args.transferGate
+      ? await args.transferGate.acquire(args.runKey ?? {}, args.signal ?? NEVER_ABORTED)
+      : undefined;
+  const timeoutMs = args.stagingLimits?.transferTimeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS;
+  // One controller per file-sized transfer (D3a), alive until the response
+  // has been handled: it bounds the send, the response read and a staged
+  // download alike, and is disposed with the gate release below.
+  const transfer: TransferController | undefined = fileSized
+    ? transferController(args.signal, timeoutMs)
+    : undefined;
+  try {
+    let upstreamRes: Response;
+    let stagedAudit: StagedAudit = {};
+    if (sendEff.kind === "composed") {
+      if (!platformSuppliesContentLength()) setHeader("Content-Length", String(sendEff.length));
+      const sent = await sendAssembled(
+        urlString,
+        fetchOptions,
+        { segments: sendEff.segments, files: sendEff.files, length: sendEff.length },
+        transfer!,
+      );
+      upstreamRes = sent.response;
+      // An upstream may answer (even 2xx) after reading only part of the
+      // body; the audit line records how much it accepted.
+      stagedAudit = {
+        stagedCount: sendEff.metas.length,
+        stagedBytes: sendEff.metas.reduce((n, m) => n + m.byteLength, 0),
+        assembledBytes: sendEff.length,
+        bodyBytesSent: sent.bodyBytesSent,
+        bodyComplete: sent.bodyComplete,
+      };
+    } else if (transfer) {
+      if (transfer.signal.aborted) throw transferFailure(transfer, undefined);
+      fetchOptions.signal = transfer.signal;
+      upstreamRes = await fetch(urlString, fetchOptions);
+    } else {
+      upstreamRes = await fetch(urlString, fetchOptions);
+    }
+    return await finishUpstream(args, ctx, op.operationId, upstreamRes, stagedAudit, transfer);
+  } catch (err) {
+    throw transfer ? transferFailure(transfer, err) : err;
+  } finally {
+    transfer?.dispose();
+    release?.();
+  }
+}
 
+/** Opaque-payload description for the approval dialog when no inspector
+ *  interpreted the body (never the bytes, never a token or handle). */
+function describeOpaque(ctx: UpstreamCtx, eff: EffectiveBody): string | undefined {
+  const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+  switch (eff.kind) {
+    case "raw":
+      return `${eff.contentType.slice(0, 100)}, ${eff.bytes.byteLength} bytes`;
+    case "multipart":
+      return `multipart, ${plural(eff.parts.length, "part")}`;
+    case "composed": {
+      const files = plural(eff.metas.length, "staged file");
+      return eff.multipartParts
+        ? `multipart, ${plural(eff.multipartParts.length, "part")}, ${files}, ${eff.length} bytes`
+        : `composed, ${plural(ctx.composed?.segments.length ?? eff.segments.length, "segment")}, ${files}, ${eff.length} bytes`;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** The audit counters of a host-assembled send (empty for any other request). */
+type StagedAudit = Pick<
+  AuditEntry,
+  "stagedCount" | "stagedBytes" | "assembledBytes" | "bodyBytesSent" | "bodyComplete"
+>;
+
+/** Everything after the upstream answered: rate-limit telemetry, redirect
+ *  refusal, staged download, and the response envelope. */
+async function finishUpstream<P extends Record<string, unknown>>(
+  args: HandleArgs<P>,
+  ctx: UpstreamCtx,
+  operationId: string,
+  upstreamRes: Response,
+  stagedAudit: StagedAudit,
+  transfer: TransferController | undefined,
+): Promise<unknown> {
   // Rate-limit headers are read off EVERY response (2xx included) so the caller
   // sees its remaining budget before it runs out, not only once throttled. A
   // provider reader is best-effort telemetry: if it throws, the upstream result
@@ -922,14 +1327,15 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // A 3xx (other than 304 Not Modified) is reported, never followed or staged.
   // `Location` is not echoed: it is upstream-controlled and may carry tokens.
   if (upstreamRes.status >= 300 && upstreamRes.status < 400 && upstreamRes.status !== 304) {
-    try { await upstreamRes.body?.cancel(); } catch { /* best effort */ }
+    cancelQuietly(upstreamRes);
     emitAudit(args, {
       deployment: args.deploymentName,
       method: ctx.method,
       path: ctx.path,
-      operationId: op.operationId,
+      operationId,
       decision: "allow",
       upstreamStatus: upstreamRes.status,
+      ...stagedAudit,
       ts: new Date().toISOString(),
     });
     return {
@@ -944,25 +1350,44 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     };
   }
 
-  // Stage-mode: only on 2xx + putFile dep present. Bytes go straight to R2,
+  // Stage-mode: only on 2xx + a staging store. The body is read block by
+  // block, encrypted and streamed to R2 (no arrayBuffer(), no base64),
   // bypassing truncateForReturn. On non-2xx, fall through to the normal error
   // envelope (so the LLM can debug — error bodies are usually small JSON).
   if (ctx.returnAs === "stage" && upstreamRes.ok) {
-    if (!args.putFile) {
-      throw new ToolError("returnAs:\"stage\" requires putFile dep — server staging bindings not configured");
+    const store = args.stagingStore;
+    if (!store) {
+      cancelQuietly(upstreamRes);
+      throw new ToolError("returnAs:\"stage\" requires server staging bindings, which are not configured");
     }
-    const buf = await upstreamRes.arrayBuffer();
-    const bytes = new Uint8Array(buf);
     const upstreamContentType = upstreamRes.headers.get("content-type") ?? "application/octet-stream";
     const filename = filenameFromContentDisposition(upstreamRes.headers.get("content-disposition"));
-    const b64 = bytesToBase64(bytes);
-    const staged = await args.putFile(b64, upstreamContentType, filename);
+    const declared = declaredResponseLength(upstreamRes.headers);
+    let staged: PutFileResult;
+    if (declared !== null && declared > store.config.maxBytes) {
+      cancelQuietly(upstreamRes);
+      staged = { ok: false, status: 413, message: "payload too large" };
+    } else {
+      const src = upstreamRes.body
+        ? blockSourceFromStream(upstreamRes.body, declared, store.config.maxBytes)
+        : blockSourceFromBytes(new Uint8Array(0));
+      staged = await stageFromBlocks(store, src, upstreamContentType, filename);
+      // The shared unknown-length slot's own message ("…or send
+      // Content-Length") is for uploaders; a download caller can only retry.
+      if (!staged.ok && staged.status === 503) {
+        staged = { ok: false, status: 503, message: "staging busy with another unknown-length transfer; retry shortly" };
+      }
+      // A refused or failed store may never have touched the body (e.g. the
+      // shared unknown-length slot is busy → 503): cancel it either way.
+      if (!staged.ok) cancelQuietly(upstreamRes);
+      if (!staged.ok && transfer?.signal.aborted) throw transferFailure(transfer, undefined);
+    }
 
     emitAudit(args, {
       deployment: args.deploymentName,
       method: ctx.method,
       path: ctx.path,
-      operationId: op.operationId,
+      operationId,
       decision: "allow",
       upstreamStatus: upstreamRes.status,
       ts: new Date().toISOString(),
@@ -994,18 +1419,29 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     };
   }
 
-  const responseText = await upstreamRes.text();
-  let parsed: unknown = responseText;
-  try { parsed = JSON.parse(responseText); } catch { /* leave as text */ }
+  // The response text is needed only to parse it and, on an error, for the
+  // first 500 characters of the message. Neither outlives this block, so on
+  // the `bypassTruncate` path (stageFromUpstreamJson: a large base64 field)
+  // only the parsed value stays reachable once the text is parsed.
+  let parsed: unknown;
+  let errorMessage = "";
+  {
+    let responseText: string | undefined = await upstreamRes.text();
+    if (!upstreamRes.ok) errorMessage = responseText.slice(0, 500);
+    parsed = responseText;
+    try { parsed = JSON.parse(responseText); } catch { /* leave as text */ }
+    responseText = undefined;
+  }
 
   emitAudit(args, {
     deployment: args.deploymentName,
     method: ctx.method,
     path: ctx.path,
-    operationId: op.operationId,
+    operationId,
     decision: "allow",
     upstreamStatus: upstreamRes.status,
     ...rateLimitAudit,
+    ...stagedAudit,
     ts: new Date().toISOString(),
   });
 
@@ -1013,7 +1449,6 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // with no indication of WHICH limit or how long to wait — that lives in the
   // headers. The envelope contract points clients at `errors[0].message`, so
   // the reason leads there (body kept after it, for debugging).
-  const errorMessage = responseText.slice(0, 500);
   const rateLimitedMessage =
     upstreamRes.status === 429 && rateLimit?.message
       ? (errorMessage ? `${rateLimit.message} Upstream said: ${errorMessage}` : rateLimit.message)

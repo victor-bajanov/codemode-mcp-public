@@ -1,6 +1,6 @@
 import type { StagingConfig } from "./types";
-import { lookupByHash, markCorrupt } from "./repo";
-import { sha256Bearer, decryptFromStorage } from "./crypto";
+import { StagedFileReadError, openStagedFile } from "./staged-file";
+import { createFixedLengthSink } from "./sinks";
 
 export interface FetchDeps {
   STAGING_D1: D1Database;
@@ -23,13 +23,6 @@ function extractHandle(req: Request): string | null {
   // Expect path: /staging/fetch/<file_handle>
   const m = url.pathname.match(/\/staging\/fetch\/([^/]+)$/);
   return m ? m[1]! : null;
-}
-
-function timingSafeEqualStrings(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
 }
 
 // row.filename originates from caller input; the Headers API throws on CR/LF,
@@ -98,42 +91,67 @@ export async function handleFetch(req: Request, deps: FetchDeps): Promise<Respon
   const handle = extractHandle(req);
   if (!handle) return new Response("not found", { status: 404 });
 
-  const token_hash = await sha256Bearer(bearer);
-  const row = await lookupByHash(deps.STAGING_D1, token_hash);
-  if (!row) return new Response("forbidden", { status: 403 });
-  if (!timingSafeEqualStrings(row.file_handle, handle)) {
-    return new Response("forbidden", { status: 403 });
+  const opened = await openStagedFile(deps, { file_handle: handle, token: bearer });
+  if (!opened.ok) {
+    switch (opened.status) {
+      case 400:
+      case 403:
+        return new Response("forbidden", { status: 403 });
+      case 409:
+        return new Response("conflict", { status: 409 });
+      case 410:
+        return new Response("gone", { status: 410 });
+      default:
+        return new Response("internal", { status: 500 });
+    }
   }
-  if (row.state === "pending") return new Response("conflict", { status: 409 });
-  if (row.state === "corrupt") return new Response("gone", { status: 410 });
-  if (row.expires_at <= now()) return new Response("gone", { status: 410 });
-  if (!row.r2_key || !row.iv) return new Response("internal", { status: 500 });
+  const file = opened.file;
+  const byteLen = file.meta.byteLength;
 
-  const obj = await deps.STAGING_R2.get(row.r2_key);
-  if (!obj) return new Response("internal", { status: 500 });
-  const ciphertext = new Uint8Array(await obj.arrayBuffer());
-
-  let plaintext: Uint8Array;
-  try {
-    plaintext = await decryptFromStorage(bearer, row.file_handle, ciphertext, row.iv);
-  } catch {
-    await markCorrupt(deps.STAGING_D1, token_hash);
-    return new Response("gone", { status: 410 });
+  // Commit to a 200 only once the object's size checks out and the first
+  // block has authenticated, so a single-block file that is corrupt is a clean
+  // 410. Later blocks stream through a fixed-length sink; a failure there
+  // aborts the body (the client sees an error, never a clean short EOF).
+  const sink = createFixedLengthSink(byteLen);
+  let firstBlock!: () => void;
+  const firstBlockReady = new Promise<void>((resolve) => {
+    firstBlock = resolve;
+  });
+  const pump = file
+    .readBlocks(async (plain) => {
+      firstBlock();
+      await sink.write(plain);
+    })
+    .then(() => sink.close());
+  const early = await Promise.race([
+    firstBlockReady.then(() => null),
+    pump.then(
+      () => null,
+      (e: unknown) => e ?? new Error("read failed"),
+    ),
+  ]);
+  if (early !== null) {
+    await sink.abort(early);
+    const status = early instanceof StagedFileReadError ? early.status : 500;
+    return new Response(status === 410 ? "gone" : "internal", { status });
   }
+  // Errors after the first block abort the sink; the consumer sees them.
+  pump.catch((e: unknown) => sink.abort(e));
 
   const headers = new Headers();
-  headers.set("Content-Type", row.content_type ?? "application/octet-stream");
+  headers.set("Content-Type", file.meta.contentType);
   headers.set("Content-Disposition", "attachment");
-  if (row.filename) {
+  if (file.meta.filename) {
     // Truncate as code points (not UTF-16 units) so a surrogate pair is never
     // split, then only emit filename-bearing headers if anything survives
     // sanitization + truncation (e.g. a control-characters-only filename).
-    const sanitizedFilename = [...sanitizeFilenameForHeader(row.filename)].slice(0, 255).join("");
+    const sanitizedFilename = [...sanitizeFilenameForHeader(file.meta.filename)].slice(0, 255).join("");
     if (sanitizedFilename.length > 0) {
       headers.set("X-Filename", toByteStringSafeFilename(sanitizedFilename));
       headers.set("Content-Disposition", buildContentDisposition(sanitizedFilename));
     }
   }
   headers.set("Cache-Control", "no-store");
-  return new Response(plaintext, { status: 200, headers });
+  headers.set("Content-Length", String(byteLen));
+  return new Response(sink.readable, { status: 200, headers });
 }

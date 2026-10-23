@@ -113,6 +113,36 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
   });
 });
 
+describe("registerFileHandleTool full description — staged transfer v2", () => {
+  const tool = () =>
+    registerFileHandleTool({
+      STAGING_D1: new FakeD1() as unknown as D1Database,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+    });
+
+  it("Step 2 sends by reference via composed / multipart[].staged", () => {
+    const step2 = tool().description.split("Step 2")[1]!.split("Step 3")[0]!;
+    expect(step2).toContain("composed");
+    expect(step2).toContain("staged: { file_handle, token }");
+    expect(step2).toMatch(/multipart/);
+  });
+
+  it("asks for Content-Length on the upload (no concurrency limit then)", () => {
+    const step1 = tool().description.split("Step 1")[1]!.split("Step 2")[0]!;
+    expect(step1).toContain("Content-Length");
+    expect(step1).toMatch(/one at a time|503/);
+    expect(step1).toMatch(/408/);
+    expect(step1).toMatch(/60 s/);
+  });
+
+  it("scopes getFile to reading small files in code, never to sending", () => {
+    const d = tool().description;
+    expect(d).toMatch(/getFile[^\n]*(8 MiB|small)/);
+    expect(d).not.toMatch(/Step 2 — inside execute\(\), read the bytes/);
+  });
+});
+
 describe("REGISTER_TOOL_INPUT_SHAPE — filename cap (adjudicated)", () => {
   // This wave's Content-Disposition emission (fetch-handler.ts) amplifies a
   // long filename ~12x into a header via percent-encoding; the zod cap here

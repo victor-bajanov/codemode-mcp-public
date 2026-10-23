@@ -19,7 +19,9 @@ import {
   signConsentToken,
   verifyConsentToken,
 } from "./oauth-consent";
+import { seedGrantSlot } from "./grant-slot";
 import { generateCodeVerifier, sha256Base64Url } from "./pkce";
+import { principalOf } from "./principal";
 import { oauthErrorCode } from "./refresh";
 
 const STATE_KV_PREFIX = "auth-state:";
@@ -325,6 +327,9 @@ export function createOAuthHandler<
       return c.text(`${provider.displayName} token exchange failed: ${tokenRes.status}`, 502);
     }
     const tokens = (await tokenRes.json()) as UpstreamTokenResponse;
+    // `expires_in` counts from the token response, so the seeded expiry is
+    // dated from here, not from after userinfo, the hook and completion.
+    const exchangedAt = Date.now();
     if (!tokens.refresh_token) {
       return c.text(
         `${provider.displayName} did not return a refresh_token. Confirm offline_access (or equivalent) scope.`,
@@ -387,6 +392,29 @@ export function createOAuthHandler<
       metadata: { label },
       props,
     });
+
+    // Seed the token broker's slot for this grant with the code-exchange
+    // access token, so the first API call is a cache hit rather than a
+    // refresh (a parallel first batch would otherwise all wait on one). Keyed
+    // by the same principal the broker is addressed by. Best effort: on any
+    // failure the broker refreshes once with the still-unspent refresh token,
+    // so sign-in never fails here and nothing token-bearing is logged.
+    // The principal lookup runs the provider's accessor, so it sits inside
+    // the try too.
+    try {
+      const principal = principalOf(provider, props);
+      if (principal) {
+        await seedGrantSlot(c.env.OAUTH_KV, {
+          userId: principal,
+          refreshToken: tokens.refresh_token,
+          accessToken: tokens.access_token,
+          expiresIn: tokens.expires_in,
+          now: exchangedAt,
+        });
+      }
+    } catch {
+      console.error(`${provider.displayName} token slot seed failed`);
+    }
 
     return redirectResponse(redirectTo, 302, [clearCookie(authCookie)]);
   });

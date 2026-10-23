@@ -3,9 +3,9 @@ import type { SurfaceReview } from "@local/shared";
 // All operations classified `allow`. Claude.ai (the primary client) does not
 // currently render MCP elicitation prompts, so `elicit` entries silently
 // become soft-deny from the operator's perspective. Re-categorize destructive
-// ops (deleteTask, deleteTemplate, deletePlan) and externally-visible writes
-// (commit, which pushes to Google Calendar) as `elicit` once client support
-// lands.
+// ops (deleteAccount first, then deleteTask, deleteTemplate, deletePlan) and
+// externally-visible writes (commit, which pushes to Google Calendar) as
+// `elicit` once client support lands.
 
 export const surfaceReview: SurfaceReview = Object.freeze({
   // Reads
@@ -94,7 +94,8 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   // only to attendees they had already invited. Kept `allow` for consistency
   // with commit / acceptPlan / regenerateCalendarFeedSecret, and because
   // `elicit` is a silent soft-deny on Claude.ai today (see the header note).
-  // This is the FIRST entry to re-categorize as `elicit` once that lands.
+  // This is the SECOND entry to re-categorize as `elicit` once that lands,
+  // after deleteAccount.
   updateBookingPage: { decision: "allow", category: "standard_write" },
 
   // Meeting-poll ops. These are the only entries in this file whose writes send
@@ -113,8 +114,8 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   cancelMeetingPoll:  { decision: "allow", category: "standard_write" },
   // nudgeMeetingPoll re-emails non-responders AND rotates each invitee's link,
   // so every link in an older email goes dead. Repeated calls are indistinguish-
-  // able from spam to the invitee. Re-categorize as `elicit` immediately after
-  // updateBookingPage once Claude.ai renders elicitation prompts.
+  // able from spam to the invitee. Third in the `elicit` queue, immediately
+  // after updateBookingPage, once Claude.ai renders elicitation prompts.
   nudgeMeetingPoll:   { decision: "allow", category: "standard_write" },
   // updateMeetingPoll edits an open poll (title, location, invitees, deadline,
   // guest link). Least-email by design: only invitees materially affected by a
@@ -123,7 +124,7 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   updateMeetingPoll:  { decision: "allow", category: "standard_write" },
   // resolveMeetingPoll forces the booking now: it creates a real calendar event
   // and sends invites, including to invitees who never responded. Largest
-  // fan-out of the five — second in the `elicit` queue behind nudgeMeetingPoll.
+  // fan-out of the five — fourth in the `elicit` queue, behind nudgeMeetingPoll.
   resolveMeetingPoll: { decision: "allow", category: "standard_write" },
 
   // Solver-weights ops (2026-08 re-vendor). All caller-scoped rows in
@@ -155,6 +156,19 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   getTimezone:   { decision: "allow", category: "standard_read" },
   setTimezone:   { decision: "allow", category: "standard_write" },
   resetTimezone: { decision: "allow", category: "standard_write" },
+
+  // deleteAccount (hosted-trial re-vendor) runs the full offboard on the
+  // caller's own subject: irreversible, the most destructive op on the
+  // surface. `allow` rather than `elicit` because `elicit` is a silent
+  // soft-deny on Claude.ai, which would leave trial users no self-serve
+  // deletion path, and optical gates it server-side three ways: the body must
+  // echo the caller's own email (`{confirm}`), deployments with
+  // SELF_SERVE_DELETE_ENABLED off answer 404, and under
+  // AGENT_CONFIRM_CLIENT_IDS (every client on the trial) it answers
+  // `202 awaiting_confirmation` and runs only after the user clicks an
+  // emailed single-use link. First op to re-categorize as `elicit` once
+  // Claude.ai renders elicitation prompts.
+  deleteAccount: { decision: "allow", category: "standard_write" },
 
   // googleCalendarWebhook is the machine-to-machine receiver Google's push
   // notifications POST to. It authenticates via X-Goog-Channel-Token, not

@@ -216,6 +216,9 @@ export function providerDescriptionBudgetTests<P extends Record<string, unknown>
       expect(docs.full).toContain("bodyBase64?: string;");
       expect(docs.full).toContain("multipart?: Array<{ name: string;");
       expect(docs.full).toContain('returnAs?: "stage";');
+      // Staged transfer v2 (issue #59): the host-assembled body channels.
+      expect(docs.full).toContain("composed?: { segments: Array<");
+      expect(docs.full).toContain("staged?: { file_handle: string; token: string }");
     });
 
     it("docs.full states the ACCESS availability convention", () => {
@@ -228,6 +231,8 @@ export function providerDescriptionBudgetTests<P extends Record<string, unknown>
         expect(docs.full).toContain("stageFromUpstreamJson");
         expect(docs.full).toContain('returnAs: "stage"');
         expect(docs.full).toContain("putFile");
+        // Sending a staged file goes by reference through `composed` (issue #59).
+        expect(docs.full).toContain("composed: { segments: [");
       });
     }
 

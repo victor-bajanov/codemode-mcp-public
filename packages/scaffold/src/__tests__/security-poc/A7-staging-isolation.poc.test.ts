@@ -27,7 +27,7 @@ import { handleUpload } from "../../staging/upload-handler";
 import { enforceStagingThrottle } from "../../oauth-hardening";
 import { registerFileHandleTool } from "../../staging/register-tool";
 import { runSweep } from "../../staging/sweep";
-import { mintToken } from "../../staging/tokens";
+import { mintFileHandle, mintToken } from "../../staging/tokens";
 
 const config = { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 64 };
 
@@ -85,8 +85,10 @@ describe("A7 staging token/handle isolation", () => {
     const budget = { limit: 3, windowSeconds: 300 };
     const guess = (r: Request, h: (r: Request) => Promise<Response>) =>
       enforceStagingThrottle(r, kv, budget, 1_000_000, h);
+    // A well-formed handle (v2 rejects an implausible `fh_…` before any D1
+    // read), so each budgeted guess is the one SELECT this probe measures.
     const fetchReq = () =>
-      new Request("https://w/staging/fetch/fh_whatever", {
+      new Request(`https://w/staging/fetch/${mintFileHandle()}`, {
         headers: { Authorization: `Bearer ${mintToken()}`, "CF-Connecting-IP": "198.51.100.66" },
       });
 

@@ -66,12 +66,20 @@ export function registerFileHandleTool(deps: RegisterToolDeps): RegisterTool {
         "Downloading or exporting bytes FROM the upstream API is a different flow that never calls this tool — use the staging download modes (Mode A/B) documented in the `execute` tool description.\n\n" +
         "Step 1 — upload the bytes out-of-band, BEFORE execute() (do this from your own host / curl / etc.):\n" +
         "  POST <upload_url> with header `Authorization: Bearer <token>` and the file bytes as the request body. " +
-        "Must happen within upload_ttl_seconds. A 204 response confirms the upload.\n\n" +
-        "Step 2 — inside execute(), read the bytes via the __stagingHost sandbox capability:\n" +
-        "  const f = await __stagingHost.getFile(file_handle, token);\n" +
-        "  // __stagingHost is a sandbox-scope capability (NOT codemode.* and NOT on globalThis).\n" +
-        "  // f = { ok: true, contentType, byteLength, filename, bytesBase64 } | { ok: false, status, message }\n" +
-        "  // bytesBase64 is standard base64; available for up to fetch_ttl_seconds after upload.\n\n" +
+        "Must happen within upload_ttl_seconds. A 204 response confirms the upload. " +
+        "Send a Content-Length header when you can (curl does for files): uploads with it are not concurrency-limited, " +
+        "while uploads without it run one at a time per server, may get 503 + Retry-After, and must finish within " +
+        "STAGING_TRANSFER_TIMEOUT_MS (60 s by default) or get 408.\n\n" +
+        "Step 2 — inside execute(), SEND the file by reference; the host reads, decrypts and assembles the bytes, which never enter execute():\n" +
+        "  await codemode.request({ method, path, contentType, composed: { segments: [\n" +
+        "    { text: \"…headers / MIME preamble…\" },\n" +
+        "    { staged: { file_handle, token }, encoding: \"base64-lines\" },  // or \"base64\"; \"identity\" only as the sole segment\n" +
+        "    { text: \"…closing boundary…\" },\n" +
+        "  ] } });\n" +
+        "  // multipart/form-data endpoints: multipart: [{ name: \"file\", staged: { file_handle, token } }] instead.\n" +
+        "  // The reference stays valid for up to fetch_ttl_seconds after upload.\n" +
+        "  To READ a small file's contents in code (parse a CSV, a PDF's text) — not to send it — use\n" +
+        "  __stagingHost.getFile(file_handle, token) (capped at 8 MiB by default; a sandbox-scope capability, NOT codemode.*).\n\n" +
         stepThree;
   return {
     name: "register_file_handle",

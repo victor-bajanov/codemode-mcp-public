@@ -103,8 +103,13 @@ export interface ApiProvider<
    *  (register-tool.ts's descriptionMode:"full" legacy path still splices it,
    *  but the factory serves the compact path.)
    *
-   *  Should show, in concrete code, exactly how to forward `f.bytesBase64` from
-   *  `__stagingHost.getFile(file_handle, token)` to THIS provider's upstream API.
+   *  Should show, in concrete code, exactly how to send the staged file to THIS
+   *  provider's upstream API BY REFERENCE: `composed: { segments: [...] }` with
+   *  `{ staged: { file_handle, token }, encoding }` segments, or a multipart
+   *  part's `staged: { file_handle, token }` — the host assembles the bytes, so
+   *  they never cross into the sandbox (staged transfer v2, issue #59). Only an
+   *  endpoint with no by-reference form (base64 inline in a JSON body) should
+   *  fall back to `__stagingHost.getFile` (capped at 8 MiB by default).
    *  Strongly recommended when staging is enabled — without it, the LLM tends to
    *  miss that the workflow applies to non-Xero providers.
    *

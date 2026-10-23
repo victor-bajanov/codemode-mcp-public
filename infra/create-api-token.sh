@@ -19,16 +19,30 @@ set -euo pipefail
 # Usage:
 #   export CF_CREATE_TOKEN='<single-use token with User API Tokens: Edit>'
 #   ./infra/create-api-token.sh
+#   # Optical hosted trial: also grant custom-domain permissions on its zone.
+#   CF_TRIAL_ZONE_ID='<trial zone id>' ./infra/create-api-token.sh
 #
-# Account id is not a secret — hardcoded below. No zone-scoped permissions:
-# codemode-mcp deploys to *.workers.dev only, with no custom domains / WAF /
-# DNS records owned by tofu. No user-scoped permissions either; wrangler's
+# Account id is not a secret — hardcoded below. No zone-scoped permissions by
+# default: codemode-mcp deploys to *.workers.dev, with no WAF / DNS records
+# owned by tofu. The one exception is apps/optical's `trial` env, served on a
+# custom domain: set CF_TRIAL_ZONE_ID to that zone's id to add a second,
+# zone-scoped policy (Workers Routes + DNS, since a custom domain creates its
+# DNS record). Unset, the token is exactly as before. The script PUTs the
+# token's FULL policy set, so EVERY re-run must pass CF_TRIAL_ZONE_ID again:
+# a run without it drops the trial zone grant, and the next trial deploy fails
+# to attach the custom domain. No user-scoped permissions either; wrangler's
 # /memberships preflight is skipped by setting CLOUDFLARE_ACCOUNT_ID in
 # infra/.env, which lets wrangler go straight to the account-scoped endpoint.
 CF_ACCOUNT_ID="REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"
 TOKEN_NAME="codemode-mcp-deploy"
+CF_TRIAL_ZONE_ID="${CF_TRIAL_ZONE_ID:-}"
 
 : "${CF_CREATE_TOKEN:?Set CF_CREATE_TOKEN to a single-use token with 'User > API Tokens > Edit'}"
+
+if [ -n "$CF_TRIAL_ZONE_ID" ] && ! [[ "$CF_TRIAL_ZONE_ID" =~ ^[0-9a-f]{32}$ ]]; then
+  echo "CF_TRIAL_ZONE_ID must be a 32-char hex zone id (got '${CF_TRIAL_ZONE_ID}')" >&2
+  exit 1
+fi
 
 API="https://api.cloudflare.com/client/v4"
 AUTH=(-H "Authorization: Bearer ${CF_CREATE_TOKEN}")
@@ -37,7 +51,7 @@ echo "Fetching permission groups..."
 RAW=$(curl -sf "${AUTH[@]}" "${API}/user/tokens/permission_groups")
 
 # Exact permissions needed, with explicit scope.
-# Format: "scope|name" where scope is "account".
+# Format: "scope|name" where scope is "account" or "zone".
 WANTED=(
   # --- wrangler deploy + wrangler secret put: worker code + secret store ---
   "account|Workers Scripts Read"
@@ -60,8 +74,20 @@ WANTED=(
   "account|Access: Organizations, Identity Providers, and Groups Read"
 )
 
+# --- CF_TRIAL_ZONE_ID only: the optical trial env's custom domain. Workers
+#     Routes attaches the domain; DNS lets wrangler create its record. ---
+if [ -n "$CF_TRIAL_ZONE_ID" ]; then
+  WANTED+=(
+    "zone|Workers Routes Read"
+    "zone|Workers Routes Write"
+    "zone|DNS Read"
+    "zone|DNS Write"
+  )
+fi
+
 # Look up each permission by exact name + scope.
 ACCOUNT_PG_JSON=""
+ZONE_PG_JSON=""
 MISSING=()
 
 for entry in "${WANTED[@]}"; do
@@ -84,8 +110,13 @@ for entry in "${WANTED[@]}"; do
   fi
 
   pg="{\"id\":\"${id}\"}"
-  [ -n "$ACCOUNT_PG_JSON" ] && ACCOUNT_PG_JSON+=","
-  ACCOUNT_PG_JSON+="$pg"
+  if [ "$want_scope" = "account" ]; then
+    [ -n "$ACCOUNT_PG_JSON" ] && ACCOUNT_PG_JSON+=","
+    ACCOUNT_PG_JSON+="$pg"
+  else
+    [ -n "$ZONE_PG_JSON" ] && ZONE_PG_JSON+=","
+    ZONE_PG_JSON+="$pg"
+  fi
 
   printf "  %-55s [%s]\n" "$want_name" "$want_scope"
 done
@@ -97,9 +128,9 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     echo "  - ${m#*|} (${m%%|*})"
   done
   echo ""
-  echo "Available permission groups matching Workers/KV/Access:"
+  echo "Available permission groups matching Workers/KV/Access/DNS:"
   echo "$RAW" | jq -r '
-    .result[] | select(.name | test("Workers Script|Workers KV|Access"; "i"))
+    .result[] | select(.name | test("Workers Script|Workers Route|Workers KV|Access|DNS"; "i"))
     | "  \(.id)  \(.name)  \((.scopes // []) | join(", "))"
   '
   echo ""
@@ -111,7 +142,17 @@ POLICIES="[{
   \"effect\": \"allow\",
   \"resources\": {\"com.cloudflare.api.account.${CF_ACCOUNT_ID}\": \"*\"},
   \"permission_groups\": [${ACCOUNT_PG_JSON}]
-}]"
+}"
+
+if [ -n "$ZONE_PG_JSON" ]; then
+  POLICIES+=",{
+  \"effect\": \"allow\",
+  \"resources\": {\"com.cloudflare.api.account.zone.${CF_TRIAL_ZONE_ID}\": \"*\"},
+  \"permission_groups\": [${ZONE_PG_JSON}]
+}"
+fi
+
+POLICIES+="]"
 
 echo ""
 echo "Token policies:"
