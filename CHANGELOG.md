@@ -2,6 +2,12 @@
 
 Curated notes for each public release. Newest first. (The auto-generated commit list for a release lives in that release's PR on the public mirror; this file is the readable summary.)
 
+## v1.2.2 — 2026-10-28
+
+### Optical provider
+
+**Spec re-vendored for Optical v1.3.1 (still 50 operations).** `commit` and `acceptPlan` gain `409 commit_in_progress`, returned while another commit of the same plan holds its 120 s claim and is writing the calendar. `acceptPlan`'s 409 `error` is now an enum (`plan_superseded`, `commit_in_progress`, `plan_not_reviewable`), and its description explains the claim.
+
 ## v1.2.1 — 2026-10-27
 
 ### Optical provider
