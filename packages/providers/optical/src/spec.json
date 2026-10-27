@@ -4077,7 +4077,7 @@
       "post": {
         "operationId": "commit",
         "summary": "Apply a proposed plan to the user's calendar, notifying attendees of any moved meeting.",
-        "description": "Apply a proposed plan (by plan_hash) to the user's calendar (Google or Outlook). For an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) nothing is applied: after the same 404/410/already-committed checks below, the user is emailed the plan's accept email (the diff with an Accept button) and the call answers 202 awaiting_confirmation (action_id = plan_hash); the plan is committed only if the user accepts it on that email's page, which re-checks it then (a plan superseded or produced under an older timezone by then commits nothing). A gated commit of a plan with no reviewable changes (an empty diff, or resolved by a non-gated client) is 409 plan_not_reviewable; if the email can't be sent it is 503 confirmation_unavailable. Every other client's commit is applied at once, with no confirmation step: any pending plan_hash the caller owns is applied, including one emailed to the user for review that they have not clicked. It creates, moves and deletes the user's own task-chunk events (no attendees). When owned movable meetings are enabled, it also moves each owned meeting the plan relocates to its new time and NOTIFIES THAT MEETING'S ATTENDEES (Google sendUpdates=all; Microsoft Graph always notifies), and the move typically resets their RSVPs; a moved meeting that is a booking-page booking also has its booking time updated. Irreversible from the API's perspective: attendee notifications cannot be recalled. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone.",
+        "description": "Apply a proposed plan (by plan_hash) to the user's calendar (Google or Outlook). For an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) nothing is applied: after the same 404/410/already-committed checks below, the user is emailed the plan's accept email (the diff with an Accept button) and the call answers 202 awaiting_confirmation (action_id = plan_hash); the plan is committed only if the user accepts it on that email's page, which re-checks it then (a plan superseded or produced under an older timezone by then commits nothing). A gated commit of a plan with no reviewable changes (an empty diff, or resolved by a non-gated client) is 409 plan_not_reviewable; if the email can't be sent it is 503 confirmation_unavailable. Every other client's commit is applied at once, with no confirmation step: any pending plan_hash the caller owns is applied, including one emailed to the user for review that they have not clicked. It creates, moves and deletes the user's own task-chunk events (no attendees). When owned movable meetings are enabled, it also moves each owned meeting the plan relocates to its new time and NOTIFIES THAT MEETING'S ATTENDEES (Google sendUpdates=all; Microsoft Graph always notifies), and the move typically resets their RSVPs; a moved meeting that is a booking-page booking also has its booking time updated. Irreversible from the API's perspective: attendee notifications cannot be recalled. Tasks listed as dropped in the plan are reset to status 'pending' with their placement stamp cleared, so they re-enter the backlog for future resolves. Schedule entries whose task is no longer live at commit time (deleted, done, or cancelled between resolve and commit) are skipped: no event is created and any existing event for that chunk is removed, releasing its slot. The 'committed' count reflects only the live tasks committed. A pending plan produced under a timezone other than the caller's current effective timezone (a resolve that raced a timezone change) is answered 404 not_found, exactly as if it had vanished; re-resolve to get a plan for the new timezone. Two concurrent commits of one plan (a double-click on the accept page, or this call racing the user's emailed accept link) never both apply it: the first claims the plan for up to 120 seconds before reading the calendar, and the other answers 409 commit_in_progress, normally having written nothing (a commit that outlived its own claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates; a retry reconciles them); once the first finishes, a retry answers 200 already_committed (or commits, if the first failed).",
         "security": [
           {
             "BearerAuth": []
@@ -4244,22 +4244,41 @@
             }
           },
           "409": {
-            "description": "plan_not_reviewable: agent-confirm clients only. The plan has no reviewable changes to email (an empty diff, or no review snapshot because a non-gated client resolved it); nothing was committed. Re-resolve if the calendar has changed.",
+            "description": "commit_in_progress: another commit of this plan holds its 120-second commit claim and is writing the calendar now. Normally this request wrote nothing; a commit that outlived its own claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates, which a retry reconciles. Retry shortly (200 already_committed once it lands). Or plan_not_reviewable: agent-confirm clients only. The plan has no reviewable changes to email (an empty diff, or no review snapshot because a non-gated client resolved it); nothing was committed. Re-resolve if the calendar has changed.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string",
-                      "enum": [
-                        "plan_not_reviewable"
-                      ],
-                      "description": "The plan has no reviewable change set to email (it changes nothing on the calendar, or it was resolved by a client that isn't agent-confirm gated), so it can't be sent for confirmation. Nothing was committed."
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string",
+                          "enum": [
+                            "plan_not_reviewable"
+                          ],
+                          "description": "The plan has no reviewable change set to email (it changes nothing on the calendar, or it was resolved by a client that isn't agent-confirm gated), so it can't be sent for confirmation. Nothing was committed."
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string",
+                          "enum": [
+                            "commit_in_progress"
+                          ],
+                          "description": "Another commit of this plan (a double-click on the accept page, or a commit racing the user's emailed accept link) is applying it right now, and normally this request wrote nothing. The exception: a commit that outlived its own 120-second claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates before answering this; a retry reconciles them. Retry after a short wait: it then answers 200 already_committed, or commits if the other attempt failed."
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
                     }
-                  },
-                  "required": [
-                    "error"
                   ]
                 }
               }
@@ -4639,7 +4658,7 @@
         ],
         "operationId": "acceptPlan",
         "summary": "Accept (commit) the proposed plan identified by {plan_hash}.",
-        "description": "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable.",
+        "description": "Commit exactly the plan named in the path (owner-scoped). Auth: a capability token (form field `t`, from the emailed link) or an optical bearer, never both: a request carrying a capability token AND an Authorization header is refused 403 `authorization_not_allowed` (the emailed link is the user's own confirmation, which an agent may not click for them). If the hash is unknown — typically because a newer resolve superseded it for the same week — the call commits NOTHING and returns 409 `plan_superseded` (with `latest_plan_hash` when that week has a current pending plan, excluding a pending plan that predates the week's latest accept); re-fetch and re-accept. A pending plan produced under a timezone other than the subject's current effective timezone (a resolve that raced a timezone change) is treated the same way as a superseded hash. Idempotent on an already-committed hash. Bearer calls from an OAuth client listed in AGENT_CONFIRM_CLIENT_IDS (an agent-confirm client) commit nothing: after the same checks (409 plan_superseded, 410, idempotent 200), the user is emailed this plan's accept email and the call answers 202 awaiting_confirmation (action_id = plan_hash); only the user's own accept on that email's page (the capability branch) commits it. A gated call on a plan with no reviewable changes is 409 plan_not_reviewable; if the email can't be sent, 503 confirmation_unavailable. A commit landing while another commit of the same plan is applying it (a double-click, or an agent's commit racing the emailed link) answers 409 commit_in_progress (the HTML form gets a 409 notice page saying the plan is already being applied) and normally writes nothing; a commit that outlived its own 120-second claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates before answering 409, and a retry reconciles them. The other commit holds the plan for at most 120 seconds, after which a retry answers 200 (already committed) or commits.",
         "responses": {
           "200": {
             "description": "Committed (idempotent on an already-committed plan)",
@@ -4734,14 +4753,19 @@
             }
           },
           "409": {
-            "description": "plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed.",
+            "description": "plan_superseded: the plan no longer exists (or was produced under an older timezone); nothing was committed. Or commit_in_progress: another commit of this plan holds its 120-second commit claim and is writing the calendar now. Normally this request wrote nothing; a commit that outlived its own claim, or whose plan was replaced mid-commit, may already have written calendar events and task updates, which a retry reconciles. Retry shortly (200 already_committed once it lands). Or, for an agent-confirm client's bearer call only, plan_not_reviewable: the plan has no reviewable changes to email; nothing was committed.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "enum": [
+                        "plan_superseded",
+                        "commit_in_progress",
+                        "plan_not_reviewable"
+                      ]
                     },
                     "latest_plan_hash": {
                       "type": "string",
