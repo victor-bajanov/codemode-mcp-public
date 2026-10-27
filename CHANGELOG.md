@@ -2,6 +2,12 @@
 
 Curated notes for each public release. Newest first. (The auto-generated commit list for a release lives in that release's PR on the public mirror; this file is the readable summary.)
 
+## v1.2.1 — 2026-10-27
+
+### Optical provider
+
+**Spec re-vendored for Optical v1.3.0 (still 50 operations).** `resolve` and `replanNow` gain `409 identity_credential_missing`, returned after an operator's admin rebind until the user signs in again. `GET /v1/calendar-access-token` documents its 404 when the deployment has the route switched off. `subscribeWebhook` now describes `subscribed` as whether the caller has a live push channel, and the status-link descriptions note that an account rebind kills them.
+
 ## v1.2.0 — 2026-10-23
 
 ### Optical provider
