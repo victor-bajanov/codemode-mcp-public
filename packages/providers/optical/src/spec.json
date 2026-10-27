@@ -3978,6 +3978,28 @@
               }
             }
           },
+          "409": {
+            "description": "identity_credential_missing: the account holds no calendar credential (an operator's admin rebind wiped it, and the account is idle until its owner signs in again). No plan was produced and nothing was emailed. Sign in again (re-authorise the client), then retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "identity_credential_missing"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "description": "identity_credential_missing: the account holds no calendar credential (an operator's admin rebind wiped it, and the account is idle until its owner signs in again). No plan was produced and nothing was emailed. Sign in again (re-authorise the client), then retry."
+                }
+              }
+            }
+          },
           "422": {
             "description": "Unsatisfiable constraints",
             "content": {
@@ -4676,7 +4698,7 @@
             }
           },
           "401": {
-            "description": "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST)",
+            "description": "Unauthenticated: missing/invalid bearer, or an invalid capability token (including one whose subject is no longer on MEMBERSHIP_ALLOWLIST, and one minted before the account was bound to a different sign-in identity: an admin rebind or a provider switch)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6935,7 +6957,7 @@
           "account"
         ],
         "summary": "Delete the caller's own account (deployment-gated).",
-        "description": "Permanently delete the CALLER's own account. Deployment-gated: unless the deployment sets SELF_SERVE_DELETE_ENABLED to exactly \"true\" this route does not exist and every call is 404 not_found (checked before auth and body validation). Requires a bearer with the scheduler:write scope (403 insufficient_scope otherwise). The body must confirm the deletion with the caller's own email address, the same value GET /v1/whoami returns as email, matched case-insensitively but otherwise exactly (no trimming); anything else is 400 confirmation_mismatch and nothing is deleted. There is no way to name another account: the subject is always the bearer's own, and unknown body keys are a 400. When the calling OAuth client is listed in AGENT_CONFIRM_CLIENT_IDS (an AI agent), nothing is deleted on this call: once the checks above pass it returns 202 awaiting_confirmation and emails the user a single-use link to a page that states plainly that it deletes the account; the deletion below runs only if they confirm it in their browser within 24 hours, at most once, after re-checking that the account is still active and self-serve deletion still enabled, and the deletion confirmation email is sent at that point. If that link can't be emailed the call is 503 confirmation_unavailable and nothing is stored or deleted. Other callers delete immediately. On success this runs the same full offboard an operator would: it stops the calendar push channel, best-effort removes upcoming Optical-placed work blocks (past ones and booked meetings stay) from the calendar, revokes the provider grant where the deployment enables it, and deletes every per-user row (tasks, templates, projects, plans, bookings, polls, config, calendar feeds, connected-calendar tokens, solver telemetry), including ALL of the caller's bearer and refresh tokens, so the bearer used for the request stops working immediately (401). Retained: the deactivated users row, which keeps the email address, role and timestamps (created, last seen, retention warning, deactivated) and nothing else, and the audit log, which records this deletion (action offboard, source api) and still names the address. How long both are kept is deployment config: when DELETED_ACCOUNT_RETENTION_DAYS is a positive integer N, the daily sweep deletes the users row N days after this deletion and replaces the address in the audit log with a keyed, non-reversible pseudonym; unset or \"0\" means they are kept indefinitely. Signing in again starts a new, empty account. When the deployment has system mail enabled, a confirmation email goes to the caller's address after the deletion; a failed send never fails the call. Not reversible.",
+        "description": "Permanently delete the CALLER's own account. Deployment-gated: unless the deployment sets SELF_SERVE_DELETE_ENABLED to exactly \"true\" this route does not exist and every call is 404 not_found (checked before auth and body validation). Requires a bearer with the scheduler:write scope (403 insufficient_scope otherwise). The body must confirm the deletion with the caller's own email address, the same value GET /v1/whoami returns as email, matched case-insensitively but otherwise exactly (no trimming); anything else is 400 confirmation_mismatch and nothing is deleted. There is no way to name another account: the subject is always the bearer's own, and unknown body keys are a 400. When the calling OAuth client is listed in AGENT_CONFIRM_CLIENT_IDS (an AI agent), nothing is deleted on this call: once the checks above pass it returns 202 awaiting_confirmation and emails the user a single-use link to a page that states plainly that it deletes the account; the deletion below runs only if they confirm it in their browser within 24 hours, at most once, after re-checking that the account is still active and self-serve deletion still enabled, and the deletion confirmation email is sent at that point. If that link can't be emailed the call is 503 confirmation_unavailable and nothing is stored or deleted. Other callers delete immediately. On success this runs the same full offboard an operator would: it stops the calendar push channel, best-effort removes upcoming Optical-placed work blocks (past ones and booked meetings stay) from the calendar, revokes the provider grant where the deployment enables it, and deletes every per-user row (tasks, templates, projects, plans, bookings, polls, config, calendar feeds, connected-calendar tokens, solver telemetry), including ALL of the caller's bearer and refresh tokens, so the bearer used for the request stops working immediately (401). Retained: the deactivated users row, which keeps the email address, role and timestamps (created, last seen, retention warning, deactivated) and nothing else, and the audit log, which records this deletion (action offboard, source api) and still names the address. How long both are kept is deployment config: when DELETED_ACCOUNT_RETENTION_DAYS is a positive integer N, the daily sweep deletes the users row N days after this deletion and replaces the address in the audit log with a keyed, non-reversible pseudonym; unset or \"0\" means they are kept indefinitely. Signing in again starts a new, empty account. When the deployment has system mail enabled, a confirmation email goes to the address the caller most recently signed in with (their sign-in address can differ from the account's email after an identity-provider rename) after the deletion; a failed send never fails the call. Not reversible.",
         "security": [
           {
             "BearerAuth": []
@@ -7576,6 +7598,28 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "identity_credential_missing: the account holds no calendar credential (an operator's admin rebind wiped it, and the account is idle until its owner signs in again). No plan was produced and nothing was emailed. Sign in again (re-authorise the client), then retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "identity_credential_missing"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "description": "identity_credential_missing: the account holds no calendar credential (an operator's admin rebind wiped it, and the account is idle until its owner signs in again). No plan was produced and nothing was emailed. Sign in again (re-authorise the client), then retry."
+                }
+              }
+            }
           }
         }
       }
@@ -7584,7 +7628,7 @@
       "post": {
         "operationId": "subscribeWebhook",
         "summary": "Subscribe the caller's primary calendar to push notifications.",
-        "description": "Ensure a Google Calendar watch channel exists for the caller's primary calendar so edits trigger replans. Idempotent.",
+        "description": "Ensure a push channel (a Google Calendar watch channel or a Microsoft Graph subscription, per the caller's sign-in provider) exists for the caller's primary calendar, so calendar edits trigger replans. Idempotent: a live channel is kept, one near expiry is renewed or rotated, and a missing one is created. `subscribed` reports whether push works after the call, not whether this call did any work. Provider errors are reported through `subscribed`, not as an error status.",
         "security": [
           {
             "BearerAuth": []
@@ -7603,7 +7647,7 @@
                     },
                     "subscribed": {
                       "type": "boolean",
-                      "description": "Whether an active watch channel now exists for the caller's primary calendar (true whether newly created or already present)."
+                      "description": "True when, after the call, a live push channel for this deployment's callback URL is stored for the caller's primary calendar (newly created, renewed or already present) and nothing this call did found the caller's upstream grant unusable. A failed renewal of a channel that has not yet expired still answers true; a fresh channel needs no provider call, so the grant is not re-checked then. False means there is no working push channel: the grant was refused, revoked or wiped, the caller's provider is switched off, or no unexpired channel for this callback is stored. Treat false as needing action: retry later, or ask the user to sign in again."
                     }
                   },
                   "required": [
@@ -8773,7 +8817,7 @@
       "get": {
         "operationId": "getCalendarAccessToken",
         "summary": "Hand the caller's raw identity-provider (Google or Microsoft) access token to the client.",
-        "description": "Return the caller's own short-lived OAuth access token, issued by their identity provider: a Google token for a Google account, a Microsoft Graph token for a Microsoft account. This is the user's raw provider credential handed to the client, not an Optical token. Until it expires, whoever holds it can act as the user directly against the provider, outside Optical and bypassing every Optical check: read, create, change and delete their calendar events, and send mail from their mailbox (Google: calendar.events, calendar.freebusy, gmail.send; Microsoft: Calendars.ReadWrite, Mail.Send; plus any extra scope that deployment requests). PRIVILEGED: requires the calendar:raw-token scope. That scope is checked against the OAuth client's allowlist only, not the user's role, so grant it only to operator/automation clients. Distinct from the per-endpoint busy-feed secrets managed at /v1/calendar-feeds.",
+        "description": "Return the caller's own short-lived OAuth access token, issued by their identity provider: a Google token for a Google account, a Microsoft Graph token for a Microsoft account. This is the user's raw provider credential handed to the client, not an Optical token. Until it expires, whoever holds it can act as the user directly against the provider, outside Optical and bypassing every Optical check: read, create, change and delete their calendar events, and send mail from their mailbox (Google: calendar.events, calendar.freebusy, gmail.send; Microsoft: Calendars.ReadWrite, Mail.Send; plus any extra scope that deployment requests). PRIVILEGED: requires the calendar:raw-token scope. That scope is checked against the OAuth client's allowlist only, not the user's role, so grant it only to operator/automation clients. Deployment-gated: the route exists only where CALENDAR_RAW_TOKEN_ENABLED is \"true\" (the smoke deployments); elsewhere it answers 404 not_found before any auth check. Distinct from the per-endpoint busy-feed secrets managed at /v1/calendar-feeds.",
         "security": [
           {
             "BearerAuth": []
@@ -8830,6 +8874,27 @@
                     "required": {
                       "type": "string",
                       "description": "The scope that was required but missing (present on insufficient_scope errors)."
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: the raw-token route is not enabled on this deployment (CALENDAR_RAW_TOKEN_ENABLED is not \"true\"). Returned before auth.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "not_found"
+                      ]
                     }
                   },
                   "required": [
@@ -9007,7 +9072,7 @@
                     },
                     "statusUrl": {
                       "type": "string",
-                      "description": "The organiser's own read-only status page for this poll (GET /poll/{id}/status): roster, response grid, and top candidate slots. Carries an embedded capability token (query param `t`) so it opens directly in a browser; it also accepts the same bearer-token auth as this API. Expires poll deadline + 7 days grace, same window as invitee links."
+                      "description": "The organiser's own read-only status page for this poll (GET /poll/{id}/status): roster, response grid, and top candidate slots. Carries an embedded capability token (query param `t`) so it opens directly in a browser; it also accepts the same bearer-token auth as this API. Expires poll deadline + 7 days grace, same window as invitee links. The link stops working if the account is later bound to a different sign-in identity (an admin rebind or a provider switch); the bearer path still opens the page."
                     },
                     "guestUrl": {
                       "type": "string",
