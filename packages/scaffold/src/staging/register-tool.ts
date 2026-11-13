@@ -1,7 +1,8 @@
 import { z } from "zod";
+import { stagingAuditEntry, type AuditSink } from "../audit.js";
 import type { StagingConfig, RegisterInput, RegisterOutput } from "./types";
 import { mintToken, mintFileHandle } from "./tokens";
-import { sha256Bearer } from "./crypto";
+import { fileRefOf, sha256Bearer } from "./crypto";
 import { insertPending } from "./repo";
 import { buildCompactRegisterFileHandleDescription } from "../descriptions/compact";
 import { GENERIC_STEP_THREE } from "../descriptions/fragments";
@@ -14,6 +15,10 @@ export interface RegisterToolDeps {
   STAGING_D1: D1Database;
   config: StagingConfig;
   uploadOrigin: string;     // e.g., "https://xero.example.com"
+  /** E-1: the session principal; written on the reserved row. */
+  owner: string;
+  /** E-1: one `staging.register` line per call when given. */
+  audit?: AuditSink;
   /** Provider-specific Step-3 guidance (see ApiProvider.attachmentHint) — upload
    *  direction only. Spliced verbatim into this tool's description, replacing
    *  the generic fallback. Ignored when `descriptionMode: "compact"` (spec D3:
@@ -86,6 +91,8 @@ export function registerFileHandleTool(deps: RegisterToolDeps): RegisterTool {
     description,
     inputShape: REGISTER_TOOL_INPUT_SHAPE,
     async handler(input: RegisterInput): Promise<RegisterOutput> {
+      // E-1: never reserve a slot without a real owner.
+      if (!deps.owner) throw new Error("staging requires an authenticated principal");
       const token = mintToken();
       const file_handle = mintFileHandle();
       const token_hash = await sha256Bearer(token);
@@ -98,7 +105,20 @@ export function registerFileHandleTool(deps: RegisterToolDeps): RegisterTool {
         filename: input.filename ?? null,
         created_at,
         expires_at: created_at + deps.config.uploadTtlSeconds,
+        owner: deps.owner,
       });
+      deps.audit?.(
+        stagingAuditEntry({
+          method: "TOOL",
+          path: "register_file_handle",
+          operationId: "staging.register",
+          allowed: true,
+          event: "register",
+          fileRef: await fileRefOf(file_handle),
+          byteLength: input.expected_byte_len,
+          status: 200,
+        }),
+      );
       return {
         token,
         file_handle,

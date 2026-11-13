@@ -25,6 +25,17 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleUpstreamRequest } from "../../request-handler";
 import { gmailProvider } from "../../../../providers/gmail/src/index";
 
+// Wave 2: a calendar write needs CALENDAR_WRITE_ALLOWLIST (fail-closed when
+// unset) and first looks up the stored event. Answer that GET with an event the
+// caller organises, and the PATCH with `{}`.
+const OWN_EVENT = { id: "evt1", organizer: { email: "u1@example.com", self: true }, attendees: [{ email: "u1@example.com", self: true }] };
+function calendarFetch() {
+  return vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const json = (init?.method ?? "GET").toUpperCase() === "GET" ? OWN_EVENT : {};
+    return new Response(JSON.stringify(json), { status: 200, headers: { "content-type": "application/json" } });
+  });
+}
+
 function fakeBroker() {
   return { async getOrRefreshAccessToken() { return "AT"; } };
 }
@@ -79,7 +90,7 @@ describe("B4 — query smuggling via `?` in a trailing path param (FIXED F-6)", 
 
   it("contrast: the same parameters passed via ctx.query ARE visible to the inspector", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", calendarFetch());
     const entry = gmailProvider.surfaceReview["calendar.events.patch"]!;
     const seen: unknown[] = [];
     await handleUpstreamRequest({
@@ -92,7 +103,7 @@ describe("B4 — query smuggling via `?` in a trailing path param (FIXED F-6)", 
       server: {} as never,
       oauth: { refreshTokenAccessor: (p) => p.refreshToken as string, userIdAccessor: (p) => p.userId as string | undefined, broker: fakeBroker() },
       audit: {},
-      env: {},
+      env: { CALENDAR_WRITE_ALLOWLIST: "primary" },
     });
     expect(seen).toEqual([{ sendUpdates: "all" }]);
   });

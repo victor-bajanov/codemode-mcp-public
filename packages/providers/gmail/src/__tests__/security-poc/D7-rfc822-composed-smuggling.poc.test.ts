@@ -62,6 +62,7 @@ function world() {
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
     uploadOrigin: "https://x.test",
+    owner: "user-A",
     now: () => NOW,
   };
   const opener = staging.createStagedFileOpener(deps);
@@ -130,6 +131,7 @@ function world() {
       openStaged: opener,
       stagingStore: deps,
       ...(gmailProvider.elicitRenderers ? { elicitRenderers: gmailProvider.elicitRenderers } : {}),
+      ...(gmailProvider.standardQueryParams ? { standardQueryParams: gmailProvider.standardQueryParams } : {}),
     } as HandleArgs<Record<string, unknown>>);
   const stage = async (bytes: Uint8Array, contentType = "application/pdf", filename: string | null = "q.pdf"): Promise<Ref> => {
     const r = await staging.stageFromBlocks(deps, staging.blockSourceFromBytes(bytes), contentType, filename);
@@ -255,8 +257,10 @@ describe("D7 — structure attacks on the composed RFC 822 body", () => {
       [{ uploadType: "multipart" }, "upload-type-not-media"],
       [{}, "upload-type-not-media"],
       [{ uploadType: "media", upload_protocol: "resumable" }, "upload-type-not-media"],
-      [{ uploadType: "media", alt: "media" }, "media-query-param"],
-      [{ uploadType: "media", key: "attacker-key" }, "media-query-param"],
+      // Since D-2 the handler's query-name policy refuses these before the
+      // inspector runs (`alt` is undeclared, `key` is a credential name).
+      [{ uploadType: "media", alt: "media" }, "undeclared-query-param"],
+      [{ uploadType: "media", key: "attacker-key" }, "forbidden-query-param"],
     ] as const) {
       const err = await w.run(media(segments, { query: query as NonNullable<UpstreamCtx["query"]> })).catch((e: unknown) => e);
       expect(err, JSON.stringify(query)).toBeInstanceOf(ToolError);

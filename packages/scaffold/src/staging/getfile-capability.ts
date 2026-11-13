@@ -1,3 +1,4 @@
+import { stagingAuditEntry, type AuditSink } from "../audit.js";
 import { DEFAULT_GETFILE_MAX_BYTES, type StagingConfig } from "./types";
 import { Base64Encoder } from "./codec";
 import { openStagedFile } from "./staged-file";
@@ -10,6 +11,10 @@ export interface GetFileStoreDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
+  /** E-1: the caller's principal; only its own rows are readable. */
+  owner: string;
+  /** E-1: one `staging.read` line per call when given. */
+  audit?: AuditSink;
   /** Test seam: override the clock. */
   now?: () => number;
 }
@@ -44,22 +49,51 @@ export type GetFileResult =
  * block; there is no per-byte string building.
  */
 export function createGetFileCapability(deps: GetFileCapabilityDeps) {
-  const maxBytes = deps.config.getFileMaxBytes ?? DEFAULT_GETFILE_MAX_BYTES;
+  const read = readOnce(deps);
   return async function getFile(handle: string, token: string): Promise<GetFileResult> {
+    const { result, fileRef, byteLength } = await read(handle, token);
+    // E-1: one line per call; `fileRef`/`byteLength` only once the reference resolved to the
+    // caller's own row.
+    deps.audit?.(
+      stagingAuditEntry({
+        method: "HOST",
+        path: "__stagingHost.getFile",
+        operationId: "staging.read",
+        allowed: result.ok,
+        event: "read",
+        fileRef,
+        byteLength,
+        status: result.ok ? 200 : result.status,
+      }),
+    );
+    return result;
+  };
+}
+
+function readOnce(deps: GetFileCapabilityDeps) {
+  const maxBytes = deps.config.getFileMaxBytes ?? DEFAULT_GETFILE_MAX_BYTES;
+  return async function read(
+    handle: string,
+    token: string,
+  ): Promise<{ result: GetFileResult; fileRef?: string; byteLength?: number }> {
     if (typeof handle !== "string" || typeof token !== "string") {
-      return { ok: false, status: 400, message: "handle and token must be strings" };
+      return { result: { ok: false, status: 400, message: "handle and token must be strings" } };
     }
     const opened = await openStagedFile(deps, { file_handle: handle, token });
-    if (!opened.ok) return opened;
+    if (!opened.ok) return { result: opened };
     const { meta } = opened.file;
+    const known = { fileRef: meta.fileRef, byteLength: meta.byteLength };
     if (meta.byteLength > maxBytes) {
       return {
-        ok: false,
-        status: 413,
-        message:
-          `file is ${meta.byteLength} bytes; getFile returns at most ${maxBytes}. ` +
-          "To send a staged file upstream, pass { file_handle, token } in codemode.request's " +
-          "`composed` segments or a `multipart[].staged` part instead of reading the bytes.",
+        ...known,
+        result: {
+          ok: false,
+          status: 413,
+          message:
+            `file is ${meta.byteLength} bytes; getFile returns at most ${maxBytes}. ` +
+            "To send a staged file upstream, pass { file_handle, token } in codemode.request's " +
+            "`composed` segments or a `multipart[].staged` part instead of reading the bytes.",
+        },
       };
     }
     const gated = await withTransferGate(deps, async (): Promise<GetFileResult> => {
@@ -88,6 +122,6 @@ export function createGetFileCapability(deps: GetFileCapabilityDeps) {
         bytesBase64: parts.join(""),
       };
     });
-    return gated.ok ? gated.value : gated;
+    return { ...known, result: gated.ok ? gated.value : gated };
   };
 }

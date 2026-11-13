@@ -35,6 +35,7 @@ export async function seedV1Row(
   const r2_key = newR2Key();
   r2.store.set(r2_key, ct);
   await insertClaimed(d1 as unknown as D1Database, {
+    owner: "user-A",
     token_hash: await sha256Bearer(token),
     file_handle: handle,
     r2_key,

@@ -8,7 +8,13 @@ export interface UnifyOptions {
 
 export interface InputDoc {
   paths: Record<string, unknown>;
-  components?: { schemas?: Record<string, unknown>; [k: string]: unknown };
+  /** `parameters` is inlined into operations by `inlineParameterRefs` before
+   *  `unify`; only `schemas` is carried into the merged spec. */
+  components?: {
+    schemas?: Record<string, unknown>;
+    parameters?: Record<string, unknown>;
+    [k: string]: unknown;
+  };
   [k: string]: unknown;
 }
 

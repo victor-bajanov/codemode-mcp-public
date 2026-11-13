@@ -2,7 +2,7 @@ import { parse as parseYaml } from "yaml";
 
 export function parseSpecYaml(content: string): {
   paths: Record<string, unknown>;
-  components?: { schemas?: Record<string, unknown> };
+  components?: { schemas?: Record<string, unknown>; parameters?: Record<string, unknown> };
   [k: string]: unknown;
 } {
   const doc = parseYaml(content);

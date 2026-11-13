@@ -218,6 +218,7 @@ describe("handleUpstreamRequest — upstream rate limits", () => {
         STAGING_R2: new FakeR2() as unknown as R2Bucket,
         config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 * 1024 },
         uploadOrigin: "https://x.test",
+        owner: "u1",
       },
     })) as Envelope;
 

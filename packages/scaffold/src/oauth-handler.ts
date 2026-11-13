@@ -10,7 +10,7 @@ import {
   clearCookie,
   consentKey,
   consentPageHeaders,
-  isKnownRedirectHost,
+  isKnownRedirectUri,
   randomId,
   randomNonce,
   readCookie,
@@ -34,6 +34,12 @@ const STATE_TOKEN_RE = /^[0-9a-f-]{36}$/i;
 const CONSENT_INVALID =
   "Consent expired or invalid. Start the connection again from your MCP client.";
 const STATE_INVALID = "State expired or invalid";
+/** A-6(4): answer to a `/callback` whose browser-binding cookie is missing or
+ *  wrong. The stash is already deleted, so the address is dead; the text tells
+ *  the user not to hand it to whoever asked for it. */
+const CALLBACK_WRONG_BROWSER =
+  "This sign-in could not be completed in this browser and has been cancelled. " +
+  "Do not share this page's address with anyone. Start the connection again from your MCP client.";
 
 type BaseEnv = {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -154,7 +160,7 @@ export function createOAuthHandler<
       redirectUri: oauthReqInfo.redirectUri,
       upstreamScopes: provider.oauth.scopes,
       token,
-      knownRedirectHost: isKnownRedirectHost(oauthReqInfo.redirectUri),
+      knownRedirect: isKnownRedirectUri(oauthReqInfo.redirectUri),
     });
     const cookie = setCookie(CONSENT_COOKIE_PREFIX + id, nonce, {
       maxAge: CONSENT_TTL_SEC,
@@ -269,13 +275,24 @@ export function createOAuthHandler<
     // written before the consent page existed TTL out within STATE_TTL_SEC
     // (sign-ins in flight at deploy time must restart).
     const stash = parseStash(stashed);
-    if (!stash) return c.text(STATE_INVALID, 400);
+    if (!stash) {
+      // A malformed stash has no legitimate completion.
+      await c.env.OAUTH_KV.delete(STATE_KV_PREFIX + stateToken);
+      return c.text(STATE_INVALID, 400);
+    }
     const authCookie = AUTH_COOKIE_PREFIX + stateToken;
     const binding = readCookie(c.req.raw, authCookie);
     if (!binding || (await sha256Base64Url(binding)) !== stash.bindingHash) {
-      // Refuse WITHOUT consuming the stash, so a request from another browser
-      // cannot burn the legitimate user's sign-in.
-      return c.text(STATE_INVALID, 400);
+      // A-6(4): refuse AND consume the stash, so the refused URL is not left
+      // redeemable by whoever holds the matching cookie (an attacker who
+      // talked the victim into sharing it). The upstream code is not spent:
+      // that would cost an upstream call carrying the client secret per
+      // forged request, and without the stash (PKCE verifier included) the
+      // code is useless here anyway. Accepted residual: a party who learns an
+      // in-flight state (only the IdP and the user's browser see it) can
+      // cancel that sign-in; the user restarts.
+      await c.env.OAUTH_KV.delete(STATE_KV_PREFIX + stateToken);
+      return c.text(CALLBACK_WRONG_BROWSER, 400);
     }
     // Residual (accepted): the same browser double-submitting /callback within
     // KV propagation can still pass twice; the upstream's single-use code

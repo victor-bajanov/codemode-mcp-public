@@ -86,6 +86,7 @@ function world() {
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
     uploadOrigin: "https://x.test",
+    owner: "user-A",
     now: () => NOW,
   };
   const opener = createStagedFileOpener(deps);
@@ -302,6 +303,7 @@ describe("D1 — getFile and stageFromUpstreamJson caps", () => {
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { ...CFG, maxBytes },
       uploadOrigin: "https://x.test",
+      owner: "user-A",
       now: () => NOW,
     };
     const putFile = createPutFileCapability(deps);
@@ -349,6 +351,7 @@ describe("D1 — getFile and stageFromUpstreamJson caps", () => {
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { ...CFG, maxBytes },
       uploadOrigin: "https://x.test",
+      owner: "user-A",
       now: () => NOW,
     });
     const encrypt = vi.spyOn(crypto.subtle, "encrypt");

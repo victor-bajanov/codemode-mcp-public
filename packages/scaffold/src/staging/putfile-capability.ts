@@ -1,14 +1,23 @@
+import { stagingAuditEntry, type AuditSink } from "../audit.js";
 import type { StagingConfig } from "./types";
 import { blockSourceFromBase64, stageFromBlocks } from "./staged-file";
 import { withTransferGate, type TransferGateDeps } from "./gate-dep";
 
-export type PutFileCapabilityDeps = PutFileStoreDeps & TransferGateDeps;
+export type PutFileCapabilityDeps = PutFileStoreDeps &
+  TransferGateDeps & {
+    /** E-1: one `staging.store` line per call when given. */
+    audit?: AuditSink;
+    /** The line's `path`: "__stagingHost.putFile" (default) or "__stagingHost.stageFromUpstreamJson". */
+    auditPath?: string;
+  };
 
 export interface PutFileStoreDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
   uploadOrigin: string;
+  /** E-1: the principal the stored row belongs to. */
+  owner: string;
   /** Test seam. */
   now?: () => number;
 }
@@ -21,6 +30,8 @@ export type PutFileResult =
       fetch_url: string;
       expires_at: number;
       byte_length: number;
+      /** Audit correlation id of the stored file (non-secret; E-1). */
+      file_ref: string;
     }
   | { ok: false; status: number; message: string };
 
@@ -53,6 +64,8 @@ export type PutFileResult =
  * `/staging/fetch/*` call.
  */
 export function createPutFileCapability(deps: PutFileCapabilityDeps) {
+  const store = storeOnce(deps);
+  const path = deps.auditPath ?? "__stagingHost.putFile";
   return async function putFile(
     bytesBase64: string,
     contentType: string,
@@ -61,6 +74,29 @@ export function createPutFileCapability(deps: PutFileCapabilityDeps) {
      *  converted copy. The sandbox wrapper forwards only the first three
      *  arguments; either alphabet is equally safe. */
     alphabet: "std" | "url" = "std",
+  ): Promise<PutFileResult> {
+    const out = await store(bytesBase64, contentType, filename, alphabet);
+    // E-1: one line per call; never the handle or token, only the file's digest.
+    deps.audit?.(
+      stagingAuditEntry({
+        method: "HOST",
+        path,
+        operationId: "staging.store",
+        allowed: out.ok,
+        event: "store",
+        ...(out.ok ? { fileRef: out.file_ref, byteLength: out.byte_length, status: 200 } : { status: out.status }),
+      }),
+    );
+    return out;
+  };
+}
+
+function storeOnce(deps: PutFileCapabilityDeps) {
+  return async function store(
+    bytesBase64: string,
+    contentType: string,
+    filename: string | null,
+    alphabet: "std" | "url",
   ): Promise<PutFileResult> {
     if (typeof bytesBase64 !== "string") {
       return { ok: false, status: 400, message: "bytesBase64 must be a string" };

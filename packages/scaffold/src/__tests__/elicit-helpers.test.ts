@@ -12,14 +12,21 @@ describe("clientSupportsElicitation", () => {
     expect(clientSupportsElicitation(server)).toBe(false);
   });
 
+  for (const elicitation of [false, true, 0, 1, "yes", null]) {
+    it(`FIXED (D-1): false when .elicitation is ${JSON.stringify(elicitation)} (the capability must be an object)`, () => {
+      const server = { server: { getClientCapabilities: () => ({ elicitation }) } };
+      expect(clientSupportsElicitation(server)).toBe(false);
+    });
+  }
+
   it("false when getClientCapabilities returns undefined", () => {
     const server = { server: { getClientCapabilities: () => undefined } };
     expect(clientSupportsElicitation(server)).toBe(false);
   });
 
-  it("true (fail-open) when accessor missing — let elicitInput itself reject", () => {
-    const server = { server: {} };
-    expect(clientSupportsElicitation(server)).toBe(true);
+  it("false (fail-closed) when the accessor is missing — a client that cannot be asked is denied", () => {
+    expect(clientSupportsElicitation({ server: {} })).toBe(false);
+    expect(clientSupportsElicitation({})).toBe(false);
   });
 
   it("preserves `this` binding when calling getClientCapabilities (regression: detached method)", () => {

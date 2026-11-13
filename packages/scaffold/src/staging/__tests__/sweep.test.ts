@@ -12,10 +12,12 @@ describe("runSweep", () => {
     const freshHash = new Uint8Array(32).fill(2);
 
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: expiredHash, file_handle: "fh_old", content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 200,
     });
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: freshHash, file_handle: "fh_new", content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 9999,
     });
@@ -39,6 +41,7 @@ describe("runSweep", () => {
     const d1 = new FakeD1();
     const r2 = new FakeR2();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: new Uint8Array(32).fill(3), file_handle: "fh_dead", content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 200,
     });
@@ -53,6 +56,7 @@ describe("runSweep", () => {
     const d1 = new FakeD1();
     const r2 = new FakeR2();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: new Uint8Array(32).fill(4), file_handle: "fh_live", content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 9999,
     });

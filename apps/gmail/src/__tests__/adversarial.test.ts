@@ -37,7 +37,10 @@ const baseScaffoldArgs = {
   props: baseProps,
   apiBaseUrl: "https://gmail.googleapis.com",
   deploymentName: "gmail-test",
-  server: {} as never,
+  // A client that advertises elicitation but whose server object has no
+  // `elicitInput`: approval ops end in `transport-error`. (A stub with no
+  // capabilities accessor at all is fail-closed: `unsupported`.)
+  server: { server: { getClientCapabilities: () => ({ elicitation: {} }) } } as never,
   oauth: {
     refreshTokenAccessor: (p: typeof baseProps) => p.refreshToken,
     userIdAccessor: (p: typeof baseProps) => p.userId,
@@ -81,10 +84,16 @@ describe("adversarial: surface-review enforcement", () => {
   it("Tier 2 (elicit) ops route through runElicitation; fail with transport-error when server stub lacks elicitInput", async () => {
     // messages.send is now `allow + inspect` (Task 9). Use messages.import,
     // which is still `elicit`, to cover the elicit path via runElicitation.
+    // Its inspector (inspectMessageImport) refuses a body without `raw` before
+    // the elicit, so send a valid message for the dialog to describe.
+    const raw = Buffer.from(
+      "From: a@corp.example\r\nTo: b@corp.example\r\nSubject: s\r\nDate: Mon, 9 Nov 2026 09:00:00 +1100\r\n\r\nx\r\n",
+      "utf8",
+    ).toString("base64url");
     await expect(
       handleUpstreamRequest({
         ...baseScaffoldArgs,
-        ctx: { method: "POST", path: "/gmail/v1/users/me/messages/import" },
+        ctx: { method: "POST", path: "/gmail/v1/users/me/messages/import", body: { raw } },
       }),
     ).rejects.toThrow(/requires user approval/);
     expect(globalThis.fetch).not.toHaveBeenCalled();
@@ -286,6 +295,7 @@ function composedWorld(): ComposedWorld {
     STAGING_R2: r2 as unknown as R2Bucket,
     config: STAGING_CFG,
     uploadOrigin: "https://x.test",
+    owner: "user-A",
     now: () => STAGING_NOW,
   };
   const opener = staging.createStagedFileOpener(deps);

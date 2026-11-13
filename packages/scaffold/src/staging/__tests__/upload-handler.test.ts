@@ -4,7 +4,8 @@ import { FakeR2 } from "./__fixtures__/fake-r2";
 import { handleUpload } from "../upload-handler";
 import { insertPending } from "../repo";
 import { mintToken, mintFileHandle } from "../tokens";
-import { sha256Bearer } from "../crypto";
+import { fileRefOf, sha256Bearer } from "../crypto";
+import type { AuditSink } from "../../audit";
 import type { StagingConfig } from "../types";
 
 const CFG: StagingConfig = { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 };
@@ -18,6 +19,7 @@ async function seedPending(now: number, expires: number, opts?: { contentTypeHin
   const handle = mintFileHandle();
   const token_hash = await sha256Bearer(token);
   await insertPending(d1 as unknown as D1Database, {
+    owner: "user-A",
     token_hash, file_handle: handle, content_type_hint: opts?.contentTypeHint ?? null,
     expected_byte_len: null, filename: null, created_at: now, expires_at: expires,
   });
@@ -249,6 +251,7 @@ describe("handleUpload — v2 block format", () => {
   async function readBack(ctx: Ctx, now: number): Promise<Uint8Array> {
     const { createStagedFileOpener } = await import("../staged-file");
     const open = createStagedFileOpener({
+      owner: "user-A",
       STAGING_D1: ctx.d1 as unknown as D1Database, STAGING_R2: ctx.r2 as unknown as R2Bucket,
       config: CFG, now: () => now + 2,
     });
@@ -489,5 +492,90 @@ describe("handleUpload — Mythos re-review fixes", () => {
     } finally {
       release();
     }
+  });
+});
+
+// E-1 (2026-11 review): pre-fix the upload route wrote no audit line. It stays bearer-only
+// (the user's own out-of-band curl), but each outcome after the row lookup is now logged with
+// the owner recorded by register_file_handle.
+describe("handleUpload — staging.upload audit (E-1)", () => {
+  type Line = Parameters<AuditSink>[0];
+  const up = (token: string, body: Uint8Array) =>
+    new Request("https://w/staging/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Length": String(body.byteLength) },
+      body,
+    });
+
+  it("FIXED (E-1): a 204 logs the row owner as principal, its fileRef and byteLength", async () => {
+    const now = nowSec();
+    const { d1, r2, token, handle } = await seedPending(now, now + 300);
+    const lines: Line[] = [];
+    const res = await handleUpload(up(token, new Uint8Array([1, 2, 3])), {
+      STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG,
+      now: () => now + 1, audit: (e) => { lines.push(e); },
+    });
+    expect(res.status).toBe(204);
+    expect(lines).toEqual([{
+      method: "POST", path: "/staging/upload", operationId: "staging.upload", decision: "allow",
+      principalId: "user-A",
+      staging: { event: "upload", fileRef: await fileRefOf(handle), byteLength: 3, status: 204 },
+    }]);
+    expect(JSON.stringify(lines)).not.toContain(handle);
+    expect(JSON.stringify(lines)).not.toContain(token);
+  });
+
+  it("FIXED (E-1): a refused upload of a known row (already claimed) logs a deny with the owner", async () => {
+    const now = nowSec();
+    const { d1, r2, token, handle } = await seedPending(now, now + 300);
+    const deps = { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => now + 1 };
+    expect((await handleUpload(up(token, new Uint8Array([1])), deps)).status).toBe(204);
+    const lines: Line[] = [];
+    const res = await handleUpload(up(token, new Uint8Array([1])), { ...deps, audit: (e) => { lines.push(e); } });
+    expect(res.status).toBe(409);
+    expect(lines).toEqual([{
+      method: "POST", path: "/staging/upload", operationId: "staging.upload", decision: "deny",
+      reason: "staging-refused", principalId: "user-A",
+      staging: { event: "upload", fileRef: await fileRefOf(handle), status: 409 },
+    }]);
+  });
+
+  it("FIXED (E-1): an unknown token (403) logs no principal and no fileRef; a missing bearer logs nothing", async () => {
+    const now = nowSec();
+    const { d1, r2 } = await seedPending(now, now + 300);
+    const lines: Line[] = [];
+    const deps = {
+      STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG,
+      now: () => now + 1, audit: ((e) => { lines.push(e); }) as AuditSink,
+    };
+    expect((await handleUpload(up(mintToken(), new Uint8Array([1])), deps)).status).toBe(403);
+    expect(lines).toEqual([{
+      method: "POST", path: "/staging/upload", operationId: "staging.upload", decision: "deny",
+      reason: "staging-refused", staging: { event: "upload", status: 403 },
+    }]);
+    const noBearer = new Request("https://w/staging/upload", { method: "POST", body: new Uint8Array([1]) });
+    expect((await handleUpload(noBearer, deps)).status).toBe(403);
+    expect(lines).toHaveLength(1);
+  });
+});
+
+describe("handleUpload — a thrown store failure is still audited (E-1)", () => {
+  it("logs a 500 deny line, then rethrows", async () => {
+    const now = nowSec();
+    const { d1, r2, token } = await seedPending(now, now + 300);
+    const lines: Parameters<AuditSink>[0][] = [];
+    const real = d1.prepare.bind(d1);
+    d1.prepare = (sql: string) => {
+      if (sql.includes("state='claimed'")) throw new Error("d1 down");
+      return real(sql);
+    };
+    await expect(handleUpload(
+      new Request("https://w/staging/upload", {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Length": "1" }, body: new Uint8Array([1]),
+      }),
+      { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => now + 1, audit: (e) => { lines.push(e); } },
+    )).rejects.toThrow("d1 down");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ decision: "deny", principalId: "user-A", staging: { event: "upload", status: 500 } });
   });
 });

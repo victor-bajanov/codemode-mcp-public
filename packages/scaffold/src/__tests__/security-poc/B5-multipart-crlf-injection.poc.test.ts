@@ -143,7 +143,7 @@ describe("B5 — non-string multipart fields (FIXED F-11, review round 1)", () =
 describe("B5 — top-level header CRLF is rejected by fetch (REFUTED)", () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-  it("contentType with CRLF throws at fetch() (Headers validation), after surface review but before any bytes are sent", async () => {
+  it("contentType with CRLF is refused at handler entry (media-type grammar, C-4), before any bytes are sent", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const sent: unknown[] = [];
     // Use the real global fetch's Headers validation by constructing a Request.
@@ -155,7 +155,7 @@ describe("B5 — top-level header CRLF is rejected by fetch (REFUTED)", () => {
       props: { userId: "u", refreshToken: "r" }, server: {} as never,
       oauth: { refreshTokenAccessor: () => "r", userIdAccessor: () => "u", broker: { async getOrRefreshAccessToken() { return "AT"; } } },
       audit: {}, env: {},
-    })).rejects.toThrow(/invalid|Invalid/);
+    })).rejects.toThrow(/`contentType` must be a media type/);
     expect(sent).toHaveLength(0);
   });
 });

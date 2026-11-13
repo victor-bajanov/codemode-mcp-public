@@ -6,7 +6,9 @@
 
 import { describe, it, expect } from "vitest";
 import { surfaceReview } from "../surface-review";
-import { inspectEventAttendees } from "../inspectors/calendar-attendees";
+import { inspectEventAttendees, inspectEventImport, inspectEventPatch } from "../inspectors/calendar-attendees";
+import { inspectStoredEvent, inspectStoredEventPatch } from "../inspectors/calendar-stored-event";
+import { inspectEventMove } from "../inspectors/calendar-move";
 
 describe("calendar surface-review tiering", () => {
   it("exposes the read surface as allow/standard_read", () => {
@@ -28,20 +30,43 @@ describe("calendar surface-review tiering", () => {
   });
 
   it("gates attendee-bearing event writes with the attendee inspector", () => {
-    for (const id of ["calendar.events.insert", "calendar.events.update", "calendar.events.patch"]) {
+    for (const id of ["calendar.events.insert", "calendar.events.update"]) {
       const entry = surfaceReview[id];
       expect(entry?.decision, id).toBe("allow");
       expect(entry?.inspect, id).toBe(inspectEventAttendees);
     }
+    // patch defers an attendees-only (RSVP-shaped) body to its upstream hook.
+    expect(surfaceReview["calendar.events.patch"]?.decision).toBe("allow");
+    expect(surfaceReview["calendar.events.patch"]?.inspect).toBe(inspectEventPatch);
   });
 
-  it("allows attendee-free event writes without an inspector", () => {
-    for (const id of ["calendar.events.move", "calendar.events.quickAdd"]) {
-      const entry = surfaceReview[id];
-      expect(entry?.decision, id).toBe("allow");
-      expect(entry?.category, id).toBe("standard_write");
-      expect(entry?.inspect, id).toBeUndefined();
-    }
+  it("FIXED (F1-2b): update and patch read the stored event before deciding; insert does not", () => {
+    expect(surfaceReview["calendar.events.update"]?.inspectUpstream).toBe(inspectStoredEvent);
+    expect(surfaceReview["calendar.events.patch"]?.inspectUpstream).toBe(inspectStoredEventPatch);
+    expect(surfaceReview["calendar.events.insert"]?.inspectUpstream).toBeUndefined();
+    expect(surfaceReview["calendar.events.import"]?.inspectUpstream).toBeUndefined();
+  });
+
+  it("FIXED (F1-2d): events.move is inspected (source and destination calendars allow-listed)", () => {
+    const entry = surfaceReview["calendar.events.move"];
+    expect(entry?.decision).toBe("allow");
+    expect(entry?.inspect).toBe(inspectEventMove);
+    expect(entry?.clientNote).toMatch(/CALENDAR_WRITE_ALLOWLIST/);
+  });
+
+  it("FIXED (F1-2e): events.quickAdd is denied outright, with reasoning and no note", () => {
+    const entry = surfaceReview["calendar.events.quickAdd"];
+    expect(entry).toMatchObject({ decision: "deny", category: "external_data_flow" });
+    expect(entry?.reasoning).toMatch(/events\.insert/);
+    expect(entry?.inspect).toBeUndefined();
+    expect(entry?.clientNote).toBeUndefined();
+  });
+
+  // The hook reads through calendar.events.get, which must stay a plain allow
+  // (the lookup refuses anything else and the write is then denied).
+  it("the stored-event read is a plain-allow GET", () => {
+    const get = surfaceReview["calendar.events.get"];
+    expect(get).toEqual({ decision: "allow", category: "standard_read" });
   });
 
   it("elicits on import (external data) and delete (irreversible)", () => {
@@ -50,7 +75,7 @@ describe("calendar surface-review tiering", () => {
       category: "external_data_flow",
     });
     // import also carries the attendee inspector so off-allowlist invitees escalate to deny
-    expect(surfaceReview["calendar.events.import"]?.inspect).toBe(inspectEventAttendees);
+    expect(surfaceReview["calendar.events.import"]?.inspect).toBe(inspectEventImport);
     expect(surfaceReview["calendar.events.delete"]).toMatchObject({
       decision: "elicit",
       category: "irreversible",

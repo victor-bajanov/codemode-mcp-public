@@ -57,7 +57,7 @@ async function world(cfg: StagingConfig = CFG): Promise<World> {
   };
   const D1 = d1 as unknown as D1Database;
   const R2 = r2 as unknown as R2Bucket;
-  const tool = registerFileHandleTool({ STAGING_D1: D1, config: cfg, uploadOrigin: "https://w", now: () => NOW });
+  const tool = registerFileHandleTool({ STAGING_D1: D1, config: cfg, uploadOrigin: "https://w", owner: "user-A", now: () => NOW });
   const { token, file_handle } = await tool.handler({});
   return {
     d1,

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   sha256Bearer,
   deriveContentKey,
+  fileRefOf,
 } from "../crypto";
 import { HKDF_INFO_V2 } from "../block-format";
 import { mintToken, mintFileHandle, decodeTokenSecret, decodeHandleBytes } from "../tokens";
@@ -81,5 +82,23 @@ describe("deriveContentKey", () => {
     );
     await expect(crypto.subtle.decrypt({ name: "AES-GCM", iv }, k2, ct1))
       .rejects.toThrow();
+  });
+});
+
+describe("fileRefOf (E-1 audit correlation id)", () => {
+  it("is the first 6 bytes of SHA-256(handle) as 12 lower-case hex chars", async () => {
+    const handle = mintFileHandle();
+    const ref = await fileRefOf(handle);
+    expect(ref).toMatch(/^[0-9a-f]{12}$/);
+    const full = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(handle))).toString("hex");
+    expect(ref).toBe(full.slice(0, 12));
+    expect(ref).not.toContain(handle);
+  });
+
+  it("is deterministic per handle and differs between handles", async () => {
+    const a = mintFileHandle();
+    const b = mintFileHandle();
+    expect(await fileRefOf(a)).toBe(await fileRefOf(a));
+    expect(await fileRefOf(a)).not.toBe(await fileRefOf(b));
   });
 });

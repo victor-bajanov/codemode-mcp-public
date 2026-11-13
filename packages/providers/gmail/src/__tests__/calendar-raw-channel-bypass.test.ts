@@ -9,7 +9,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleUpstreamRequest, type UpstreamCtx } from "@local/scaffold";
 import { gmailProvider } from "../index";
 
-const ENV = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@allowed.example" };
+const ENV = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@allowed.example", CALENDAR_WRITE_ALLOWLIST: "primary" };
 const EVENT = {
   summary: "x",
   start: { dateTime: "2026-10-09T10:00:00Z" },

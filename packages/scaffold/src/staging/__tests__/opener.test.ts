@@ -13,7 +13,7 @@ import {
 } from "../staged-file";
 import { BLOCK_BYTES } from "../block-format";
 import { insertPending, lookupByHash } from "../repo";
-import { sha256Bearer } from "../crypto";
+import { fileRefOf, sha256Bearer } from "../crypto";
 import { mintFileHandle, mintToken } from "../tokens";
 import type { StagingConfig } from "../types";
 
@@ -32,6 +32,7 @@ function setup(now = NOW) {
   const d1 = new FakeD1();
   const r2 = new FakeR2();
   const open = createStagedFileOpener({
+    owner: "user-A",
     STAGING_D1: d1 as unknown as D1Database,
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
@@ -40,6 +41,7 @@ function setup(now = NOW) {
   const stage = async (bytes: Uint8Array, ct = "application/pdf", filename: string | null = "q.pdf") => {
     const out = await stageFromBlocks(
       {
+        owner: "user-A",
         STAGING_D1: d1 as unknown as D1Database,
         STAGING_R2: r2 as unknown as R2Bucket,
         config: CFG,
@@ -114,6 +116,7 @@ describe("createStagedFileOpener — resolution (D1 only)", () => {
     const { open, d1 } = setup();
     const ref = { file_handle: mintFileHandle(), token: mintToken() };
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: await sha256Bearer(ref.token), file_handle: ref.file_handle, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: NOW, expires_at: NOW + 300,
     });
@@ -126,6 +129,7 @@ describe("createStagedFileOpener — resolution (D1 only)", () => {
     const s = setup();
     const ref = await s.stage(pattern(4));
     const later = createStagedFileOpener({
+      owner: "user-A",
       STAGING_D1: s.d1 as unknown as D1Database,
       STAGING_R2: s.r2 as unknown as R2Bucket,
       config: CFG,
@@ -161,7 +165,9 @@ describe("createStagedFileOpener — v2 reads", () => {
     const x = pattern(2 * BLOCK_BYTES + 5);
     const ref = await stage(x, "application/pdf", "q.pdf");
     const r = await open(ref);
-    expect(r.ok && r.file.meta).toEqual({ byteLength: x.byteLength, contentType: "application/pdf", filename: "q.pdf" });
+    expect(r.ok && r.file.meta).toEqual({
+      byteLength: x.byteLength, contentType: "application/pdf", filename: "q.pdf", fileRef: await fileRefOf(ref.file_handle),
+    });
     const { blocks, indices } = await readAll(r);
     expect(blocks.map((b) => b.byteLength)).toEqual([BLOCK_BYTES, BLOCK_BYTES, 5]);
     expect(indices).toEqual([0, 1, 2]);

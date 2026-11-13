@@ -4,6 +4,7 @@ import { FakeR2 } from "./__fixtures__/fake-r2";
 import { createPutFileCapability } from "../putfile-capability";
 import { handleFetch } from "../fetch-handler";
 import type { StagingConfig } from "../types";
+import type { AuditSink } from "../../audit";
 
 const CFG: StagingConfig = {
   uploadTtlSeconds: 300,
@@ -15,6 +16,7 @@ function makeDeps(now: number) {
   const d1 = new FakeD1();
   const r2 = new FakeR2();
   const putFile = createPutFileCapability({
+    owner: "user-A",
     STAGING_D1: d1 as unknown as D1Database,
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
@@ -123,6 +125,7 @@ describe("createPutFileCapability — bad inputs", () => {
     const d1 = new FakeD1();
     const r2 = new FakeR2();
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 4 },
@@ -145,6 +148,7 @@ describe("createPutFileCapability — bad inputs", () => {
     function smallCap(maxBytes: number) {
       const r2 = new FakeR2();
       const putFile = createPutFileCapability({
+        owner: "user-A",
         STAGING_D1: new FakeD1() as unknown as D1Database,
         STAGING_R2: r2 as unknown as R2Bucket,
         config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes },
@@ -253,6 +257,7 @@ describe("createPutFileCapability — backend failures", () => {
       store: inner.store,
     };
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -299,6 +304,7 @@ describe("createPutFileCapability — backend failures", () => {
     };
 
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -349,6 +355,7 @@ describe("createPutFileCapability — v2", () => {
     const gate = new FakeGate();
     const runKey = {};
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       STAGING_R2: new FakeR2() as unknown as R2Bucket,
       config: CFG,
@@ -393,6 +400,7 @@ describe("gate deps typing (F6)", () => {
       STAGING_R2: new FakeR2() as unknown as R2Bucket,
       config: CFG,
       uploadOrigin: "https://x.test",
+      owner: "user-A",
     };
     // @ts-expect-error a gate needs the run context it is keyed by
     createPutFileCapability({ ...base, transferGate: new FakeGate() });
@@ -422,5 +430,56 @@ describe("createPutFileCapability — undeterminable-length base64 while the slo
     } finally {
       release();
     }
+  });
+});
+
+// E-1 (2026-11 review): pre-fix `putFile` wrote no audit line, so 25 files could be staged in
+// one run (and handed out as fetch_urls) without a trace. Each call now logs one
+// `staging.store` line.
+describe("createPutFileCapability — staging.store audit (E-1)", () => {
+  type Line = Parameters<AuditSink>[0];
+  function audited(auditPath?: string) {
+    const lines: Line[] = [];
+    const d1 = new FakeD1();
+    const putFile = createPutFileCapability({
+      owner: "user-A",
+      STAGING_D1: d1 as unknown as D1Database,
+      STAGING_R2: new FakeR2() as unknown as R2Bucket,
+      config: CFG,
+      uploadOrigin: "https://x.test",
+      now: () => 1_700_000_000,
+      audit: (e) => { lines.push(e); },
+      ...(auditPath ? { auditPath } : {}),
+    });
+    return { lines, putFile, d1 };
+  }
+
+  it("FIXED (E-1): a store logs path __stagingHost.putFile, its fileRef and byteLength; never the handle or token", async () => {
+    const { lines, putFile } = audited();
+    const out = await putFile(bytesToBase64(new Uint8Array([1, 2, 3, 4])), "text/plain", null);
+    if (!out.ok) throw new Error("store failed");
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.putFile", operationId: "staging.store", decision: "allow",
+      staging: { event: "store", fileRef: out.file_ref, byteLength: 4, status: 200 },
+    }]);
+    expect(out.file_ref).toMatch(/^[0-9a-f]{12}$/);
+    const s = JSON.stringify(lines);
+    expect(s).not.toContain(out.file_handle);
+    expect(s).not.toContain(out.token);
+  });
+
+  it("FIXED (E-1): a refused store logs a deny with its status", async () => {
+    const { lines, putFile } = audited();
+    await putFile("QUJD\nREVG", "text/plain", null);
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.putFile", operationId: "staging.store", decision: "deny",
+      reason: "staging-refused", staging: { event: "store", status: 400 },
+    }]);
+  });
+
+  it("the ungated instance under stageFromUpstreamJson logs under its own path", async () => {
+    const { lines, putFile } = audited("__stagingHost.stageFromUpstreamJson");
+    await putFile(bytesToBase64(new Uint8Array([1])), "text/plain", null);
+    expect(lines[0]!.path).toBe("__stagingHost.stageFromUpstreamJson");
   });
 });

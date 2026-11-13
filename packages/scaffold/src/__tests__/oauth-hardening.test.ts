@@ -1,19 +1,24 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   checkRateLimit,
   classifyHardenedRequest,
   clientIdentity,
   withNoStore,
   tooManyRequestsResponse,
+  payloadTooLargeResponse,
   enforceOAuthHardening,
-  stampClientRegistration,
+  readBodyCapped,
+  refreshClientTtl,
   validateRegistrationRedirectUris,
   checkFailureBudget,
   recordFailure,
   enforceStagingThrottle,
-  CLIENT_STAMP_PREFIX,
+  MAX_FORM_BODY_BYTES,
+  MAX_REGISTRATION_BODY_BYTES,
+  type HardeningConfig,
   type RateLimitStore,
 } from "../oauth-hardening";
+import { CHUNK, meteredBody } from "./oauth-worker-harness";
 
 function fakeStore(): RateLimitStore & { data: Map<string, string> } {
   const data = new Map<string, string>();
@@ -29,7 +34,36 @@ function fakeStore(): RateLimitStore & { data: Map<string, string> } {
 }
 
 const CFG = { limit: 3, windowSeconds: 60 };
-const HCFG = { register: CFG, token: CFG };
+const TTL = { registeredSeconds: 1000, activeSeconds: 5000 };
+const HCFG: HardeningConfig = {
+  register: CFG,
+  token: CFG,
+  authorize: CFG,
+  callback: CFG,
+  clientTtl: TTL,
+};
+
+/** A store that also records the put options (the client TTL lives there). */
+function optsStore(): RateLimitStore & {
+  data: Map<string, string>;
+  opts: Map<string, { expirationTtl?: number } | undefined>;
+} {
+  const data = new Map<string, string>();
+  const opts = new Map<string, { expirationTtl?: number } | undefined>();
+  return {
+    data,
+    opts,
+    async get(k: string) {
+      return data.get(k) ?? null;
+    },
+    async put(k: string, v: string, o?: { expirationTtl?: number }) {
+      data.set(k, v);
+      opts.set(k, o);
+    },
+  };
+}
+
+
 
 describe("checkRateLimit (fixed window counter)", () => {
   it("allows up to the limit then blocks the next request", async () => {
@@ -81,6 +115,21 @@ describe("classifyHardenedRequest", () => {
     expect(
       classifyHardenedRequest(new Request("https://x.test/token", { method: "POST" })),
     ).toBe("token");
+  });
+
+  it("FIXED (A-3): matches GET/HEAD/POST /authorize and GET/HEAD /callback", () => {
+    const c = (path: string, method: string) =>
+      classifyHardenedRequest(new Request(`https://x.test${path}`, { method }));
+    expect(c("/authorize", "GET")).toBe("authorize");
+    expect(c("/authorize", "HEAD")).toBe("authorize");
+    expect(c("/authorize", "POST")).toBe("authorize");
+    expect(c("/callback", "GET")).toBe("callback");
+    expect(c("/callback", "HEAD")).toBe("callback");
+    // Other methods pass through (Hono answers them); sub paths are not the endpoint.
+    expect(c("/authorize", "PUT")).toBeNull();
+    expect(c("/callback", "POST")).toBeNull();
+    expect(c("/authorize/x", "GET")).toBeNull();
+    expect(c("/callback/x", "GET")).toBeNull();
   });
 
   it("ignores non-POST methods and unrelated / sub paths", () => {
@@ -150,10 +199,11 @@ describe("validateRegistrationRedirectUris (F-2)", () => {
       headers: { "content-type": "application/json", ...headers },
       body: typeof body === "string" ? body : JSON.stringify(body),
     });
+  const text = (body: unknown) => (typeof body === "string" ? body : JSON.stringify(body));
 
   it("rejects an http:// redirect URI on a non-loopback host with a no-store 400", async () => {
-    const res = await validateRegistrationRedirectUris(
-      reg({ redirect_uris: ["https://claude.ai/cb", "http://attacker.example/collect"] }),
+    const res = validateRegistrationRedirectUris(
+      text({ redirect_uris: ["https://claude.ai/cb", "http://attacker.example/collect"] }),
     );
     expect(res).not.toBeNull();
     expect(res!.status).toBe(400);
@@ -165,8 +215,8 @@ describe("validateRegistrationRedirectUris (F-2)", () => {
   });
 
   it("accepts https:// and loopback http:// URIs", async () => {
-    const res = await validateRegistrationRedirectUris(
-      reg({
+    const res = validateRegistrationRedirectUris(
+      text({
         redirect_uris: [
           "https://claude.ai/api/mcp/auth_callback",
           "http://localhost:6274/oauth/callback",
@@ -178,21 +228,44 @@ describe("validateRegistrationRedirectUris (F-2)", () => {
     expect(res).toBeNull();
   });
 
-  it("leaves non-JSON, oversized, non-array and custom-scheme bodies to the library", async () => {
-    expect(await validateRegistrationRedirectUris(reg("not json"))).toBeNull();
-    expect(await validateRegistrationRedirectUris(reg({ redirect_uris: "http://attacker.example" }))).toBeNull();
-    expect(await validateRegistrationRedirectUris(reg({ redirect_uris: ["cursor://anysphere.cursor-retrieval/cb", "::bad::", 7] }))).toBeNull();
-    expect(
-      await validateRegistrationRedirectUris(
-        reg({ redirect_uris: ["http://attacker.example/x"] }, { "content-length": String(2 * 1024 * 1024) }),
-      ),
-    ).toBeNull();
+  it("leaves non-JSON, non-array and custom-scheme bodies to the library", async () => {
+    expect(validateRegistrationRedirectUris("not json")).toBeNull();
+    expect(validateRegistrationRedirectUris(text({ redirect_uris: "http://attacker.example" }))).toBeNull();
+    expect(validateRegistrationRedirectUris(text({ redirect_uris: ["cursor://anysphere.cursor-retrieval/cb", "::bad::", 7] }))).toBeNull();
   });
 
-  it("leaves the original request body readable", async () => {
-    const req = reg({ redirect_uris: ["https://claude.ai/cb"] });
-    await validateRegistrationRedirectUris(req);
-    expect(await req.json()).toEqual({ redirect_uris: ["https://claude.ai/cb"] });
+  it("FIXED (A-3): a registration body over 1 MiB is 413 from the wrapper; the library is not called", async () => {
+    const store = fakeStore();
+    let called = 0;
+    const handler = async () => { called += 1; return new Response("{}", { status: 201 }); };
+    // Declared length over the cap (the pre-fix code handed this to the library).
+    const declared = await enforceOAuthHardening(
+      reg({ redirect_uris: ["http://attacker.example/x"] }, {
+        "content-length": String(2 * 1024 * 1024),
+        "CF-Connecting-IP": "1.1.1.9",
+      }),
+      store, HCFG, 1_000, handler,
+    );
+    expect(declared.status).toBe(413);
+    // No declared length, 1 MiB + 1 byte of real body.
+    const over = await enforceOAuthHardening(
+      reg("a".repeat(MAX_REGISTRATION_BODY_BYTES + 1), { "CF-Connecting-IP": "1.1.1.8" }),
+      store, HCFG, 1_000, handler,
+    );
+    expect(over.status).toBe(413);
+    expect(called).toBe(0);
+  });
+
+  it("leaves the original request body readable for the handler", async () => {
+    const store = fakeStore();
+    let seen: unknown = null;
+    const res = await enforceOAuthHardening(
+      reg({ redirect_uris: ["https://claude.ai/cb"] }, { "CF-Connecting-IP": "1.1.1.7" }),
+      store, HCFG, 1_000,
+      async (r) => { seen = await r.json(); return new Response("{}", { status: 400 }); },
+    );
+    expect(res.status).toBe(400);
+    expect(seen).toEqual({ redirect_uris: ["https://claude.ai/cb"] });
   });
 
   it("enforceOAuthHardening refuses the bad registration without calling the handler", async () => {
@@ -402,7 +475,7 @@ describe("enforceOAuthHardening (composition)", () => {
 
   it("applies register and token limits independently", async () => {
     const store = fakeStore();
-    const cfg = { register: { limit: 1, windowSeconds: 300 }, token: { limit: 3, windowSeconds: 60 } };
+    const cfg = { ...HCFG, register: { limit: 1, windowSeconds: 300 }, token: { limit: 3, windowSeconds: 60 } };
     const handler = async () => new Response("{}", { status: 200 });
     const reg = () =>
       new Request("https://x.test/register", { method: "POST", headers: { "CF-Connecting-IP": "7.7.7.7" } });
@@ -422,61 +495,409 @@ describe("enforceOAuthHardening (composition)", () => {
   });
 });
 
-describe("stampClientRegistration", () => {
-  it("writes a registeredAt stamp keyed by client_id", async () => {
-    const store = fakeStore();
-    await stampClientRegistration(store, JSON.stringify({ client_id: "cid-1" }), 12345);
-    const raw = store.data.get(`${CLIENT_STAMP_PREFIX}cid-1`);
-    expect(raw).toBeDefined();
-    expect(JSON.parse(raw!)).toEqual({ registeredAt: 12345 });
+
+// A-3 (2026-11 review): the library buffers request bodies whole, and the
+// pre-fix wrapper read a whole `POST /register` body (tee'd) before checking
+// its length; `POST /authorize` and `POST /token` had no bound at all. The
+// wrapper now reads every hardened body with a streaming cap and answers 413
+// before the handler runs.
+describe("readBodyCapped (A-3)", () => {
+  it("FIXED (A-3): a declared Content-Length over the cap is refused without touching the body", async () => {
+    const body = meteredBody(24 * 1024 * 1024);
+    const req = new Request("https://x.test/register", {
+      method: "POST",
+      headers: { "content-length": String(24 * 1024 * 1024) },
+      body: body.stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(await readBodyCapped(req, 1024)).toEqual({ ok: false });
+    expect(body.consumed()).toBe(0);
   });
 
-  it("skips a non-JSON body", async () => {
-    const store = fakeStore();
-    await stampClientRegistration(store, "<html>not json</html>", 1);
-    expect(store.data.size).toBe(0);
+  it("FIXED (A-3): a chunked body is cut off one chunk past the cap", async () => {
+    const total = 24 * 1024 * 1024;
+    const body = meteredBody(total);
+    const req = new Request("https://x.test/register", {
+      method: "POST",
+      body: body.stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(await readBodyCapped(req, MAX_REGISTRATION_BODY_BYTES)).toEqual({ ok: false });
+    expect(body.consumed()).toBeLessThanOrEqual(MAX_REGISTRATION_BODY_BYTES + CHUNK);
   });
 
-  it("skips a body with no string client_id", async () => {
-    const store = fakeStore();
-    await stampClientRegistration(store, JSON.stringify({ foo: "bar" }), 1);
-    await stampClientRegistration(store, JSON.stringify({ client_id: 42 }), 1);
-    expect(store.data.size).toBe(0);
+  it("returns the text and bytes of a body at or under the cap", async () => {
+    const at = await readBodyCapped(
+      new Request("https://x.test/token", { method: "POST", body: "a".repeat(16) }),
+      16,
+    );
+    expect(at).toMatchObject({ ok: true, text: "a".repeat(16) });
+    const multi = await readBodyCapped(
+      new Request("https://x.test/token", { method: "POST", body: "grant_type=x&client_id=%C3%A9" }),
+      1024,
+    );
+    expect(multi.ok && multi.text).toBe("grant_type=x&client_id=%C3%A9");
+    expect(multi.ok && multi.bytes.byteLength).toBe(29);
+    const over = await readBodyCapped(
+      new Request("https://x.test/token", { method: "POST", body: "a".repeat(17) }),
+      16,
+    );
+    expect(over).toEqual({ ok: false });
+  });
+
+  it("treats a missing body as empty", async () => {
+    const r = await readBodyCapped(new Request("https://x.test/token", { method: "POST" }), 16);
+    expect(r.ok && r.text).toBe("");
+  });
+
+  it("payloadTooLargeResponse is a no-store 413 invalid_request", async () => {
+    const res = payloadTooLargeResponse();
+    expect(res.status).toBe(413);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      error: "invalid_request",
+      error_description: "Request body too large",
+    });
   });
 });
 
-describe("enforceOAuthHardening (registration stamping)", () => {
-  const mkReg = () =>
-    new Request("https://x.test/register", { method: "POST", headers: { "CF-Connecting-IP": "2.2.2.2" } });
+describe("enforceOAuthHardening body caps (A-3)", () => {
+  const post = (path: string, body: BodyInit, headers: Record<string, string> = {}) =>
+    new Request(`https://x.test${path}`, {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "203.0.113.20", ...headers },
+      body,
+      duplex: "half",
+    } as RequestInit);
 
-  it("stamps a successful /register and preserves the response body", async () => {
+  it("FIXED (A-3): POST /token with a 24 MiB body is 413 after at most 16 KiB + one chunk; the handler is not called", async () => {
+    const body = meteredBody(24 * 1024 * 1024);
+    let called = 0;
+    const res = await enforceOAuthHardening(
+      post("/token", body.stream, { "content-type": "application/x-www-form-urlencoded" }),
+      fakeStore(), HCFG, 1_000,
+      async () => { called += 1; return new Response("{}"); },
+    );
+    expect(res.status).toBe(413);
+    expect(body.consumed()).toBeLessThanOrEqual(MAX_FORM_BODY_BYTES + CHUNK);
+    expect(called).toBe(0);
+  });
+
+  it("FIXED (A-3): POST /authorize with a body over 16 KiB is 413 before the handler", async () => {
+    let called = 0;
+    const res = await enforceOAuthHardening(
+      post("/authorize", "consent_token=" + "a".repeat(MAX_FORM_BODY_BYTES)),
+      fakeStore(), HCFG, 1_000,
+      async () => { called += 1; return new Response("ok"); },
+    );
+    expect(res.status).toBe(413);
+    expect(called).toBe(0);
+  });
+
+  it("hands the handler the same form under the cap (headers kept)", async () => {
+    let form: [string, unknown][] = [];
+    let cookie: string | null = null;
+    const res = await enforceOAuthHardening(
+      post("/authorize", "consent_token=t&action=approve", {
+        "content-type": "application/x-www-form-urlencoded",
+        Cookie: "__Host-cm-consent-x=1",
+      }),
+      fakeStore(), HCFG, 1_000,
+      async (r) => {
+        form = [...(await r.formData()).entries()];
+        cookie = r.headers.get("cookie");
+        return new Response("page", { status: 303, headers: { location: "https://login.example.com/" } });
+      },
+    );
+    expect(res.status).toBe(303);
+    expect(form).toEqual([["consent_token", "t"], ["action", "approve"]]);
+    expect(cookie).toBe("__Host-cm-consent-x=1");
+  });
+});
+
+describe("percent-encoded paths (A-3 review)", () => {
+  // Hono decodes %xx before routing, so `/%61uthorize` reaches the consent
+  // handler; the pre-fix classifier compared the raw path and let it skip the
+  // bucket and the body cap.
+  const at = (path: string, init: RequestInit = {}) =>
+    new Request(`https://x.test${path}`, {
+      ...init,
+      headers: { "CF-Connecting-IP": "198.51.100.30", ...(init.headers as Record<string, string> | undefined) },
+    });
+
+  it("FIXED (A-3): classifies encoded endpoint paths as the endpoint they route to", () => {
+    expect(classifyHardenedRequest(at("/%61uthorize"))).toBe("authorize");
+    expect(classifyHardenedRequest(at("/%63allback"))).toBe("callback");
+    expect(classifyHardenedRequest(at("/%72egister", { method: "POST" }))).toBe("register");
+    expect(classifyHardenedRequest(at("/%74oken", { method: "POST" }))).toBe("token");
+    expect(classifyHardenedRequest(at("/m%63p", { method: "POST" }))).toBeNull();
+  });
+
+  it("FIXED (A-3): an encoded /authorize hits 429 once the bucket is full", async () => {
     const store = fakeStore();
-    const handler = async () =>
-      new Response(JSON.stringify({ client_id: "reg-xyz", client_secret: "s" }), {
+    const cfg = { ...HCFG, authorize: { limit: 1, windowSeconds: 300 } };
+    let calls = 0;
+    const handler = async () => { calls += 1; return new Response("page"); };
+    expect((await enforceOAuthHardening(at("/authorize"), store, cfg, 1_000, handler)).status).toBe(200);
+    expect((await enforceOAuthHardening(at("/%61uthorize"), store, cfg, 1_000, handler)).status).toBe(429);
+    expect((await enforceOAuthHardening(at("/%63allback"), store, { ...cfg, callback: { limit: 0, windowSeconds: 300 } }, 1_000, handler)).status).toBe(429);
+    expect(calls).toBe(1);
+  });
+
+  it("FIXED (A-3): an encoded POST /authorize is body-capped", async () => {
+    let calls = 0;
+    const res = await enforceOAuthHardening(
+      at("/%61uthorize", { method: "POST", body: "consent_token=" + "a".repeat(MAX_FORM_BODY_BYTES) }),
+      fakeStore(), HCFG, 1_000, async () => { calls += 1; return new Response("ok"); },
+    );
+    expect(res.status).toBe(413);
+    expect(calls).toBe(0);
+  });
+
+  it("FIXED (A-3): a malformed percent-escape is refused 400 before the handler", async () => {
+    let calls = 0;
+    const handler = async () => { calls += 1; return new Response("ok"); };
+    for (const path of ["/%61uthorize%ZZ", "/%E0%61uthorize", "/authorize%"]) {
+      const res = await enforceOAuthHardening(at(path), fakeStore(), HCFG, 1_000, handler);
+      expect(res.status).toBe(400);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
+    expect(calls).toBe(0);
+  });
+});
+
+describe("enforceOAuthHardening on /authorize and /callback (A-3)", () => {
+  it("FIXED (A-3): rate limits each leg in its own bucket; passes responses through unchanged", async () => {
+    const store = fakeStore();
+    const cfg = { ...HCFG, authorize: { limit: 2, windowSeconds: 300 }, callback: { limit: 1, windowSeconds: 300 } };
+    let calls = 0;
+    const handler = async () => {
+      calls += 1;
+      return new Response("<html>consent</html>", {
+        status: 200,
+        headers: { "content-type": "text/html", "x-frame-options": "DENY" },
+      });
+    };
+    const get = (path: string, ip = "198.51.100.4") =>
+      new Request(`https://x.test${path}`, { headers: { "CF-Connecting-IP": ip } });
+
+    const first = await enforceOAuthHardening(get("/authorize?client_id=c"), store, cfg, 1_000, handler);
+    expect(first.status).toBe(200);
+    expect(first.headers.get("x-frame-options")).toBe("DENY");
+    expect(first.headers.get("pragma")).toBeNull(); // not rebuilt with no-store
+    expect(await first.text()).toBe("<html>consent</html>");
+    expect((await enforceOAuthHardening(get("/authorize"), store, cfg, 1_000, handler)).status).toBe(200);
+    const blocked = await enforceOAuthHardening(get("/authorize"), store, cfg, 1_000, handler);
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(calls).toBe(2);
+
+    // /callback has its own bucket, and another IP its own budget.
+    expect((await enforceOAuthHardening(get("/callback?state=s"), store, cfg, 1_000, handler)).status).toBe(200);
+    expect((await enforceOAuthHardening(get("/callback?state=s"), store, cfg, 1_000, handler)).status).toBe(429);
+    expect((await enforceOAuthHardening(get("/authorize", "198.51.100.5"), store, cfg, 1_000, handler)).status).toBe(200);
+    expect([...store.data.keys()].sort()).toEqual([
+      "ratelimit:authorize:198.51.100.4:0",
+      "ratelimit:authorize:198.51.100.5:0",
+      "ratelimit:callback:198.51.100.4:0",
+    ]);
+  });
+});
+
+// A-5 (2026-11 review): the client record now carries a KV TTL instead of a
+// `clientreg:` stamp read by a five-minute sweep.
+describe("refreshClientTtl (A-5)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("FIXED (A-5): re-puts the client record verbatim with the given TTL", async () => {
+    const store = optsStore();
+    store.data.set("client:c1", '{"clientId":"c1"}');
+    expect(await refreshClientTtl(store, "c1", 777)).toBe(true);
+    expect(store.data.get("client:c1")).toBe('{"clientId":"c1"}');
+    expect(store.opts.get("client:c1")).toEqual({ expirationTtl: 777 });
+  });
+
+  it("is a no-op returning false for an unknown client", async () => {
+    const store = optsStore();
+    expect(await refreshClientTtl(store, "nope", 777)).toBe(false);
+    expect(store.data.size).toBe(0);
+  });
+
+  it("swallows store errors and logs without the client id", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const broken: RateLimitStore = {
+      async get() { throw new Error("kv down"); },
+      async put() { throw new Error("kv down"); },
+    };
+    expect(await refreshClientTtl(broken, "secret-client-id", 1)).toBe(false);
+    expect(err).toHaveBeenCalled();
+    expect(JSON.stringify(err.mock.calls)).not.toContain("secret-client-id");
+    expect(JSON.stringify(err.mock.calls)).toContain("oauth client ttl refresh failed");
+  });
+});
+
+describe("enforceOAuthHardening client TTL (A-5)", () => {
+  const reg = () =>
+    new Request("https://x.test/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "2.2.2.2", "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["https://claude.ai/cb"] }),
+    });
+  const tok = (form: Record<string, string>, headers: Record<string, string> = {}) =>
+    new Request("https://x.test/token", {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "2.2.2.2",
+        "content-type": "application/x-www-form-urlencoded",
+        ...headers,
+      },
+      body: new URLSearchParams(form).toString(),
+    });
+
+  it("FIXED (A-5): a successful /register gives the new client record the unused TTL, writes no stamp, keeps the body", async () => {
+    const store = optsStore();
+    const handler = async () => {
+      // The library writes the record with no TTL, then answers.
+      await store.put("client:reg-xyz", '{"clientId":"reg-xyz"}');
+      return new Response(JSON.stringify({ client_id: "reg-xyz", client_secret: "s" }), {
         status: 201,
         headers: { "content-type": "application/json" },
       });
-    const res = await enforceOAuthHardening(mkReg(), store, HCFG, 999, handler);
+    };
+    const res = await enforceOAuthHardening(reg(), store, HCFG, 999, handler);
     expect(res.status).toBe(201);
+    expect(res.headers.get("cache-control")).toBe("no-store");
     expect(await res.json()).toEqual({ client_id: "reg-xyz", client_secret: "s" });
-    expect(JSON.parse(store.data.get(`${CLIENT_STAMP_PREFIX}reg-xyz`)!)).toEqual({ registeredAt: 999 });
+    expect(store.opts.get("client:reg-xyz")).toEqual({ expirationTtl: TTL.registeredSeconds });
+    expect([...store.data.keys()].filter((k) => k.startsWith("clientreg:"))).toEqual([]);
   });
 
-  it("does not stamp a failed /register", async () => {
-    const store = fakeStore();
-    const handler = async () => new Response(JSON.stringify({ error: "bad" }), { status: 400 });
-    await enforceOAuthHardening(mkReg(), store, HCFG, 999, handler);
-    const stamps = [...store.data.keys()].filter((k) => k.startsWith(CLIENT_STAMP_PREFIX));
-    expect(stamps).toEqual([]);
+  it("does not touch a client on a failed /register", async () => {
+    const store = optsStore();
+    store.data.set("client:x", "{}");
+    await enforceOAuthHardening(reg(), store, HCFG, 999, async () =>
+      new Response(JSON.stringify({ client_id: "x" }), { status: 400 }),
+    );
+    expect(store.opts.has("client:x")).toBe(false);
   });
 
-  it("does not stamp a /token response", async () => {
-    const store = fakeStore();
-    const handler = async () =>
-      new Response(JSON.stringify({ client_id: "should-not-stamp" }), { status: 200 });
-    const req = new Request("https://x.test/token", { method: "POST", headers: { "CF-Connecting-IP": "2.2.2.2" } });
-    await enforceOAuthHardening(req, store, HCFG, 999, handler);
-    const stamps = [...store.data.keys()].filter((k) => k.startsWith(CLIENT_STAMP_PREFIX));
-    expect(stamps).toEqual([]);
+  it("FIXED (A-5): a 200 /token renews the client to the active TTL (client_id from the form)", async () => {
+    const store = optsStore();
+    store.data.set("client:pub", '{"clientId":"pub"}');
+    const res = await enforceOAuthHardening(
+      tok({ grant_type: "refresh_token", refresh_token: "r", client_id: "pub" }),
+      store, HCFG, 999, async () => new Response('{"access_token":"a"}', { status: 200 }),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(store.opts.get("client:pub")).toEqual({ expirationTtl: TTL.activeSeconds });
+  });
+
+  it("FIXED (A-5): a 200 /token renews the client named in the Basic Authorization header", async () => {
+    const store = optsStore();
+    store.data.set("client:conf id", "{}");
+    store.data.set("client:form-id", "{}");
+    await enforceOAuthHardening(
+      tok(
+        { grant_type: "authorization_code", code: "c", client_id: "form-id" },
+        { Authorization: `Basic ${btoa("conf%20id:sec%3Aret")}` },
+      ),
+      store, HCFG, 999, async () => new Response("{}", { status: 200 }),
+    );
+    expect(store.opts.get("client:conf id")).toEqual({ expirationTtl: TTL.activeSeconds });
+    expect(store.opts.has("client:form-id")).toBe(false);
+  });
+
+  it("FIXED (A-5 review): a revocation 200 (token=, no grant_type) does not renew the client", async () => {
+    const store = optsStore();
+    store.data.set("client:pub", "{}");
+    // The library answers revocation of any token, even junk, with 200.
+    const res = await enforceOAuthHardening(
+      tok({ client_id: "pub", token: "junk" }),
+      store, HCFG, 999, async () => new Response("", { status: 200 }),
+    );
+    expect(res.status).toBe(200);
+    expect(store.opts.has("client:pub")).toBe(false);
+    // Nor does an unknown grant type that somehow answered 200.
+    await enforceOAuthHardening(
+      tok({ client_id: "pub", grant_type: "client_credentials" }),
+      store, HCFG, 999, async () => new Response("{}", { status: 200 }),
+    );
+    expect(store.opts.has("client:pub")).toBe(false);
+  });
+
+  // The library only checks that Content-Type *includes*
+  // application/x-www-form-urlencoded and then reads request.formData(), so a
+  // multipart body with that string tacked on is parsed as multipart there
+  // while URLSearchParams over the raw text sees a different form.
+  const multipartToken = (parts: Array<[string, string]>) => {
+    const b = "XXB";
+    const body =
+      parts.map(([n, v]) => `--${b}\r\nContent-Disposition: form-data; name="${n}"\r\n\r\n${v}\r\n`).join("") +
+      `--${b}--\r\n`;
+    return new Request("https://x.test/token", {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "2.2.2.2",
+        "content-type": `multipart/form-data; boundary=${b}; application/x-www-form-urlencoded`,
+      },
+      body,
+    });
+  };
+
+  it("FIXED (A-5 review): a multipart revocation smuggling a victim's refresh form renews nobody", async () => {
+    const store = optsStore();
+    store.data.set("client:victim", "{}");
+    store.data.set("client:attacker", "{}");
+    let parsed: Record<string, unknown> = {};
+    const res = await enforceOAuthHardening(
+      multipartToken([
+        ["z", "&client_id=victim&grant_type=refresh_token&"],
+        ["client_id", "attacker"],
+        ["token", "junk"],
+      ]),
+      store, HCFG, 999,
+      async (r) => {
+        // What the library sees: a revocation by `attacker`.
+        parsed = Object.fromEntries((await r.formData()).entries());
+        return new Response("", { status: 200 });
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(parsed).toMatchObject({ client_id: "attacker", token: "junk" });
+    expect(parsed.grant_type).toBeUndefined();
+    expect(store.opts.has("client:victim")).toBe(false);
+    expect(store.opts.has("client:attacker")).toBe(false);
+  });
+
+  it("FIXED (A-5 review): a multipart refresh renews nobody; only an exact urlencoded content type renews", async () => {
+    const store = optsStore();
+    store.data.set("client:pub", "{}");
+    await enforceOAuthHardening(
+      multipartToken([["grant_type", "refresh_token"], ["refresh_token", "r"], ["client_id", "pub"]]),
+      store, HCFG, 999, async () => new Response("{}", { status: 200 }),
+    );
+    expect(store.opts.has("client:pub")).toBe(false);
+    // Parameters on the urlencoded type are fine (essence compared).
+    await enforceOAuthHardening(
+      tok(
+        { grant_type: "refresh_token", refresh_token: "r", client_id: "pub" },
+        { "content-type": " Application/X-WWW-Form-Urlencoded ; charset=UTF-8" },
+      ),
+      store, HCFG, 999, async () => new Response("{}", { status: 200 }),
+    );
+    expect(store.opts.get("client:pub")).toEqual({ expirationTtl: TTL.activeSeconds });
+  });
+
+  it("does not renew on a failed /token", async () => {
+    const store = optsStore();
+    store.data.set("client:pub", "{}");
+    await enforceOAuthHardening(
+      tok({ grant_type: "authorization_code", code: "bad", client_id: "pub" }),
+      store, HCFG, 999, async () => new Response('{"error":"invalid_grant"}', { status: 400 }),
+    );
+    expect(store.opts.has("client:pub")).toBe(false);
   });
 });

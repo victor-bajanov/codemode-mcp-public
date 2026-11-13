@@ -202,4 +202,13 @@ describe("findShadowConflicts", () => {
     });
     expect(conflicts.map((c) => c.second.operationId)).toContain("getSummary");
   });
+
+  it("treats a different upstream hook (inspectUpstream) as different treatment", () => {
+    const inspect = () => ({ decision: "allow" as const });
+    const conflicts = findShadowConflicts(SHADOW_SPEC, {
+      getReport: { decision: "allow", inspect },
+      getSummary: { decision: "allow", inspect, inspectUpstream: async () => ({ decision: "allow" }) },
+    });
+    expect(conflicts.map((c) => c.second.operationId)).toEqual(["getSummary"]);
+  });
 });

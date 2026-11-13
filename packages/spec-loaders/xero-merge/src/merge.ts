@@ -6,6 +6,7 @@ import { parseSpecYaml } from "./parse";
 import { rewritePaths } from "./transforms/paths";
 import { prefixOperationIds } from "./transforms/operationIds";
 import { prefixSchemas } from "./transforms/schemas";
+import { inlineParameterRefs } from "./transforms/parameters";
 import { unify } from "./unify";
 import { applyPatches, type Patch } from "./patch";
 import { validateMerged } from "./validate";
@@ -39,10 +40,14 @@ export function mergeXeroSpecs(opts: MergeOptions = {}): MergeResult {
     const raw = readFileSync(join(specsDir, s.file), "utf8");
     const parsed = parseSpecYaml(raw) as {
       paths: Record<string, Record<string, unknown>>;
-      components?: { schemas?: Record<string, unknown> };
+      components?: { schemas?: Record<string, unknown>; parameters?: Record<string, unknown> };
       [k: string]: unknown;
     };
-    const pathsDoc = rewritePaths(parsed, s.pathPrefix);
+    // Inline `#/components/parameters/*` refs first: `unify` carries schemas
+    // only, and the inlined objects then go through the same path/schema
+    // rewrites as every other operation field.
+    const inlined = inlineParameterRefs(parsed);
+    const pathsDoc = rewritePaths(inlined, s.pathPrefix);
     const idsDoc = prefixOperationIds(
       pathsDoc as unknown as Parameters<typeof prefixOperationIds>[0],
       s.idPrefix,

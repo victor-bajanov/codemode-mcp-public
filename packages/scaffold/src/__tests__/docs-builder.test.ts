@@ -297,3 +297,42 @@ describe("buildProviderDocs", () => {
     });
   });
 });
+
+describe("buildProviderDocs — security fixes wave 1", () => {
+  it("F2-8: the envelope section explains the untrusted fence only when the provider sets untrustedFieldExtension", () => {
+    const fenced = buildProviderDocs(makeProvider({ untrustedFieldExtension: "x-test-untrusted" }), false, annotatedSpec);
+    expect(fenced.sections.envelope).toContain("⟦untrusted⟧…⟦/untrusted⟧");
+    expect(fenced.sections.envelope).toMatch(/third-party text/);
+    expect(fenced.sections.envelope).toMatch(/strip the markers before reusing/i);
+    expect(fenced.sections.envelope).toContain("request header");
+
+    const plain = buildProviderDocs(makeProvider(), false, annotatedSpec);
+    expect(plain.sections.envelope).not.toContain("untrusted");
+    expect(plain.full).not.toContain("⟦untrusted⟧");
+  });
+
+  it("D-3 / C-4: request-options no longer says contentType is forwarded as-is", () => {
+    const { sections } = buildProviderDocs(makeProvider(), false, annotatedSpec);
+    const line = sections["request-options"]!.split("\n").find((l) => l.includes("contentType?: string;"))!;
+    expect(line).not.toContain("forwarded as-is");
+    expect(line).toContain("media type");
+    expect(line).toContain("application/json");
+  });
+});
+
+describe("buildProviderDocs — security fixes wave 4", () => {
+  it("E-1: the staging section says fetch_url has a limited number of downloads and the reference keeps working in the session", () => {
+    const { sections } = buildProviderDocs(stagingProvider, true, annotatedSpec);
+    const staging = sections.staging!;
+    const curlAt = staging.indexOf('curl -H "Authorization: Bearer <token>" <fetch_url>');
+    expect(curlAt).toBeGreaterThan(-1);
+    const after = staging.slice(curlAt);
+    expect(after).not.toMatch(/downloads? (the file )?(exactly )?once/i);
+    expect(after).toMatch(/limited number of downloads/i);
+    expect(after).toMatch(/default 5/);
+    expect(after).toMatch(/410/);
+    expect(after).toMatch(/re-stage/i);
+    // In-MCP reuse by the same user is unchanged.
+    expect(after).toContain("same file_handle and token");
+  });
+});

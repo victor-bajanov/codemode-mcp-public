@@ -1,6 +1,7 @@
+import { stagingAuditEntry, type AuditSink } from "../audit.js";
 import { DEFAULT_TRANSFER_TIMEOUT_MS, type StagingConfig } from "./types";
 import { atomicClaim, lookupByHash } from "./repo";
-import { sha256Bearer, deriveV2Key } from "./crypto";
+import { sha256Bearer, deriveV2Key, fileRefOf } from "./crypto";
 import { ENC_VERSION_V2 } from "./block-format";
 import {
   StagingBodyLengthMismatch,
@@ -18,6 +19,8 @@ export interface UploadDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
+  /** E-1: one `staging.upload` line per request once the row is looked up, when given. */
+  audit?: AuditSink;
   now?: () => number;
 }
 
@@ -49,21 +52,48 @@ export async function handleUpload(req: Request, deps: UploadDeps): Promise<Resp
 
   const token_hash = await sha256Bearer(bearer);
   const row = await lookupByHash(deps.STAGING_D1, token_hash);
-  if (!row) return new Response("forbidden", { status: 403 });
+  // E-1: one `staging.upload` line per outcome from here on. The principal is the owner
+  // `register_file_handle` recorded; a missing row logs none. Never the handle or token.
+  const fileRef = row ? await fileRefOf(row.file_handle) : undefined;
+  const logged = (res: Response, byteLength?: number): Response => {
+    deps.audit?.(
+      stagingAuditEntry({
+        method: "POST",
+        path: "/staging/upload",
+        operationId: "staging.upload",
+        allowed: res.status === 204,
+        principalId: row?.owner,
+        event: "upload",
+        fileRef,
+        byteLength,
+        status: res.status,
+      }),
+    );
+    return res;
+  };
+  if (!row) return logged(new Response("forbidden", { status: 403 }));
   if (row.state === "claimed" || row.state === "corrupt") {
-    return new Response("conflict", { status: 409 });
+    return logged(new Response("conflict", { status: 409 }));
   }
   if (row.expires_at <= now()) {
-    return new Response("gone", { status: 410 });
+    return logged(new Response("gone", { status: 410 }));
   }
 
   // Content-Type hint check.
   const ct = req.headers.get("Content-Type") ?? "application/octet-stream";
   if (row.content_type_hint && row.content_type_hint !== ct) {
-    return new Response("content-type mismatch", { status: 400 });
+    return logged(new Response("content-type mismatch", { status: 400 }));
   }
 
-  return storeAndClaim(req, deps, bearer, token_hash, row.file_handle, ct, declaredLen, now);
+  let stored: Awaited<ReturnType<typeof storeAndClaim>>;
+  try {
+    stored = await storeAndClaim(req, deps, bearer, token_hash, row.file_handle, ct, declaredLen, now);
+  } catch (err) {
+    // A D1/R2 failure escapes as a thrown error (the runtime answers 500); log it first.
+    logged(new Response(null, { status: 500 }));
+    throw err;
+  }
+  return logged(stored.res, stored.byteLength);
 }
 
 async function storeAndClaim(
@@ -75,7 +105,7 @@ async function storeAndClaim(
   ct: string,
   declaredLen: number | null,
   now: () => number,
-): Promise<Response> {
+): Promise<{ res: Response; byteLength?: number }> {
   // Encrypt block by block as the body arrives (v2 format), enforcing
   // maxBytes while streaming (F-13): a body with no (or a lying)
   // Content-Length is cancelled as soon as it passes maxBytes. With a declared
@@ -111,18 +141,18 @@ async function storeAndClaim(
     // such uploads share one isolate-wide slot (unknown-length-slot.ts); a
     // second one is turned away before its body is read or any R2 write.
     if (err instanceof StagingBusy) {
-      return new Response(err.message, { status: 503, headers: { "Retry-After": "1" } });
+      return { res: new Response(err.message, { status: 503, headers: { "Retry-After": "1" } }) };
     }
     await deleteQuietly(deps.STAGING_R2, r2_key);
     // The client stopped sending within transferTimeoutMs: 408 Request
     // Timeout is exactly "the server gave up waiting for the request body".
-    if (err instanceof StagingTimeout) return new Response("upload timed out", { status: 408 });
-    if (err instanceof StagingTooLarge) return new Response("payload too large", { status: 413 });
-    if (err instanceof StagingSourceError) return new Response("body read failed", { status: 400 });
+    if (err instanceof StagingTimeout) return { res: new Response("upload timed out", { status: 408 }) };
+    if (err instanceof StagingTooLarge) return { res: new Response("payload too large", { status: 413 }) };
+    if (err instanceof StagingSourceError) return { res: new Response("body read failed", { status: 400 }) };
     if (err instanceof StagingBodyLengthMismatch) {
-      return new Response("body length does not match Content-Length", { status: 400 });
+      return { res: new Response("body length does not match Content-Length", { status: 400 }) };
     }
-    return new Response("internal", { status: 500 });
+    return { res: new Response("internal", { status: 500 }) };
   }
 
   const claimed_at = now();
@@ -140,8 +170,8 @@ async function storeAndClaim(
   if (!claimed) {
     // Lost the race or row vanished. Clean up the R2 object we just wrote.
     await deps.STAGING_R2.delete(r2_key);
-    return new Response("conflict", { status: 409 });
+    return { res: new Response("conflict", { status: 409 }) };
   }
-  return new Response(null, { status: 204 });
+  return { res: new Response(null, { status: 204 }), byteLength: byteLen };
 }
 

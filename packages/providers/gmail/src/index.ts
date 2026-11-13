@@ -175,6 +175,11 @@ export const gmailProvider: ApiProvider = {
   spec,
   surfaceReview,
   elicitRenderers: gmailElicitRenderers,
+  // Google's standard parameters are declared nowhere in the Discovery specs.
+  // Only the response-shaping and quota ones are accepted on every operation
+  // (the media-send inspector allows the same set); `alt`, `callback`,
+  // `$.xgafv`, `key`, `access_token` and `oauth_token` stay refused (D-2).
+  standardQueryParams: ["fields", "prettyPrint", "quotaUser", "upload_protocol"],
   apiBaseUrl: "https://www.googleapis.com",
   executeHint: GMAIL_CALENDAR_HINT,
   // Distilled from GMAIL_CALENDAR_HINT above for the compact `execute`

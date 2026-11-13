@@ -87,6 +87,19 @@ export interface ApiProvider<
    *  when no renderer resolves. */
   elicitRenderers?: Partial<Record<string, ElicitRenderer>>;
 
+  /** Query parameter names every operation accepts even though the spec does
+   *  not declare them per operation (e.g. Google's response-shaping and quota
+   *  parameters). The request handler refuses any other undeclared name, and
+   *  a hard deny-list (`$`-prefixed, credentials, method overrides) wins over
+   *  this list (D-2). Default: none. */
+  standardQueryParams?: readonly string[];
+
+  /** Vendor extension key (e.g. `x-optical-untrusted`) the provider's spec
+   *  sets to `true` on response-schema nodes carrying third-party text. The
+   *  request handler fences every string such a node reaches as
+   *  `⟦untrusted⟧…⟦/untrusted⟧` before returning it (F2-8). Default: none. */
+  untrustedFieldExtension?: string;
+
   /** Provider-specific Step-3 guidance for the staging/attachment workflow — the
    *  UPLOAD direction (bytes TO the upstream API). For the opposite direction
    *  (bytes FROM the upstream API), see `downloadHint` below; the two are never

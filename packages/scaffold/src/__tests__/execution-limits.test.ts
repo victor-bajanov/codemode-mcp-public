@@ -4,30 +4,40 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_EXECUTE_HOST_TIMEOUT_MS,
+  DEFAULT_EXECUTE_MAX_DENIED_CALLS,
   DEFAULT_EXECUTE_MAX_UPSTREAM_CALLS,
   readExecutionLimits,
 } from "../execution-limits";
 
 describe("readExecutionLimits", () => {
-  it("defaults to 75 000 ms and 1 000 calls when unset", () => {
+  it("defaults to 75 000 ms, 1 000 calls and 32 refused calls when unset", () => {
     expect(DEFAULT_EXECUTE_HOST_TIMEOUT_MS).toBe(75_000);
     expect(DEFAULT_EXECUTE_MAX_UPSTREAM_CALLS).toBe(1_000);
-    expect(readExecutionLimits({})).toEqual({ hostTimeoutMs: 75_000, maxUpstreamCalls: 1_000 });
+    expect(DEFAULT_EXECUTE_MAX_DENIED_CALLS).toBe(32);
+    expect(readExecutionLimits({})).toEqual({ hostTimeoutMs: 75_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 32 });
   });
 
   it("treats empty strings (and null) as unset", () => {
     expect(
-      readExecutionLimits({ EXECUTE_HOST_TIMEOUT_MS: "", EXECUTE_MAX_UPSTREAM_CALLS: null }),
-    ).toEqual({ hostTimeoutMs: 75_000, maxUpstreamCalls: 1_000 });
+      readExecutionLimits({
+        EXECUTE_HOST_TIMEOUT_MS: "",
+        EXECUTE_MAX_UPSTREAM_CALLS: null,
+        EXECUTE_MAX_DENIED_CALLS: "",
+      }),
+    ).toEqual({ hostTimeoutMs: 75_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 32 });
   });
 
   it("honours overrides, as strings (wrangler vars) or numbers", () => {
     expect(
-      readExecutionLimits({ EXECUTE_HOST_TIMEOUT_MS: "30000", EXECUTE_MAX_UPSTREAM_CALLS: "50" }),
-    ).toEqual({ hostTimeoutMs: 30_000, maxUpstreamCalls: 50 });
+      readExecutionLimits({
+        EXECUTE_HOST_TIMEOUT_MS: "30000",
+        EXECUTE_MAX_UPSTREAM_CALLS: "50",
+        EXECUTE_MAX_DENIED_CALLS: "8",
+      }),
+    ).toEqual({ hostTimeoutMs: 30_000, maxUpstreamCalls: 50, maxDeniedCalls: 8 });
     expect(
-      readExecutionLimits({ EXECUTE_HOST_TIMEOUT_MS: 1, EXECUTE_MAX_UPSTREAM_CALLS: 1 }),
-    ).toEqual({ hostTimeoutMs: 1, maxUpstreamCalls: 1 });
+      readExecutionLimits({ EXECUTE_HOST_TIMEOUT_MS: 1, EXECUTE_MAX_UPSTREAM_CALLS: 1, EXECUTE_MAX_DENIED_CALLS: 1 }),
+    ).toEqual({ hostTimeoutMs: 1, maxUpstreamCalls: 1, maxDeniedCalls: 1 });
   });
 
   it.each(["0", "-1", "1.5", "abc", " ", "Infinity", "NaN"])(
@@ -44,6 +54,15 @@ describe("readExecutionLimits", () => {
     (raw) => {
       expect(() => readExecutionLimits({ EXECUTE_MAX_UPSTREAM_CALLS: raw })).toThrow(
         /EXECUTE_MAX_UPSTREAM_CALLS: must be a positive integer/,
+      );
+    },
+  );
+
+  it.each(["0", "-2", "3.5", "many", " ", "Infinity"])(
+    "throws on EXECUTE_MAX_DENIED_CALLS=%j (B-2 denial budget)",
+    (raw) => {
+      expect(() => readExecutionLimits({ EXECUTE_MAX_DENIED_CALLS: raw })).toThrow(
+        /EXECUTE_MAX_DENIED_CALLS: must be a positive integer/,
       );
     },
   );

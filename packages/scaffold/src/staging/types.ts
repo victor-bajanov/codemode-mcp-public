@@ -26,6 +26,10 @@ export interface StagingRow {
   claimed_at: number | null;
   expires_at: number;              // unix seconds
   enc_version: EncVersion;         // 1 when the column is absent (pre-0002 rows); only 2 is readable
+  /** E-1: the principal (audit `principalId`) that created the row; null on pre-0003 rows (refused). */
+  owner: string | null;
+  /** E-1: public /staging/fetch downloads counted so far (limit STAGING_FETCH_MAX_USES); 0 on pre-0003 rows. */
+  fetch_count: number;
 }
 
 export interface RegisterInput {
@@ -57,12 +61,15 @@ export interface StagingConfig {
   maxConcurrentTransfers?: number;
   /** Absolute per-transfer timeout. */
   transferTimeoutMs?: number;
+  /** E-1: public `/staging/fetch` downloads allowed per file within the fetch TTL. */
+  fetchMaxUses?: number;
 }
 
 export const DEFAULT_GETFILE_MAX_BYTES = 8_388_608; // 8 MiB
 export const DEFAULT_COMPOSE_MAX_BYTES = 75_497_472; // 72 MiB
 export const DEFAULT_MAX_CONCURRENT_TRANSFERS = 2;
 export const DEFAULT_TRANSFER_TIMEOUT_MS = 60_000;
+export const DEFAULT_FETCH_MAX_USES = 5;
 
 export interface StagingBindings {
   STAGING_R2: R2Bucket;

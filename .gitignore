@@ -41,3 +41,6 @@ coverage/
 
 # Surface-review CLI temporary files
 .surface-review-tmp/
+
+# Orchestrator run artefacts (may hold private review text)
+.orchestrator/

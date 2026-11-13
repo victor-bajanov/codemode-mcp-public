@@ -1,11 +1,14 @@
+import { stagingAuditEntry, type AuditSink } from "../audit.js";
 import type { StagingConfig } from "./types";
-import { StagedFileReadError, openStagedFile } from "./staged-file";
+import { StagedFileReadError, openForPublicDownload } from "./staged-file";
 import { createFixedLengthSink } from "./sinks";
 
 export interface FetchDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
+  /** E-1: one `staging.download` line per request when given. */
+  audit?: AuditSink;
   now?: () => number;
 }
 
@@ -84,25 +87,52 @@ function buildContentDisposition(sanitizedFilename: string): string {
   return `attachment; filename="${escapeQuotedString(asciiFallback)}"; filename*=UTF-8''${encoded}`;
 }
 
+/**
+ * Public download of a staged file: `GET /staging/fetch/<file_handle>` with the `stg_` bearer.
+ * Use-limited (E-1): each GET that passes the row checks is counted before any R2 read, up to
+ * `config.fetchMaxUses` (STAGING_FETCH_MAX_USES, default 5); past the limit a GET is 410.
+ * One `staging.download` audit line per request once its status is known; it carries the row
+ * owner's principal and the file's `fileRef`, never the handle or token.
+ */
 export async function handleFetch(req: Request, deps: FetchDeps): Promise<Response> {
-  const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
-  const bearer = parseBearer(req);
-  if (!bearer) return new Response("forbidden", { status: 403 });
-  const handle = extractHandle(req);
-  if (!handle) return new Response("not found", { status: 404 });
+  let owner: string | undefined;
+  let fileRef: string | undefined;
+  const respond = (body: BodyInit | null, status: number, init?: { headers: Headers; byteLength: number }) => {
+    deps.audit?.(
+      stagingAuditEntry({
+        method: "GET",
+        path: "/staging/fetch",
+        operationId: "staging.download",
+        allowed: status === 200,
+        principalId: owner,
+        event: "download",
+        fileRef,
+        byteLength: init?.byteLength,
+        status,
+      }),
+    );
+    return new Response(body, init ? { status, headers: init.headers } : { status });
+  };
 
-  const opened = await openStagedFile(deps, { file_handle: handle, token: bearer });
+  const bearer = parseBearer(req);
+  if (!bearer) return respond("forbidden", 403);
+  const handle = extractHandle(req);
+  if (!handle) return respond("not found", 404);
+
+  const opened = await openForPublicDownload(deps, { file_handle: handle, token: bearer });
+  owner = opened.owner;
+  fileRef = opened.fileRef;
   if (!opened.ok) {
     switch (opened.status) {
       case 400:
       case 403:
-        return new Response("forbidden", { status: 403 });
+        return respond("forbidden", 403);
       case 409:
-        return new Response("conflict", { status: 409 });
+        return respond("conflict", 409);
       case 410:
-        return new Response("gone", { status: 410 });
+        return respond("gone", 410);
       default:
-        return new Response("internal", { status: 500 });
+        return respond("internal", 500);
     }
   }
   const file = opened.file;
@@ -133,7 +163,7 @@ export async function handleFetch(req: Request, deps: FetchDeps): Promise<Respon
   if (early !== null) {
     await sink.abort(early);
     const status = early instanceof StagedFileReadError ? early.status : 500;
-    return new Response(status === 410 ? "gone" : "internal", { status });
+    return respond(status === 410 ? "gone" : "internal", status);
   }
   // Errors after the first block abort the sink; the consumer sees them.
   pump.catch((e: unknown) => sink.abort(e));
@@ -153,5 +183,5 @@ export async function handleFetch(req: Request, deps: FetchDeps): Promise<Respon
   }
   headers.set("Cache-Control", "no-store");
   headers.set("Content-Length", String(byteLen));
-  return new Response(sink.readable, { status: 200, headers });
+  return respond(sink.readable, 200, { headers, byteLength: byteLen });
 }

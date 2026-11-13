@@ -43,7 +43,10 @@ function makeArgs<R extends SurfaceReview>(opts: {
     props,
     apiBaseUrl: "https://gmail.googleapis.com",
     deploymentName: "gmail-test",
-    server: {} as never,
+    // A client that advertises elicitation but whose server object has no
+    // `elicitInput`: approval ops end in `transport-error`. (A stub with no
+    // capabilities accessor at all is fail-closed: `unsupported`.)
+    server: { server: { getClientCapabilities: () => ({ elicitation: {} }) } } as never,
     oauth: {
       refreshTokenAccessor: (p: typeof props) => p.refreshToken,
       userIdAccessor: (p: typeof props) => p.userId,
@@ -232,7 +235,7 @@ describe("request-handler inspector path", () => {
     const sendCtx = (to: string) => ({
       method: "POST" as const,
       path: "/gmail/v1/users/me/messages/send",
-      body: { payload: { headers: [{ name: "To", value: to }] } },
+      body: { raw: Buffer.from(`To: ${to}\r\nSubject: x\r\n\r\nhi\r\n`, "utf8").toString("base64url") },
     });
     const testerEnv = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@tester.example" };
 

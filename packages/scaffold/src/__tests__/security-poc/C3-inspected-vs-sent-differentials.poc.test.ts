@@ -57,7 +57,7 @@ describe("C3a raw JSON channel: inspector sees JSON.parse(bytes), upstream gets 
     expect(contentType).toBe("application/json");
   });
 
-  it("FIXED (F-7): a BOM-prefixed body goes out as the BOM-less document the inspector judged", () => {
+  it("FIXED (F-7, D-3): a BOM-prefixed body is not judged at all: JSON bytes are strict UTF-8, so it is unparseable (denied on gated ops)", () => {
     const ctx: UpstreamCtx = {
       method: "POST",
       path: "/gmail/v1/users/me/messages/send",
@@ -66,9 +66,9 @@ describe("C3a raw JSON channel: inspector sees JSON.parse(bytes), upstream gets 
     };
     const eff = resolveEffective(ctx);
     const derived = deriveInspectRequest(ctx, eff, INSPECT_JSON_MAX_BYTES);
-    expect(derived.req.body).toEqual({ raw: "RVZJTA" });
-    const { bodyToSend } = marshalBody(ctx, derived.sendAs!);
-    expect(bodyToSend).toBe(JSON.stringify(derived.req.body));
+    expect(derived.unparseableJson).toBe(true);
+    expect(derived.sendAs).toBeUndefined();
+    expect(derived.req.body).toBeUndefined();
   });
 
   it("the plain `body` channel has no such differential (same object is stringified)", () => {

@@ -11,7 +11,22 @@ describe("readStagingConfig", () => {
       composeMaxBytes: 75_497_472,
       maxConcurrentTransfers: 2,
       transferTimeoutMs: 60_000,
+      fetchMaxUses: 5,
     });
+  });
+
+  // E-1 follow-up: the public /staging/fetch download is counted, not single use.
+  it("STAGING_FETCH_MAX_USES: default 5, parsed when set, 1 allowed, empty = unset", () => {
+    expect(readStagingConfig({}).fetchMaxUses).toBe(5);
+    expect(readStagingConfig({ STAGING_FETCH_MAX_USES: "" }).fetchMaxUses).toBe(5);
+    expect(readStagingConfig({ STAGING_FETCH_MAX_USES: "1" }).fetchMaxUses).toBe(1);
+    expect(readStagingConfig({ STAGING_FETCH_MAX_USES: "12" }).fetchMaxUses).toBe(12);
+  });
+
+  it("STAGING_FETCH_MAX_USES: invalid values are refused like every other STAGING_* integer (no unlimited)", () => {
+    for (const bad of ["0", "-1", "1.5", "abc", "Infinity", "unlimited"]) {
+      expect(() => readStagingConfig({ STAGING_FETCH_MAX_USES: bad })).toThrow(/STAGING_FETCH_MAX_USES/);
+    }
   });
 
   it("parses overrides from vars", () => {

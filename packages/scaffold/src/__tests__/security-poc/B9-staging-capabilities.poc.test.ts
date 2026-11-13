@@ -37,8 +37,8 @@ describe("B9 — staging capability isolation", () => {
   it("getFile needs BOTH the handle and the token of the same row; secrets are 32/16 random bytes (REFUTED)", async () => {
     const d1 = new FakeD1() as unknown as D1Database;
     const r2 = new FakeR2() as unknown as R2Bucket;
-    const putFile = createPutFileCapability({ STAGING_D1: d1, STAGING_R2: r2, config, uploadOrigin: "https://poc.example" });
-    const getFile = createGetFileCapability({ STAGING_D1: d1, STAGING_R2: r2, config });
+    const putFile = createPutFileCapability({ STAGING_D1: d1, STAGING_R2: r2, config, uploadOrigin: "https://poc.example", owner: "user-A" });
+    const getFile = createGetFileCapability({ STAGING_D1: d1, STAGING_R2: r2, config, owner: "user-A" });
     const a = await putFile(btoa("user-A-data"), "text/plain", "a.txt");
     const b = await putFile(btoa("user-B-data"), "text/plain", "b.txt");
     if (!a.ok || !b.ok) throw new Error("setup");
@@ -54,7 +54,7 @@ describe("B9 — staging capability isolation", () => {
   });
 
   it("FIXED (F-24): putFile enforces maxBytes on the base64 length before decoding", async () => {
-    const putFile = createPutFileCapability({ STAGING_D1: new FakeD1() as never, STAGING_R2: new FakeR2() as never, config, uploadOrigin: "https://poc.example" });
+    const putFile = createPutFileCapability({ STAGING_D1: new FakeD1() as never, STAGING_R2: new FakeR2() as never, config, uploadOrigin: "https://poc.example", owner: "user-A" });
     const atobSpy = vi.spyOn(globalThis, "atob");
     try {
       // Over-cap AND malformed: a 413 (not 400 "bad base64") proves the size
@@ -72,7 +72,7 @@ describe("B9 — staging capability isolation", () => {
   it("FIXED (F-24): stageFromUpstreamJson forwards only the declared requestOpts fields to the handler ctx", async () => {
     const seen: unknown[] = [];
     const cap = createStageFromUpstreamJsonCapability({
-      putFile: async () => ({ ok: true, file_handle: "fh_x", token: "stg_x", fetch_url: "u", expires_at: 0, byte_length: 1 }),
+      putFile: async () => ({ ok: true, file_handle: "fh_x", token: "stg_x", fetch_url: "u", expires_at: 0, byte_length: 1, file_ref: "000000000000" }),
       upstreamRequest: async (ctx) => { seen.push(ctx); return { success: true, status: 200, result: { data: "aGk=" } }; },
     });
     const opts = { method: "GET", path: "/w", headers: { "X-Extra": "1" }, returnAs: "stage", multipart: [], relatedRequestId: "rid-1" } as never;

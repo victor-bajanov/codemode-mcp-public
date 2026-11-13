@@ -2,7 +2,8 @@
 //
 // Status: FIXED (F-15) — the approving POST /authorize binds the flow to the
 // browser with a `__Host-cm-auth-<state>` cookie whose SHA-256 is stashed with
-// the state; /callback refuses (without consuming the stash) unless it matches.
+// the state; /callback refuses unless it matches, and a refusal consumes the
+// stash (A-6(4)), so a refused URL cannot be redeemed afterwards.
 //
 // Against the real `createOAuthHandler` with a fake KV, exactly like
 // oauth-handler.test.ts does; the flow is driven through the consent page
@@ -14,11 +15,14 @@
 //     key is still not atomic, but a /callback without the binding cookie no
 //     longer reaches it: two concurrent requests carrying the state but not
 //     the cookie are both refused before the upstream token endpoint is
-//     called. Accepted residual: the SAME browser double-submitting /callback
+//     called, and the first refusal deletes the stash (A-6(4)), so the
+//     legitimate browser is refused afterwards too (it restarts). Accepted
+//     residual: the SAME browser double-submitting /callback
 //     within KV propagation can still pass twice; the upstream's single-use
 //     code makes the second exchange fail.
 //   - FIXED (F-15, was STATIC): the state is no longer the only binding — a
-//     different browser holding the state string cannot complete the flow.
+//     different browser holding the state string cannot complete the flow,
+//     and since A-6(4) its attempt cancels the flow for everyone.
 //   - REFUTED: state entries are written with the documented 600 s TTL.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -111,7 +115,7 @@ describe("A2 /callback state handling", () => {
     expect(completeSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("FIXED (F-15): two concurrent /callback requests without the binding cookie are both refused before any upstream call", async () => {
+  it("FIXED (F-15, A-6(4)): two concurrent /callback requests without the binding cookie are both refused before any upstream call, and the stash is consumed", async () => {
     const kv = makeKV();
     const completeSpy = vi.fn(async () => ({ redirectTo: "https://claude.ai/cb?code=x" }));
     const env = makeEnv(kv, completeSpy);
@@ -128,36 +132,45 @@ describe("A2 /callback state handling", () => {
     expect(r2.status).toBe(400);
     expect(tokenCalls).toHaveLength(0);
     expect(completeSpy).not.toHaveBeenCalled();
-    // The stash was not consumed, so the legitimate browser still completes.
-    expect(kv.data.has(`auth-state:${state}`)).toBe(true);
+    // The refusal consumed the stash, so the refused URL is dead even for the
+    // browser holding the matching cookie.
+    expect(kv.data.has(`auth-state:${state}`)).toBe(false);
     const legit = await app.request(`https://w.test/callback?code=UPC&state=${state}`, { headers: { cookie: authCookiePair } }, env);
-    expect(legit.status).toBe(302);
-    expect(tokenCalls).toHaveLength(1);
-    expect(completeSpy).toHaveBeenCalledTimes(1);
+    expect(legit.status).toBe(400);
+    expect(await legit.text()).toBe("State expired or invalid");
+    expect(tokenCalls).toHaveLength(0);
+    expect(completeSpy).not.toHaveBeenCalled();
     // Accepted residual (not exercised): the same browser double-submitting
     // within KV propagation can still race; the upstream's single-use code
     // makes the second exchange fail.
   });
 
-  it("FIXED (F-15): the approving POST binds the state to the browser — a different browser cannot complete the flow", async () => {
+  it("FIXED (F-15, A-6(4)): the approving POST binds the state to the browser — a different browser cannot complete the flow, and its attempt cancels it", async () => {
     const kv = makeKV();
     const completeSpy = vi.fn(async () => ({ redirectTo: "https://claude.ai/cb?code=x" }));
     const env = makeEnv(kv, completeSpy);
     const app = createOAuthHandler(POC_PROVIDER);
-    stubUpstream();
+    const tokenCalls = stubUpstream();
 
-    const { state, authCookie, authCookiePair } = await approve(app, env);
-    expect(authCookie).toMatch(new RegExp(`^__Host-cm-auth-${state}=[A-Za-z0-9_-]{43}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$`));
     // A different "browser" (no cookie, or its own cookie value) holding the state.
-    for (const cookie of [undefined, `__Host-cm-auth-${state}=someone-elses-value`]) {
+    for (const cookie of [undefined, "someone-elses-value"]) {
+      const { state, authCookie, authCookiePair } = await approve(app, env);
+      expect(authCookie).toMatch(new RegExp(`^__Host-cm-auth-${state}=[A-Za-z0-9_-]{43}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600$`));
       const other = await app.request(
         `https://w.test/callback?code=UPC&state=${state}`,
-        { headers: { "user-agent": "someone-else", ...(cookie ? { cookie } : {}) } },
+        { headers: { "user-agent": "someone-else", ...(cookie ? { cookie: `__Host-cm-auth-${state}=${cookie}` } : {}) } },
         env,
       );
       expect(other.status).toBe(400);
+      expect(kv.data.has(`auth-state:${state}`)).toBe(false);
+      // The refused URL is dead for the owning browser too; it restarts.
+      const mine = await app.request(`https://w.test/callback?code=UPC&state=${state}`, { headers: { cookie: authCookiePair } }, env);
+      expect(mine.status).toBe(400);
     }
+    expect(tokenCalls).toHaveLength(0);
     expect(completeSpy).not.toHaveBeenCalled();
+    // Control: the owning browser on an untouched flow completes.
+    const { state, authCookiePair } = await approve(app, env);
     const mine = await app.request(`https://w.test/callback?code=UPC&state=${state}`, { headers: { cookie: authCookiePair } }, env);
     expect(mine.status).toBe(302);
   });

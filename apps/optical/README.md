@@ -123,7 +123,9 @@ secrets to both environments, and deploys.
   the IdP and retry.
 - **No file attachments / no staging bindings.** Unlike Gmail/Xero,
   `apps/optical/wrangler.jsonc` has no R2/D1/STAGING_* bindings. Optical's API is pure JSON. (Its
-  `*/5` cron only drives the shared OAuth inactive-client sweep.)
+  `*/5` cron drives setupProvider's `scheduled` hook, the staging sweep, which is a no-op here
+  without staging bindings. OAuth client records expire by KV TTL; see
+  `packages/scaffold/SECURITY.md` §7.13.)
 
 ## Spec re-sync
 

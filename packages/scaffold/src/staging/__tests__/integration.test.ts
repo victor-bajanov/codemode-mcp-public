@@ -19,6 +19,7 @@ describe("integration: register → upload → fetch → getFile → sweep", () 
 
     // 1. register
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -66,6 +67,7 @@ describe("integration: register → upload → fetch → getFile → sweep", () 
 
     // 4. fetch via getFile capability (what the sandbox sees)
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -104,6 +106,7 @@ describe("integration: putFile round-trip via fetch_url", () => {
 
     // 1. register + upload an initial fixture.
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -130,6 +133,7 @@ describe("integration: putFile round-trip via fetch_url", () => {
 
     // 2. inside-sandbox flow: getFile then putFile on the same bytes.
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -141,6 +145,7 @@ describe("integration: putFile round-trip via fetch_url", () => {
     if (!got.ok) return;
 
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -178,6 +183,7 @@ describe("integration: putFile round-trip via fetch_url", () => {
     const now = () => clock;
 
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,

@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from "vitest";
 import type { ApiProvider } from "./api-provider.js";
-import { genericWalker, buildRequestedSchema, resolveRenderer } from "./elicit.js";
+import { genericWalker, resolveRenderer } from "./elicit.js";
 import { annotateSpecWithSurfaceReview, type AnnotatableSpec } from "./annotate-spec.js";
 import { buildProviderDocs } from "./descriptions/docs.js";
 // DOCS_TOOL_DESCRIPTION comes from descriptions/compact.js, NOT
@@ -37,6 +37,23 @@ function collectOperationIdToMethod(spec: SpecLike): Map<string, string> {
   return m;
 }
 
+/** Entries whose `inspectUpstream` hook is not paired with `inspect` on a
+ *  body-bearing method (POST/PUT/PATCH). The request handler refuses an
+ *  unpaired hook at run time; this catches it at test time. */
+export function inspectUpstreamProblems(
+  provider: Pick<ApiProvider<Record<string, unknown>>, "spec" | "surfaceReview">,
+): string[] {
+  const idToMethod = collectOperationIdToMethod(provider.spec as unknown as SpecLike);
+  const problems: string[] = [];
+  for (const [id, e] of Object.entries(provider.surfaceReview)) {
+    if (e.inspectUpstream === undefined) continue;
+    if (e.inspect === undefined) problems.push(`${id}: inspectUpstream without inspect`);
+    const method = idToMethod.get(id) ?? "unknown";
+    if (!HTTP_METHODS_WITH_BODY.has(method)) problems.push(`${id}: inspectUpstream on a non-body method (${method})`);
+  }
+  return problems;
+}
+
 /** Run the standard battery of surface-review invariants for an ApiProvider.
  *  Wraps describe/it from vitest; intended to be called from a *.test.ts file. */
 export function providerSurfaceReviewTests<P extends Record<string, unknown>>(
@@ -64,7 +81,13 @@ export function providerSurfaceReviewTests<P extends Record<string, unknown>>(
       expect(inspectorOnNonBody).toEqual([]);
     });
 
-    it("every elicit entry resolves to a renderer (per-op, per-category, or non-empty walker output)", () => {
+    it("every entry with inspectUpstream also has inspect and is on a body-bearing method", () => {
+      expect(inspectUpstreamProblems(provider)).toEqual([]);
+    });
+
+    it("every elicit entry renders a dialog headline (per-op, per-category, or walker)", () => {
+      // D-1: the walker may return no facts (the scaffold still shows the
+      // request line); every dialog needs a headline naming the action.
       const failures: string[] = [];
       for (const [opId, entry] of Object.entries(provider.surfaceReview)) {
         if (entry.decision !== "elicit") continue;
@@ -75,26 +98,33 @@ export function providerSurfaceReviewTests<P extends Record<string, unknown>>(
           operationId: opId,
           body: undefined,                                    // schema-only check
         });
-        if (!out.fields || Object.keys(out.fields).length === 0) {
+        if (typeof out.headline !== "string" || out.headline === "") {
           failures.push(opId);
         }
       }
       expect(failures).toEqual([]);
     });
 
-    it("every renderer's output round-trips through buildRequestedSchema", () => {
+    it("every renderer returns a headline and primitive-only facts", () => {
       const failures: string[] = [];
       for (const [opId, entry] of Object.entries(provider.surfaceReview)) {
         if (entry.decision !== "elicit") continue;
         const renderer = resolveRenderer(entry, entry.category, provider.elicitRenderers);
         if (!renderer) continue;
         try {
-          const out = renderer({ operationId: opId, body: undefined });
-          const schema = buildRequestedSchema(out.fields);
-          // Sanity: every required key has a primitive type entry.
-          for (const k of schema.required) {
-            const t = schema.properties[k]?.type;
-            if (t !== "string" && t !== "number" && t !== "boolean") failures.push(opId);
+          const out = renderer({
+            operationId: opId,
+            method: idToMethod.get(opId) ?? "POST",
+            path: "/",
+            pathParams: {},
+            body: undefined,
+          });
+          if (typeof out.headline !== "string" || out.headline === "") failures.push(`${opId}: empty headline`);
+          // Facts are shown, never asked: each must be a primitive.
+          for (const [k, v] of Object.entries(out.facts)) {
+            if (typeof v !== "string" && typeof v !== "number" && typeof v !== "boolean") {
+              failures.push(`${opId}: fact ${k} is not a primitive`);
+            }
           }
         } catch (e) {
           failures.push(`${opId}: ${(e as Error).message}`);

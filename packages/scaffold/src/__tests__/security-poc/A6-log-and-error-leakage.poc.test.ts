@@ -104,6 +104,7 @@ describe("A6 console and error-channel leakage", () => {
       STAGING_R2: new FakeR2() as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 },
       uploadOrigin: "https://w",
+      owner: "user-A",
     };
     const out = (await handleUpstreamRequest({
       ...baseArgs(broker), stagingStore, ctx: { method: "GET", path: "/files/1", returnAs: "stage" },

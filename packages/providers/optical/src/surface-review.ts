@@ -157,6 +157,31 @@ export const surfaceReview: SurfaceReview = Object.freeze({
   setTimezone:   { decision: "allow", category: "standard_write" },
   resetTimezone: { decision: "allow", category: "standard_write" },
 
+  // listActAs (delegated-access re-vendor) lists whose calendars the caller
+  // can act for and who can act for the caller. Caller-scoped: optical refuses
+  // it under an Optical-On-Behalf-Of header naming anyone else. As a side
+  // effect it re-checks the caller's existing delegation rows against their
+  // own calendar list and each Google owner's mail route, but it never adds an
+  // owner and never changes any provider sharing, so it is a read from the
+  // caller's point of view. Deployment-gated (DELEGATION_ENABLED, else 403).
+  listActAs:     { decision: "allow", category: "standard_read" },
+
+  // Internal meeting find (meeting-find re-vendor). findMeetingTime ranks up
+  // to 5 slots for the caller plus up to 8 attendee addresses the caller
+  // supplies. It reads attendee free/busy through the caller's own access
+  // and prices Optical attendees' weeks read-only: it writes no event, task,
+  // plan or mail, only audit rows. It returns cost numbers, never event
+  // titles. Rate-limited per actor server-side. Deployment-gated
+  // (MEETING_FIND_ENABLED, else 403 feature_disabled).
+  findMeetingTime: { decision: "allow", category: "standard_read" },
+  // bookMeetingTime creates one event on the caller's own calendar for an
+  // option of a recent find (15-minute token), inviting the attendees named
+  // in that find, so the fan-out is the list the caller already gave. It
+  // re-checks free/busy first (409 slot_unavailable) and is idempotent per
+  // find. Optical gates it under AGENT_CONFIRM_CLIENT_IDS (202 until the
+  // user clicks the emailed link). Same reach class as resolveMeetingPoll.
+  bookMeetingTime: { decision: "allow", category: "standard_write" },
+
   // deleteAccount (hosted-trial re-vendor) runs the full offboard on the
   // caller's own subject: irreversible, the most destructive op on the
   // surface. `allow` rather than `elicit` because `elicit` is a silent

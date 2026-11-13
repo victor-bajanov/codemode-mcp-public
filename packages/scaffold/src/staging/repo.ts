@@ -8,6 +8,8 @@ export interface InsertPendingInput {
   filename: string | null;
   created_at: number;
   expires_at: number;
+  /** E-1: the principal that registered the upload. */
+  owner: string;
 }
 
 export interface AtomicClaimInput {
@@ -26,8 +28,8 @@ export async function insertPending(d1: D1Database, input: InsertPendingInput): 
   await d1
     .prepare(
       `INSERT INTO staging
-       (token_hash, file_handle, state, content_type_hint, expected_byte_len, filename, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (token_hash, file_handle, state, content_type_hint, expected_byte_len, filename, created_at, expires_at, owner)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.token_hash,
@@ -38,6 +40,7 @@ export async function insertPending(d1: D1Database, input: InsertPendingInput): 
       input.filename,
       input.created_at,
       input.expires_at,
+      input.owner,
     )
     .run();
 }
@@ -79,6 +82,8 @@ export interface InsertClaimedInput {
   claimed_at: number;
   expires_at: number;
   enc_version: EncVersion;
+  /** E-1: the principal that stored the file. */
+  owner: string;
 }
 
 export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): Promise<void> {
@@ -86,8 +91,8 @@ export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): 
     .prepare(
       `INSERT INTO staging
        (token_hash, file_handle, state, r2_key, iv, content_type_hint, content_type,
-        expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at, enc_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        expected_byte_len, byte_len, filename, created_at, claimed_at, expires_at, enc_version, owner)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.token_hash,
@@ -104,6 +109,7 @@ export async function insertClaimed(d1: D1Database, input: InsertClaimedInput): 
       input.claimed_at,
       input.expires_at,
       input.enc_version,
+      input.owner,
     )
     .run();
 }
@@ -156,7 +162,30 @@ export async function lookupByHash(d1: D1Database, token_hash: Uint8Array): Prom
     claimed_at: (raw.claimed_at as number | null) ?? null,
     expires_at: raw.expires_at as number,
     enc_version: toEncVersion(raw.enc_version),
+    // Pre-0003 rows have neither column: owner null (refused by every reader), never fetched.
+    owner: typeof raw.owner === "string" ? raw.owner : null,
+    fetch_count: typeof raw.fetch_count === "number" ? raw.fetch_count : 0,
   };
+}
+
+/**
+ * Count one public download against the row's limit (E-1, STAGING_FETCH_MAX_USES). True when
+ * this call was counted: the row is claimed, unexpired and below `maxUses`. One atomic
+ * statement, so N+k concurrent GETs at limit N yield exactly N wins.
+ */
+export async function countPublicFetch(
+  d1: D1Database,
+  token_hash: Uint8Array,
+  maxUses: number,
+  now: number,
+): Promise<boolean> {
+  const result = await d1
+    .prepare(
+      `UPDATE staging SET fetch_count=fetch_count+1 WHERE token_hash=? AND state='claimed' AND fetch_count<? AND expires_at>? RETURNING file_handle`,
+    )
+    .bind(token_hash, maxUses, now)
+    .first<{ file_handle: string }>();
+  return result != null;
 }
 
 export async function markCorrupt(d1: D1Database, token_hash: Uint8Array): Promise<void> {

@@ -63,7 +63,7 @@ function world() {
   const r2 = new FakeR2();
   const D1 = d1 as unknown as D1Database;
   const R2 = r2 as unknown as R2Bucket;
-  const deps = { STAGING_D1: D1, STAGING_R2: R2, config: CFG, uploadOrigin: "https://x.test", now: () => NOW };
+  const deps = { STAGING_D1: D1, STAGING_R2: R2, config: CFG, uploadOrigin: "https://x.test", owner: "user-A", now: () => NOW };
   const open = createStagedFileOpener(deps);
   const stage = async (bytes: Uint8Array, seedless = false): Promise<StagedRef & { r2_key: string }> => {
     const r = await stageFromBlocks(deps, blockSourceFromBytes(bytes), "application/pdf", seedless ? null : "q.pdf");

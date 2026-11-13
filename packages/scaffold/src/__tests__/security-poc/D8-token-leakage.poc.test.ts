@@ -66,7 +66,7 @@ function world(env: Record<string, string> = { DEBUG_ELICIT: "true", ALLOW_PII_I
   const d1 = new FakeD1();
   const r2 = new FakeR2();
   const D1 = d1 as unknown as D1Database;
-  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", now: () => NOW };
+  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", owner: "user-A", now: () => NOW };
   const opener = createStagedFileOpener(deps);
   const sinks = ["log", "error", "warn", "info", "debug"] as const;
   const spies = sinks.map((s) => vi.spyOn(console, s).mockImplementation(() => {}));
@@ -117,6 +117,7 @@ function world(env: Record<string, string> = { DEBUG_ELICIT: "true", ALLOW_PII_I
   const pending = async (): Promise<StagedRef> => {
     const ref = { file_handle: mintFileHandle(), token: mintToken() };
     await insertPending(D1, {
+      owner: "user-A",
       token_hash: await sha256Bearer(ref.token),
       file_handle: ref.file_handle,
       content_type_hint: null,
@@ -342,7 +343,10 @@ describe("D8 — L2 the approval dialog", () => {
     const r = (await handleUpstreamRequest(w.args(composedOf(ref), { surfaceReview: sr }))) as { success: boolean };
     expect(r.success).toBe(true);
     const params = w.elicitCalls[0] as { message: string; requestedSchema: { properties: Record<string, unknown> } };
-    expect(Object.keys(params.requestedSchema.properties).sort()).toEqual(["attachments", "count"]);
+    // D-1: the summary is shown as facts in the message; the schema is confirm-only.
+    expect(Object.keys(params.requestedSchema.properties)).toEqual(["confirm"]);
+    expect(params.message).toContain("count: 1");
+    expect(params.message).toMatch(/attachments: .+ \(10 bytes\)/);
     assertClean(JSON.stringify(params), ref);
     assertClean(w.consoleText(), ref);
   });

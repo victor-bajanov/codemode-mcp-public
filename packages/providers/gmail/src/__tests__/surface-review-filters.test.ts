@@ -203,3 +203,22 @@ describe("inspectFilterCreate", () => {
     });
   });
 });
+
+describe("inspectFilterCreate summary is not silently truncated (D-1)", () => {
+  // A silent 200-character cut let padding hide the dangerous label or the
+  // sender; the scaffold now cuts dialog values visibly (with "…").
+  const padding = Array.from({ length: 40 }, (_, i) => `Label_${String(i).padStart(8, "0")}`);
+  const criteria = { negatedQuery: "z".repeat(400), from: "security@bank.example" };
+
+  it.each([
+    ["irreversible", { removeLabelIds: padding, addLabelIds: ["TRASH"] }],
+    ["persistent_state", { addLabelIds: padding, removeLabelIds: ["INBOX"] }],
+  ])("%s summary carries the whole criteria and action JSON", (_cat, action) => {
+    const result = inspectFilterCreate({ body: { criteria, action } });
+    expect(result.decision).toBe("elicit");
+    expect(result.summary).toEqual({
+      criteria: JSON.stringify(criteria),
+      action: JSON.stringify(action),
+    });
+  });
+});

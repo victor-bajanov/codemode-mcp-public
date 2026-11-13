@@ -3,8 +3,11 @@
 // Inspector for createCreditNotes / updateOrCreateCreditNotes / updateCreditNote.
 // Mirrors the invoice draft policy (same Status enum, same SentToContact gate):
 //   - Status ∈ {DRAFT, SUBMITTED} → allow.
-//   - Status omitted + CreditNoteID present → allow (update preserving existing state).
-//   - Status omitted + no CreditNoteID → deny (would be a create with no explicit state).
+//   - Status omitted or null → deny creditnote-status-required, with or without a
+//     CreditNoteID (F2-4; the stored credit note is read by the stored-status hook).
+//   - By-id update: a body CreditNoteID must equal the path id (creditnote-id-mismatch).
+//   - The inline Contact may not carry sensitive contact fields
+//     (creditnote-inline-contact-details).
 //   - any other Status (AUTHORISED, PAID, VOIDED, DELETED) → deny.
 //   - SentToContact set (anything but absent/null/false) → deny regardless of Status.
 //   - Gated keys (wrapper, Status, CreditNoteID, SentToContact) are read case-insensitively,
@@ -50,7 +53,7 @@ describe("inspectCreditNoteDraft", () => {
   it("denies when Status is missing and no CreditNoteID (would be a create)", () => {
     expect(inspectCreditNoteDraft({
       body: { CreditNotes: [{ Type: "ACCRECCREDIT" }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-not-draft" });
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-status-required" });
   });
 
   it("denies when CreditNotes array is empty", () => {
@@ -77,12 +80,18 @@ describe("inspectCreditNoteDraft", () => {
     })).toEqual({ decision: "allow" });
   });
 
-  // === Status-omitted updates: CreditNoteID signals "preserve existing state" ===
+  // === F2-4: Status-omitted updates are no longer "preserve existing state" ===
 
-  it("allows a bulk update with CreditNoteID and no Status (preserve existing state)", () => {
+  it("FIXED (F2-4): denies a bulk update with CreditNoteID and no Status", () => {
     expect(inspectCreditNoteDraft({
       body: { CreditNotes: [{ CreditNoteID: "8576f4cf-e24d-4e3a-83ff-c6f30418a7de", Reference: "edit" }] },
-    })).toEqual({ decision: "allow" });
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-status-required" });
+  });
+
+  it("FIXED (F2-4): any non-empty id string no longer grants anything (\"x\", no Status)", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: "x", Type: "ACCPAYCREDIT" }] },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-status-required" });
   });
 
   it("still denies a bulk update when CreditNoteID is present but Status is AUTHORISED", () => {
@@ -94,7 +103,7 @@ describe("inspectCreditNoteDraft", () => {
   it("denies a bulk update with empty-string CreditNoteID and no Status", () => {
     expect(inspectCreditNoteDraft({
       body: { CreditNotes: [{ CreditNoteID: "" }] },
-    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-not-draft" });
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-status-required" });
   });
 
   // === Singular by-ID update (POST /CreditNotes/{ID}) — flat body, no CreditNotes wrapper ===
@@ -105,10 +114,10 @@ describe("inspectCreditNoteDraft", () => {
     })).toEqual({ decision: "allow" });
   });
 
-  it("allows a singular flat-body update with CreditNoteID and no Status", () => {
+  it("FIXED (F2-4): denies a singular flat-body update with CreditNoteID and no Status", () => {
     expect(inspectCreditNoteDraft({
       body: { CreditNoteID: "8576f4cf-e24d-4e3a-83ff-c6f30418a7de", Reference: "edit" },
-    })).toEqual({ decision: "allow" });
+    })).toMatchObject({ decision: "deny", category: "irreversible", reason: "creditnote-status-required" });
   });
 
   it("denies a singular flat-body AUTHORISED credit note", () => {
@@ -159,7 +168,12 @@ describe("inspectCreditNoteDraft", () => {
 
   it("reads CreditNoteID case-insensitively and denies two spellings of it", () => {
     expect(inspectCreditNoteDraft({
-      body: { CreditNotes: [{ creditNoteId: ID }] },
+      body: { CreditNotes: [{ creditNoteId: "other", Status: "DRAFT" }] },
+      pathParams: { CreditNoteID: ID },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-id-mismatch" });
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ creditNoteId: ID, Status: "DRAFT" }] },
+      pathParams: { CreditNoteID: ID },
     })).toEqual({ decision: "allow" });
     expect(inspectCreditNoteDraft({
       body: { CreditNotes: [{ CreditNoteID: ID, creditnoteid: "other" }] },
@@ -189,7 +203,7 @@ describe("inspectCreditNoteDraft", () => {
 
   it("treats a lower-case creditnotes wrapper as bulk", () => {
     expect(inspectCreditNoteDraft({
-      body: { creditnotes: [{ Status: "AUTHORISED" }], CreditNoteID: "x" },
+      body: { creditnotes: [{ Status: "AUTHORISED" }] },
     })).toMatchObject({ decision: "deny", reason: "creditnote-not-draft" });
     expect(inspectCreditNoteDraft({
       body: { creditNotes: [{ Status: "DRAFT" }] },
@@ -200,5 +214,68 @@ describe("inspectCreditNoteDraft", () => {
     expect(inspectCreditNoteDraft({
       body: { CreditNotes: [{ Status: "DRAFT" }], creditnotes: [{ Status: "AUTHORISED" }] },
     })).toMatchObject({ decision: "deny", reason: "creditnote-ambiguous-key" });
+  });
+
+  it("FIXED (F2-4): treats a null Status like an absent one", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, Status: null }] },
+    })).toMatchObject({ decision: "deny", reason: "creditnote-status-required" });
+  });
+
+  it("FIXED (F2-4): denies a by-id update whose body CreditNoteID names another credit note", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNoteID: "0f3d1c2e-4b5a-4c6d-8e7f-9a0b1c2d3e4f", Status: "DRAFT" },
+      pathParams: { CreditNoteID: ID },
+    })).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-id-mismatch" });
+  });
+
+  it("FIXED (F2-4 review): denies more than one item on the by-id endpoint", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteID: ID, Status: "DRAFT" }, { CreditNoteNumber: "CN-POSTED", Status: "DRAFT" }] },
+      pathParams: { CreditNoteID: ID },
+    })).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-by-id-multiple-items" });
+  });
+
+  it("FIXED (F2-4 review): denies a key beside the CreditNotes wrapper", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ Status: "DRAFT" }], CreditNoteID: ID, Status: "AUTHORISED" },
+    })).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-unexpected-key" });
+  });
+
+  it("FIXED (F2-4 review): denies a CreditNoteNumber with surrounding whitespace or not a string", () => {
+    for (const CreditNoteNumber of ["CN-1 ", " CN-1", 7]) {
+      expect(inspectCreditNoteDraft({
+        body: { CreditNotes: [{ CreditNoteNumber, Status: "DRAFT" }] },
+      })).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-bad-number" });
+    }
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ CreditNoteNumber: "CN-1", Status: "DRAFT" }] },
+    })).toEqual({ decision: "allow" });
+  });
+
+  it("FIXED (F2-4 review): denies a Status that is not a string", () => {
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ Status: ["DRAFT"] }] },
+    })).toMatchObject({ decision: "deny", category: "malformed", reason: "creditnote-bad-status" });
+  });
+
+  it("FIXED (F2-1): denies an inline Contact carrying a sensitive field", () => {
+    const res = inspectCreditNoteDraft({
+      body: { CreditNotes: [{ Status: "DRAFT", Contact: { ContactID: ID, ContactPersons: [{ EmailAddress: "a@attacker.example" }] } }] },
+    });
+    expect(res).toMatchObject({ decision: "deny", category: "financial_legal", reason: "creditnote-inline-contact-details" });
+    expect(res.message).toContain("ContactPersons");
+    expect(inspectCreditNoteDraft({
+      body: { CreditNotes: [{ Status: "DRAFT", Contact: { ContactID: ID } }] },
+    })).toEqual({ decision: "allow" });
+  });
+});
+
+describe("a flat body keyed by the singular root is refused (wave 3 review)", () => {
+  it("FIXED: `{ CreditNote: { … } }` is denied creditnote-unexpected-key", () => {
+    for (const key of ["CreditNote", "creditnote"]) {
+      expect(inspectCreditNoteDraft({ body: { [key]: { CreditNoteID: "x", Status: "DRAFT" } } }), key)
+        .toMatchObject({ decision: "deny", reason: "creditnote-unexpected-key" });
+    }
   });
 });

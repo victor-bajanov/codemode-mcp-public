@@ -5,14 +5,16 @@
 // name outside RFC 5322 ftext denies as malformed, and an address-list element
 // carrying a quoted string or a comment is refused rather than having a
 // look-alike angle-addr pulled out of it (F-3, F-18).
-// Every case runs on each channel that carries RFC 822 text: JSON `raw`,
-// `rawBody` (uploadType=media) and `multipart` (uploadType=multipart).
+// Every case runs on each path that carries RFC 822 text: messages.send `raw`,
+// drafts.send `message.raw` and the messages.send.media `rawBody` upload. The
+// JSON messages.send endpoint refuses a rawBody or multipart body outright.
 
 import { describe, it, expect } from "vitest";
-import type { InspectRequest } from "@local/shared";
+import type { InspectRequest, InspectResult } from "@local/shared";
 import {
   inspectDraftSend,
   inspectOutboundMessage,
+  inspectOutboundMessageMedia,
   MASS_SEND_THRESHOLD,
   UNREADABLE_RECIPIENT_MESSAGE,
 } from "../inspectors/outbound";
@@ -29,23 +31,46 @@ function b64(s: string): string {
   return Buffer.from(s, "utf8").toString("base64");
 }
 
-/** The same RFC 822 text on each channel the inspector reads it from. */
-const CHANNELS: ReadonlyArray<[string, (msg: string) => InspectRequest]> = [
-  ["JSON raw", (msg) => ({ body: { raw: b64url(msg) } })],
-  ["rawBody", (msg) => ({ rawBody: new TextEncoder().encode(msg), contentType: "message/rfc822" })],
-  [
-    "multipart",
-    (msg) => ({
+const media = (msg: string): InspectRequest => ({
+  rawBody: new TextEncoder().encode(msg),
+  contentType: "message/rfc822",
+  query: { uploadType: "media" },
+});
+
+/** The same RFC 822 text judged on each path that reads it: messages.send
+ *  `raw`, drafts.send `message.raw` and the messages.send.media upload. */
+const CHANNELS: ReadonlyArray<[string, (msg: string) => InspectResult]> = [
+  ["messages.send raw", (msg) => inspectOutboundMessage({ body: { raw: b64url(msg) } }, ENV)],
+  ["drafts.send message.raw", (msg) => inspectDraftSend({ body: { id: "d1", message: { raw: b64url(msg) } } }, ENV)],
+  ["messages.send.media rawBody", (msg) => inspectOutboundMessageMedia(media(msg), ENV)],
+];
+
+describe("non-JSON channels on the JSON messages.send endpoint are refused", () => {
+  const msg = `To: ${OK}\r\nSubject: hi\r\n\r\nbody\r\n`;
+  it.each<[string, InspectRequest]>([
+    ["rawBody", media(msg)],
+    ["multipart", {
       multipart: [
         { name: "metadata", contentType: "application/json", value: "{}" },
         { name: "media", contentType: "message/rfc822", bodyBase64: b64(msg) },
       ],
       contentType: "multipart/related",
-    }),
-  ],
-];
+    }],
+  ])("denies an allowlisted %s message as send-no-raw", (_label, req) => {
+    expect(inspectOutboundMessage(req, ENV)).toMatchObject({ decision: "deny", reason: "send-no-raw" });
+  });
 
-describe.each(CHANNELS)("duplicate recipient headers (%s)", (_channel, req) => {
+  it("the media send still refuses a multipart body (unchanged)", () => {
+    const req: InspectRequest = {
+      multipart: [{ name: "media", contentType: "message/rfc822", value: msg }],
+      contentType: "message/rfc822",
+      query: { uploadType: "media" },
+    };
+    expect(inspectOutboundMessageMedia(req, ENV)).toMatchObject({ decision: "deny", reason: "send-no-recipients" });
+  });
+});
+
+describe.each(CHANNELS)("duplicate recipient headers (%s)", (_channel, judge) => {
   it.each([
     ["To", `To: ${EVIL}\r\nTo: ${OK}\r\nSubject: hi\r\n\r\nbody\r\n`],
     ["Cc", `To: ${OK}\r\nCc: ${EVIL}\r\nCc: ${OK2}\r\nSubject: hi\r\n\r\nbody\r\n`],
@@ -54,7 +79,7 @@ describe.each(CHANNELS)("duplicate recipient headers (%s)", (_channel, req) => {
     ["To, both allowlisted", `To: ${OK}\r\nTo: ${OK2}\r\n\r\nbody\r\n`],
     ["To, bare LF", `To: ${OK}\nTo: ${EVIL}\n\nbody\n`],
   ])("denies a repeated %s header", (_label, msg) => {
-    expect(inspectOutboundMessage(req(msg), ENV)).toMatchObject({
+    expect(judge(msg)).toMatchObject({
       decision: "deny",
       category: "malformed",
       reason: "duplicate-recipient-header",
@@ -64,21 +89,21 @@ describe.each(CHANNELS)("duplicate recipient headers (%s)", (_channel, req) => {
 
   it("does not treat a folded continuation as a second occurrence", () => {
     const msg = `To: ${OK},\r\n ${OK2}\r\nSubject: hi\r\n\r\nbody\r\n`;
-    expect(inspectOutboundMessage(req(msg), ENV).decision).toBe("allow");
+    expect(judge(msg).decision).toBe("allow");
   });
 
   it("allows one To, one Cc and one Bcc each carrying several allowlisted addresses", () => {
     const msg = `To: ${OK}, ${OK2}\r\nCc: a@allowed.example, b@allowed.example\r\nBcc: c@allowed.example\r\n\r\nbody\r\n`;
-    expect(inspectOutboundMessage(req(msg), ENV).decision).toBe("allow");
+    expect(judge(msg).decision).toBe("allow");
   });
 
   it("still allows a repeated non-recipient header (Subject, Received)", () => {
     const msg = `Received: a\r\nReceived: b\r\nTo: ${OK}\r\nSubject: one\r\nSubject: two\r\n\r\nbody\r\n`;
-    expect(inspectOutboundMessage(req(msg), ENV).decision).toBe("allow");
+    expect(judge(msg).decision).toBe("allow");
   });
 });
 
-describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_channel, req) => {
+describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_channel, judge) => {
   it("bare-LF headers with a CRLFCRLF later in the body: the body is ignored, the real To is judged", () => {
     const msg =
       `To: ${EVIL}\n` +
@@ -88,12 +113,12 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
       `To: ${OK}\n` +
       "\r\n\r\n" +
       "rest of body\n";
-    expect(inspectOutboundMessage(req(msg), ENV)).toMatchObject({ decision: "deny", reason: "external-send" });
+    expect(judge(msg)).toMatchObject({ decision: "deny", reason: "external-send" });
   });
 
   it("an off-list To in the body of a bare-LF message does not taint an allowlisted send", () => {
     const msg = `To: ${OK}\nSubject: hi\n\nquoted reply:\nTo: ${EVIL}\r\n\r\nmore\n`;
-    expect(inspectOutboundMessage(req(msg), ENV).decision).toBe("allow");
+    expect(judge(msg).decision).toBe("allow");
   });
 
   it("a lone CR in the header block denies as ambiguous (readers disagree on it)", () => {
@@ -111,7 +136,7 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
       // CR CR LF: the CR before CRLF is lone.
       `To: ${OK}\r\r\nTo: ${EVIL}\r\n\r\nbody`,
     ]) {
-      expect(inspectOutboundMessage(req(msg), ENV), JSON.stringify(msg)).toMatchObject({
+      expect(judge(msg), JSON.stringify(msg)).toMatchObject({
         ...ambiguous,
         message: expect.stringMatching(/bare CR or mixes CRLF with bare LF/),
       });
@@ -119,10 +144,10 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
   });
 
   it("a lone CR in the body, after a proper blank line, is not examined", () => {
-    expect(inspectOutboundMessage(req(`To: ${OK}\r\nSubject: hi\r\n\r\nbody\rTo: ${EVIL}\r\r`), ENV).decision).toBe(
+    expect(judge(`To: ${OK}\r\nSubject: hi\r\n\r\nbody\rTo: ${EVIL}\r\r`).decision).toBe(
       "allow",
     );
-    expect(inspectOutboundMessage(req(`To: ${OK}\nSubject: hi\n\nbody\r\rmore\r`), ENV).decision).toBe("allow");
+    expect(judge(`To: ${OK}\nSubject: hi\n\nbody\r\rmore\r`).decision).toBe("allow");
   });
 
   it("CRLF mixed with bare LF in the header block denies as ambiguous", () => {
@@ -132,7 +157,7 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
       `To: ${EVIL}\r\n\nTo: ${OK}\r\n\r\n`,
       `To: ${OK}\r\nSubject: hi\nCc: ${OK2}\r\n\r\nbody`,
     ]) {
-      expect(inspectOutboundMessage(req(msg), ENV), JSON.stringify(msg)).toMatchObject({
+      expect(judge(msg), JSON.stringify(msg)).toMatchObject({
         decision: "deny",
         category: "malformed",
         reason: "ambiguous-line-ending",
@@ -141,12 +166,12 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
   });
 
   it("mixed line endings in the body only are not examined", () => {
-    expect(inspectOutboundMessage(req(`To: ${OK}\r\nSubject: hi\r\n\r\nline\nline\r\n`), ENV).decision).toBe("allow");
-    expect(inspectOutboundMessage(req(`To: ${OK}\nSubject: hi\n\nline\r\nline\n`), ENV).decision).toBe("allow");
+    expect(judge(`To: ${OK}\r\nSubject: hi\r\n\r\nline\nline\r\n`).decision).toBe("allow");
+    expect(judge(`To: ${OK}\nSubject: hi\n\nline\r\nline\n`).decision).toBe("allow");
   });
 
   it("a message that begins with an empty line has no headers, so no recipients (fail closed)", () => {
-    expect(inspectOutboundMessage(req(`\r\nTo: ${OK}\r\n\r\nbody`), ENV)).toMatchObject({
+    expect(judge(`\r\nTo: ${OK}\r\n\r\nbody`)).toMatchObject({
       decision: "deny",
       reason: "send-no-recipients",
     });
@@ -154,7 +179,7 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
 
   it("an unparseable recipient address denies as external-send", () => {
     for (const to of [`${EVIL}@allowed.example`, '"a b"@allowed.example', `undisclosed: ${EVIL};`]) {
-      expect(inspectOutboundMessage(req(`To: ${to}\r\n\r\nbody`), ENV), to).toMatchObject({
+      expect(judge(`To: ${to}\r\n\r\nbody`), to).toMatchObject({
         decision: "deny",
         reason: "external-send",
       });
@@ -162,12 +187,12 @@ describe.each(CHANNELS)("header block ends at the first empty line (%s)", (_chan
   });
 
   it("an unreadable recipient tells the caller how to write it; an off-allowlist one does not (F-18)", () => {
-    expect(inspectOutboundMessage(req(`To: "Smith, John" <${OK}>\r\n\r\nbody`), ENV)).toMatchObject({
+    expect(judge(`To: "Smith, John" <${OK}>\r\n\r\nbody`)).toMatchObject({
       decision: "deny",
       reason: "external-send",
       message: UNREADABLE_RECIPIENT_MESSAGE,
     });
-    expect(inspectOutboundMessage(req(`To: ${EVIL}\r\n\r\nbody`), ENV).message).toBeUndefined();
+    expect(judge(`To: ${EVIL}\r\n\r\nbody`).message).toBeUndefined();
   });
 });
 
@@ -188,12 +213,14 @@ describe("header-only messages", () => {
   });
 
   it("an upload with no blank line at all still fails closed (terminator must be in the scan window)", () => {
-    const req = { rawBody: new TextEncoder().encode(`To: ${OK}\r\nSubject: hi`), contentType: "message/rfc822" };
-    expect(inspectOutboundMessage(req, ENV)).toMatchObject({ decision: "deny", reason: "send-no-recipients" });
+    expect(inspectOutboundMessageMedia(media(`To: ${OK}\r\nSubject: hi`), ENV)).toMatchObject({
+      decision: "deny",
+      reason: "send-no-recipients",
+    });
   });
 });
 
-describe("drafts.send update-and-send and payload.headers", () => {
+describe("drafts.send { id, message: { raw } } and the payload decoy", () => {
   it("drafts.send { id, message: { raw } } with a repeated To is denied", () => {
     const raw = b64url(`To: ${EVIL}\r\nTo: ${OK}\r\n\r\nbody`);
     expect(inspectDraftSend({ body: { id: "d1", message: { raw } } }, ENV)).toMatchObject({
@@ -202,12 +229,23 @@ describe("drafts.send update-and-send and payload.headers", () => {
     });
   });
 
-  it("payload.headers already collects every occurrence, so a repeated To there is judged in full", () => {
-    const twoTo = (a: string, b: string): InspectRequest => ({
-      body: { payload: { headers: [{ name: "To", value: a }, { name: "To", value: b }] } },
-    });
-    expect(inspectOutboundMessage(twoTo(EVIL, OK), ENV)).toMatchObject({ decision: "deny", reason: "external-send" });
-    expect(inspectOutboundMessage(twoTo(OK, OK2), ENV).decision).toBe("allow");
+  it("a repeated To in raw is denied on both send paths; a payload.headers decoy is refused unread", () => {
+    for (const [a, b] of [[EVIL, OK], [OK, OK2]]) {
+      const raw = b64url(`To: ${a}\r\nTo: ${b}\r\n\r\nbody`);
+      expect(inspectOutboundMessage({ body: { raw } }, ENV)).toMatchObject({
+        decision: "deny",
+        reason: "duplicate-recipient-header",
+      });
+      expect(inspectDraftSend({ body: { id: "d1", message: { raw } } }, ENV)).toMatchObject({
+        decision: "deny",
+        reason: "duplicate-recipient-header",
+      });
+      const headers = [{ name: "To", value: a }, { name: "To", value: b }];
+      expect(inspectOutboundMessage({ body: { payload: { headers } } }, ENV)).toMatchObject({
+        decision: "deny",
+        reason: "send-unexpected-key",
+      });
+    }
   });
 
   it("the mass-send summary shows the first Subject occurrence", () => {
@@ -241,11 +279,11 @@ const ANGLE_ADDR_DECOYS: ReadonlyArray<[string, string]> = [
   ["backslash in the display-name", `Staff\\x <${OK}>`],
 ];
 
-describe.each(CHANNELS)("quoted strings and comments in address lists fail closed (%s)", (_channel, req) => {
+describe.each(CHANNELS)("quoted strings and comments in address lists fail closed (%s)", (_channel, judge) => {
   it.each(ANGLE_ADDR_DECOYS)("denies %s as external-send", (_label, to) => {
     for (const field of ["To", "Cc", "Bcc"]) {
       const msg = field === "To" ? `To: ${to}\r\n\r\nbody` : `To: ${OK}\r\n${field}: ${to}\r\n\r\nbody`;
-      expect(inspectOutboundMessage(req(msg), ENV), `${field}: ${to}`).toMatchObject({
+      expect(judge(msg), `${field}: ${to}`).toMatchObject({
         decision: "deny",
         category: "external_data_flow",
         reason: "external-send",
@@ -255,7 +293,7 @@ describe.each(CHANNELS)("quoted strings and comments in address lists fail close
 
   it("refuses a quoted display-name even when the angle-addr is allowlisted (documented false positive)", () => {
     for (const to of [`"Staff" <${OK}>`, `"Smith, John" <${OK}>`, `${OK} (Staff)`]) {
-      expect(inspectOutboundMessage(req(`To: ${to}\r\n\r\nbody`), ENV), to).toMatchObject({
+      expect(judge(`To: ${to}\r\n\r\nbody`), to).toMatchObject({
         decision: "deny",
         reason: "external-send",
       });
@@ -272,34 +310,42 @@ describe.each(CHANNELS)("quoted strings and comments in address lists fail close
       `José Núñez <${OK}>`,
       `=?utf-8?B?Sm9zw6k=?= <${OK}>`,
     ]) {
-      expect(inspectOutboundMessage(req(`To: ${to}\r\n\r\nbody`), ENV).decision, to).toBe("allow");
+      expect(judge(`To: ${to}\r\n\r\nbody`).decision, to).toBe("allow");
     }
   });
 });
 
-describe("quoted strings and comments in payload.headers fail closed", () => {
-  it.each(ANGLE_ADDR_DECOYS)("denies %s as external-send", (_label, to) => {
+describe("quoted strings and comments: drafts.send message.raw fails closed, payload.headers is refused unread", () => {
+  it.each(ANGLE_ADDR_DECOYS)("denies %s as external-send in a drafts.send message.raw", (_label, to) => {
     for (const name of ["To", "cc", "BCC"]) {
-      const headers = name === "To" ? [{ name, value: to }] : [{ name: "To", value: OK }, { name, value: to }];
-      expect(inspectOutboundMessage({ body: { payload: { headers } } }, ENV), `${name}: ${to}`).toMatchObject({
+      const msg = name === "To" ? `To: ${to}\r\n\r\nbody` : `To: ${OK}\r\n${name}: ${to}\r\n\r\nbody`;
+      const body = { id: "d1", message: { raw: b64url(msg) } };
+      expect(inspectDraftSend({ body }, ENV), `${name}: ${to}`).toMatchObject({
         decision: "deny",
         reason: "external-send",
       });
     }
   });
 
-  it("drafts.send update-and-send with a quoted decoy is denied", () => {
-    const body = { id: "d1", message: { payload: { headers: [{ name: "To", value: `"<${OK}>" <${EVIL}>` }] } } };
-    expect(inspectDraftSend({ body }, ENV)).toMatchObject({ decision: "deny", reason: "external-send" });
+  it.each(ANGLE_ADDR_DECOYS)("refuses %s in payload.headers as send-unexpected-key", (_label, to) => {
+    for (const name of ["To", "cc", "BCC"]) {
+      const headers = name === "To" ? [{ name, value: to }] : [{ name: "To", value: OK }, { name, value: to }];
+      expect(inspectOutboundMessage({ body: { payload: { headers } } }, ENV), `${name}: ${to}`).toMatchObject({
+        decision: "deny",
+        reason: "send-unexpected-key",
+      });
+      expect(inspectDraftSend({ body: { id: "d1", message: { payload: { headers } } } }, ENV), `${name}: ${to}`)
+        .toMatchObject({ decision: "deny", reason: "send-unexpected-key" });
+    }
   });
 
-  it("still allows an unquoted display-name", () => {
-    const headers = [{ name: "To", value: `Staff <${OK}>` }];
-    expect(inspectOutboundMessage({ body: { payload: { headers } } }, ENV).decision).toBe("allow");
+  it("still allows an unquoted display-name in a drafts.send message.raw", () => {
+    const body = { id: "d1", message: { raw: b64url(`To: Staff <${OK}>\r\n\r\nbody`) } };
+    expect(inspectDraftSend({ body }, ENV).decision).toBe("allow");
   });
 });
 
-describe.each(CHANNELS)("header names outside RFC 5322 ftext (%s)", (_channel, req) => {
+describe.each(CHANNELS)("header names outside RFC 5322 ftext (%s)", (_channel, judge) => {
   it.each([
     ["NUL in the name", `To: ${OK}\r\nBcc\0: ${EVIL}\r\n\r\nbody`],
     ["space inside the name", `To: ${OK}\r\nB cc: ${EVIL}\r\n\r\nbody`],
@@ -307,7 +353,7 @@ describe.each(CHANNELS)("header names outside RFC 5322 ftext (%s)", (_channel, r
     ["DEL in the name", `To: ${OK}\r\nBcc\x7f: ${EVIL}\r\n\r\nbody`],
     ["empty name", `To: ${OK}\r\n: ${EVIL}\r\n\r\nbody`],
   ])("denies %s as malformed-header-name", (_label, msg) => {
-    expect(inspectOutboundMessage(req(msg), ENV)).toMatchObject({
+    expect(judge(msg)).toMatchObject({
       decision: "deny",
       category: "malformed",
       reason: "malformed-header-name",
@@ -315,7 +361,7 @@ describe.each(CHANNELS)("header names outside RFC 5322 ftext (%s)", (_channel, r
   });
 
   it("tolerates whitespace before the colon and leaves body lines alone", () => {
-    expect(inspectOutboundMessage(req(`To : ${OK}\r\nSubject\t: hi\r\n\r\nB cc: ${EVIL}\r\n`), ENV).decision).toBe(
+    expect(judge(`To : ${OK}\r\nSubject\t: hi\r\n\r\nB cc: ${EVIL}\r\n`).decision).toBe(
       "allow",
     );
   });

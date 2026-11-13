@@ -20,9 +20,12 @@
 //    ambiguity between the off-allowlist (deny) and mass-send (elicit) checks.
 //    Order: off-allowlist check first (deny wins), mass-send second.
 //
-//  * Drafts.update vs drafts.create: the inspector cannot tell them apart from
-//    body shape alone. When `body.message` is missing, return
-//    `draft-update-no-message`.
+//  * Sends are read from `raw` only (F1-1, F1-3). messages.send accepts the
+//    keys raw, threadId and labelIds; drafts.send accepts { id, message } with
+//    message keys raw, threadId, labelIds and id. Any other key — `payload`
+//    (Gmail's output-only parsed view) or a `message` wrapper on messages.send
+//    — is `send-unexpected-key`. A drafts.send without a non-empty
+//    `message.raw` is `draft-send-unvetted-recipients`.
 
 import { describe, it, expect } from "vitest";
 import {
@@ -143,19 +146,12 @@ describe("B2) outboundAllowlistFromEnv — per-deployment resolution", () => {
   });
 });
 
-describe("C) inspectOutboundMessage — messages.send body shape (top-level Message)", () => {
-  it("allows when all recipients are allowlisted (payload.headers)", () => {
+describe("C) inspectOutboundMessage — messages.send body shape (top-level Message, read from raw only)", () => {
+  const send = (headers: Record<string, string>) => ({ body: { raw: toBase64Url(rfc822(headers)) } });
+
+  it("allows when all recipients are allowlisted", () => {
     const result = inspectOutboundMessage(
-      {
-        body: {
-          payload: {
-            headers: [
-              { name: "To", value: "alice@example.com" },
-              { name: "Cc", value: "bob@example.com" },
-            ],
-          },
-        },
-      },
+      send({ To: "alice@example.com", Cc: "bob@example.com" }),
       ENV,
     );
     expect(result).toMatchObject({ decision: "allow" });
@@ -163,16 +159,7 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
 
   it("denies as external-send when any recipient is off the allowlist", () => {
     const result = inspectOutboundMessage(
-      {
-        body: {
-          payload: {
-            headers: [
-              { name: "To", value: "alice@example.com" },
-              { name: "Cc", value: "eve@evil.com" },
-            ],
-          },
-        },
-      },
+      send({ To: "alice@example.com", Cc: "eve@evil.com" }),
       ENV,
     );
     expect(result).toMatchObject({
@@ -189,16 +176,7 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
       { length: 30 },
       (_, i) => `user${i}@example.com`,
     );
-    const result = inspectOutboundMessage(
-      {
-        body: {
-          payload: {
-            headers: [{ name: "To", value: recipients.join(", ") }],
-          },
-        },
-      },
-      ENV,
-    );
+    const result = inspectOutboundMessage(send({ To: recipients.join(", ") }), ENV);
     expect(result).toMatchObject({
       decision: "elicit",
       category: "external_data_flow",
@@ -213,16 +191,7 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
     // Same address appears in both To and Cc — should count once.
     // With one (allowlisted) recipient, expect allow (NOT mass-send, NOT external).
     const result = inspectOutboundMessage(
-      {
-        body: {
-          payload: {
-            headers: [
-              { name: "To", value: "alice@example.com" },
-              { name: "Cc", value: "alice@example.com" },
-            ],
-          },
-        },
-      },
+      send({ To: "alice@example.com", Cc: "alice@example.com" }),
       ENV,
     );
     expect(result).toMatchObject({ decision: "allow" });
@@ -241,8 +210,30 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
     expect(result).toMatchObject({ decision: "allow" });
   });
 
-  it("denies as malformed when no recipients can be extracted", () => {
+  it("refuses the output-only payload.headers shape as send-unexpected-key (F1-1/F1-3)", () => {
+    const result = inspectOutboundMessage(
+      { body: { payload: { headers: [{ name: "To", value: "alice@example.com" }] } } },
+      ENV,
+    );
+    expect(result).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "send-unexpected-key",
+      message: expect.stringContaining("payload"),
+    });
+  });
+
+  it("denies as malformed when there is no raw to read", () => {
     const result = inspectOutboundMessage({ body: {} }, ENV);
+    expect(result).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "send-no-raw",
+    });
+  });
+
+  it("denies as malformed when raw yields no recipients", () => {
+    const result = inspectOutboundMessage(send({ Subject: "nobody" }), ENV);
     expect(result).toMatchObject({
       decision: "deny",
       category: "malformed",
@@ -251,32 +242,25 @@ describe("C) inspectOutboundMessage — messages.send body shape (top-level Mess
   });
 });
 
-describe("D) inspectOutboundMessage — draft wrapper body shape ({message: ...}), reached via drafts.send update-and-send", () => {
-  it("allows when message.raw recipients are allowlisted", () => {
-    const raw = toBase64Url(
-      rfc822({
-        To: "alice@example.com",
-        Subject: "Draft hello",
-      }),
-    );
-    const result = inspectOutboundMessage({ body: { message: { raw } } }, ENV);
-    expect(result).toMatchObject({ decision: "allow" });
+describe("D) the draft wrapper ({message: ...}) is refused on messages.send and read by inspectDraftSend", () => {
+  it("messages.send refuses a { message } wrapper as send-unexpected-key (F1-3)", () => {
+    const raw = toBase64Url(rfc822({ To: "alice@example.com", Subject: "Draft hello" }));
+    expect(inspectOutboundMessage({ body: { message: { raw } } }, ENV)).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "send-unexpected-key",
+      message: expect.stringContaining("message"),
+    });
   });
 
-  it("denies when message.payload.headers contains an off-allowlist recipient", () => {
-    const result = inspectOutboundMessage(
-      {
-        body: {
-          message: {
-            payload: {
-              headers: [{ name: "To", value: "eve@evil.com" }],
-            },
-          },
-        },
-      },
-      ENV,
-    );
-    expect(result).toMatchObject({
+  it("drafts.send allows when message.raw recipients are allowlisted", () => {
+    const raw = toBase64Url(rfc822({ To: "alice@example.com", Subject: "Draft hello" }));
+    expect(inspectDraftSend({ body: { id: "d1", message: { raw } } }, ENV)).toMatchObject({ decision: "allow" });
+  });
+
+  it("drafts.send denies when message.raw has an off-allowlist recipient", () => {
+    const raw = toBase64Url(rfc822({ To: "eve@evil.com" }));
+    expect(inspectDraftSend({ body: { id: "d1", message: { raw } } }, ENV)).toMatchObject({
       decision: "deny",
       category: "external_data_flow",
       reason: "external-send",
@@ -284,9 +268,9 @@ describe("D) inspectOutboundMessage — draft wrapper body shape ({message: ...}
   });
 });
 
-describe("E) inspectOutboundMessage — draft wrapper body shape ({id, message: ...}), reached via drafts.send update-and-send", () => {
-  it("allows when message recipients are allowlisted", () => {
-    const result = inspectOutboundMessage(
+describe("E) payload decoys and bare ids", () => {
+  it("drafts.send refuses { id, message: { payload } } as send-unexpected-key (F1-1)", () => {
+    const result = inspectDraftSend(
       {
         body: {
           id: "d1",
@@ -301,15 +285,27 @@ describe("E) inspectOutboundMessage — draft wrapper body shape ({id, message: 
       },
       ENV,
     );
-    expect(result).toMatchObject({ decision: "allow" });
-  });
-
-  it("denies as malformed when the body has only {id} and no message", () => {
-    const result = inspectOutboundMessage({ body: { id: "d1" } }, ENV);
     expect(result).toMatchObject({
       decision: "deny",
       category: "malformed",
-      reason: "draft-update-no-message",
+      reason: "send-unexpected-key",
+      message: expect.stringContaining("payload"),
+    });
+  });
+
+  it("messages.send refuses a body of only {id} as send-unexpected-key", () => {
+    expect(inspectOutboundMessage({ body: { id: "d1" } }, ENV)).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "send-unexpected-key",
+    });
+  });
+
+  it("drafts.send denies a bare {id} as draft-send-unvetted-recipients", () => {
+    expect(inspectDraftSend({ body: { id: "d1" } }, ENV)).toMatchObject({
+      decision: "deny",
+      category: "external_data_flow",
+      reason: "draft-send-unvetted-recipients",
     });
   });
 });
@@ -337,20 +333,20 @@ describe("F) drafts surface wiring — draft creation is ungated; the allowlist 
   });
 });
 
-describe("G) inspectDraftSend — stored drafts are unvetted, so bare-id send fails closed; update-and-send is inspected", () => {
+describe("G) inspectDraftSend — stored drafts are unvetted, so bare-id send fails closed; { id, message: { raw } } is inspected", () => {
   it("denies a bare {id} send (stored draft's recipients cannot be verified)", () => {
     expect(inspectDraftSend({ body: { id: "d1" } }, ENV)).toMatchObject({
       decision: "deny",
       category: "external_data_flow",
       reason: "draft-send-unvetted-recipients",
-      message: expect.stringContaining("update-and-send"),
+      message: expect.stringContaining("{ id, message: { raw } }"),
     });
   });
 
-  it("denies an empty body {} (no recipients to verify)", () => {
+  it("denies an empty body {} (no draft id)", () => {
     expect(inspectDraftSend({ body: {} }, ENV)).toMatchObject({
       decision: "deny",
-      reason: "draft-send-unvetted-recipients",
+      reason: "draft-send-no-id",
     });
   });
 
@@ -388,25 +384,24 @@ describe("G) inspectDraftSend — stored drafts are unvetted, so bare-id send fa
     });
   });
 
-  it("delegates a non-JSON media channel to inspectOutboundMessage (off-allowlist denied)", () => {
+  it("denies a non-JSON media channel (drafts.send takes a JSON Draft object only)", () => {
     const req = {
       rawBody: new TextEncoder().encode(
-        "To: eve@evil.com\r\nSubject: hi\r\n\r\nbody",
+        "To: alice@example.com\r\nSubject: hi\r\n\r\nbody",
       ),
       contentType: "message/rfc822",
     };
     expect(inspectDraftSend(req, ENV)).toMatchObject({
       decision: "deny",
-      reason: "external-send",
+      category: "malformed",
+      reason: "draft-send-body-not-object",
     });
   });
 });
 
 describe("H) per-deployment allowlist — inspectors resolve the env they are handed", () => {
   const send = (to: string) => ({
-    body: {
-      payload: { headers: [{ name: "To", value: to }] },
-    },
+    body: { raw: toBase64Url(rfc822({ To: to, Subject: "hi" })) },
   });
 
   it("denies every recipient when no env is passed (fail closed, no permissive default)", () => {

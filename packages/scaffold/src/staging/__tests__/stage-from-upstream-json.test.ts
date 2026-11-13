@@ -5,6 +5,7 @@ import {
   type UpstreamRequestResult,
 } from "../stage-from-upstream-json";
 import type { PutFileResult } from "../putfile-capability";
+import { fileRefOf } from "../crypto";
 
 // Pass-through spy on the block decoder, so tests can see the ranges it gets.
 vi.mock("../codec", async (importOriginal) => {
@@ -23,6 +24,7 @@ function okPutFileResult(overrides: Partial<Extract<PutFileResult, { ok: true }>
     fetch_url: "https://x.test/staging/fetch/fh_x",
     expires_at: 999,
     byte_length: 12,
+    file_ref: "0123456789ab",
     ...overrides,
   };
 }
@@ -410,6 +412,7 @@ describe("stageFromUpstreamJson — v2 staging side (real putFile)", () => {
     const gate = new FakeGate();
     const runKey = {};
     const putFile = createPutFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes },
@@ -458,12 +461,16 @@ describe("stageFromUpstreamJson — v2 staging side (real putFile)", () => {
     // Round-trip through the opener.
     const { createStagedFileOpener } = await import("../staged-file");
     const open = createStagedFileOpener({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 },
     });
     const r = await open({ file_handle: out.file_handle, token: out.token });
     if (!r.ok) throw new Error("open failed");
-    expect(r.file.meta).toEqual({ byteLength: x.byteLength, contentType: "application/pdf", filename: "q.pdf" });
+    expect(r.file.meta).toEqual({
+      byteLength: x.byteLength, contentType: "application/pdf", filename: "q.pdf",
+      fileRef: await fileRefOf(out.file_handle),
+    });
     const parts: Uint8Array[] = [];
     await r.file.readBlocks(async (b) => { parts.push(b.slice()); });
     expect(Buffer.concat(parts).equals(Buffer.from(x))).toBe(true);
@@ -531,6 +538,7 @@ describe("stageFromUpstreamJson — v2 staging side (real putFile)", () => {
     const gate = new FakeGate();
     const cap = createStageFromUpstreamJsonCapability({
       putFile: createPutFileCapability({
+        owner: "user-A",
         STAGING_D1: new FakeD1() as unknown as D1Database,
         STAGING_R2: new FakeR2() as unknown as R2Bucket,
         config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 },
@@ -571,6 +579,7 @@ describe("stageFromUpstreamJson — alphabet tolerance (review item 3)", () => {
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 },
       uploadOrigin: "https://x.test",
+      owner: "user-A",
     };
     const cap = createStageFromUpstreamJsonCapability({
       putFile: createPutFileCapability(store),
@@ -600,5 +609,37 @@ describe("stageFromUpstreamJson — alphabet tolerance (review item 3)", () => {
   it("data mixing both alphabets → 400", async () => {
     const { out } = await stageWith("+/-_AAAA");
     expect(out).toMatchObject({ ok: false, status: 400 });
+  });
+});
+
+// E-1 (2026-11 review): the file stageFromUpstreamJson stores is audited exactly once, by its
+// (ungated) putFile under its own path, with the stored row owned by the session principal.
+// The capability itself logs nothing: its inner request has the operation's own line.
+describe("stageFromUpstreamJson — owner and audit (E-1)", () => {
+  it("FIXED (E-1): one staging.store line under __stagingHost.stageFromUpstreamJson; the row has the owner", async () => {
+    const { FakeD1 } = await import("./__fixtures__/fake-d1");
+    const { FakeR2 } = await import("./__fixtures__/fake-r2");
+    const { createPutFileCapability } = await import("../putfile-capability");
+    const d1 = new FakeD1();
+    const lines: unknown[] = [];
+    const cap = createStageFromUpstreamJsonCapability({
+      putFile: createPutFileCapability({
+        STAGING_D1: d1 as unknown as D1Database,
+        STAGING_R2: new FakeR2() as unknown as R2Bucket,
+        config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 },
+        uploadOrigin: "https://w",
+        owner: "user-A",
+        audit: (e) => { lines.push(e); },
+        auditPath: "__stagingHost.stageFromUpstreamJson",
+      }),
+      upstreamRequest: async () => ({ success: true, status: 200, result: { data: "AQID" } }),
+    });
+    const out = await cap(BASE_REQ, "data", "base64url", null);
+    if (!out.ok) throw new Error("stage failed");
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.stageFromUpstreamJson", operationId: "staging.store", decision: "allow",
+      staging: { event: "store", fileRef: await fileRefOf(out.file_handle), byteLength: 3, status: 200 },
+    }]);
+    expect([...d1.rows.values()][0]!.owner).toBe("user-A");
   });
 });

@@ -503,7 +503,7 @@ describe("handleUpstreamRequest — elicit integration", () => {
     });
     vi.stubGlobal("fetch", fetchSpy);
     const audit = captureAudit();
-    const elicitInput = vi.fn(async () => ({ action: "accept", content: { to: "x@y.com" } }));
+    const elicitInput = vi.fn(async () => ({ action: "accept", content: { confirm: true } }));
 
     await handleUpstreamRequest({
       ctx: { method: "POST", path: "/send", body: { to: "x@y.com" } },
@@ -548,7 +548,7 @@ describe("handleUpstreamRequest — elicit integration", () => {
     let seenOptions: unknown = "UNCALLED";
     const elicitInput = vi.fn(async (_params: unknown, options?: unknown) => {
       seenOptions = options;
-      return { action: "accept", content: { to: "x@y.com" } };
+      return { action: "accept", content: { confirm: true } };
     });
 
     await handleUpstreamRequest({
@@ -603,7 +603,7 @@ describe("handleUpstreamRequest — elicit integration", () => {
 
   it("freezes ctx.body before inspectors run", async () => {
     const ctx = { method: "POST" as const, path: "/send", body: { to: "x@y.com" } };
-    const elicitInput = vi.fn(async () => ({ action: "accept", content: { to: "x@y.com" } }));
+    const elicitInput = vi.fn(async () => ({ action: "accept", content: { confirm: true } }));
     vi.stubGlobal("fetch", vi.fn(async (url: RequestInfo | URL) => {
       const u = typeof url === "string" ? url : url.toString();
       if (u.includes("/token")) {
@@ -649,7 +649,7 @@ describe("handleUpstreamRequest — elicit integration", () => {
     const audit = captureAudit();
     const elicitInput = vi.fn(async () => ({
       action: "accept",
-      content: { to: "x@y.com" },
+      content: { confirm: true },
     }));
 
     await handleUpstreamRequest({
@@ -712,6 +712,7 @@ describe("handleUpstreamRequest — returnAs:\"stage\"", () => {
         STAGING_R2: r2 as unknown as R2Bucket,
         config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes },
         uploadOrigin: "https://x.test",
+        owner: "test-user",
         now: () => 1_700_000_000,
       },
     };
@@ -892,7 +893,7 @@ describe("handleUpstreamRequest — elicit PII", () => {
     const audit = captureAudit();
     const elicitInput = vi.fn(async () => ({
       action: "accept",
-      content: { to: "x@y.com" },
+      content: { confirm: true },
     }));
 
     await handleUpstreamRequest({
@@ -1208,7 +1209,11 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
     servers: [{ url: "https://api.example.com" }],
     paths: {
       "/things/{id}": {
-        get: { operationId: "getThing", responses: { "200": { description: "OK" } } },
+        get: {
+          operationId: "getThing",
+          parameters: [{ name: "q", in: "query", schema: { type: "string" } }],
+          responses: { "200": { description: "OK" } },
+        },
         delete: { operationId: "deleteThing", responses: { "200": { description: "OK" } } },
       },
       // Listed first so the WIRE path "/items/labels/1" resolves here, while the
@@ -1246,6 +1251,7 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
       STAGING_R2: r2 as unknown as R2Bucket,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 1024 * 1024 },
       uploadOrigin: "https://x.test",
+      owner: "test-user",
     };
     return {
       fetchSpy,
@@ -1355,7 +1361,7 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
       expect(headers["content-type"]).toBe("application/json");
     });
 
-    it("BOM-prefixed bytes go out as the BOM-less canonical JSON", async () => {
+    it("BOM-prefixed bytes are refused: JSON bytes are decoded as strict UTF-8 (D-3)", async () => {
       inspectSpy.mockClear();
       const raw = '﻿{"to":"ok@allow"}';
       const h = hardArgs({
@@ -1363,10 +1369,23 @@ describe("request path hardening (F-1, F-6, F-7, F-11, F-17, F-19, F-24)", () =>
         bodyBase64: Buffer.from(raw, "utf8").toString("base64"),
         contentType: "application/json; charset=utf-8",
       });
+      await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/denied by surface review/);
+      expect(inspectSpy).not.toHaveBeenCalled();
+      expect(upstreamCalls(h.fetchSpy)).toHaveLength(0);
+      expect(h.audit.read().at(-1)).toMatchObject({ decision: "deny", reason: "unparseable-json-body" });
+    });
+
+    it("charset=utf-8 is accepted and dropped: the wire label is exactly application/json (D-3)", async () => {
+      inspectSpy.mockClear();
+      const h = hardArgs({
+        method: "POST", path: "/send",
+        bodyBase64: Buffer.from('{"to":"ok@allow"}', "utf8").toString("base64"),
+        contentType: "application/json; charset=utf-8",
+      });
       await handleUpstreamRequest(h.args);
       expect(sentBody(h.fetchSpy)).toBe('{"to":"ok@allow"}');
       const headers = (upstreamCalls(h.fetchSpy)[0]![1] as RequestInit).headers as Record<string, string>;
-      expect(headers["content-type"]).toBe("application/json; charset=utf-8");
+      expect(headers["content-type"]).toBe("application/json");
     });
 
     it("non-inspected operations still send raw JSON bytes verbatim", async () => {
@@ -1661,24 +1680,31 @@ describe("approval-only operations are judged on the payload that is sent", () =
       contentType: " application/json",
     });
     await handleUpstreamRequest(h.args);
-    const params = h.elicitInput.mock.calls[0]![0] as { requestedSchema: { properties: Record<string, unknown> } };
-    expect(Object.keys(params.requestedSchema.properties)).toContain("Amount");
+    const params = h.elicitInput.mock.calls[0]![0] as { message: string; requestedSchema: { properties: Record<string, unknown> } };
+    // Facts are shown in the message; the schema only asks for confirm.
+    expect(params.message).toContain("Amount: 250");
+    expect(Object.keys(params.requestedSchema.properties)).toEqual(["confirm"]);
     const init = upstreamInit(h.fetchSpy);
     expect(init.body).toBe('{"Amount":250}');
     expect((init.headers as Record<string, string>)["content-type"]).toBe("application/json");
   });
 
-  it("an uninspected raw non-JSON payload is approved as opaque, never rendered as an empty request", async () => {
+  it("an uninspected raw non-JSON payload is denied before the dialog, nothing is sent (D-1)", async () => {
     const h = approveArgs({
       method: "POST",
       path: "/payruns/1",
       bodyBase64: Buffer.from("<PayRuns/>", "utf8").toString("base64"),
       contentType: "application/xml",
     });
-    await handleUpstreamRequest(h.args);
-    const params = h.elicitInput.mock.calls[0]![0] as { message: string; requestedSchema: { properties: Record<string, unknown> } };
-    expect(params.message).toMatch(/application\/xml, 10 bytes\) cannot be shown/);
-    expect(Object.keys(params.requestedSchema.properties)).toEqual(["confirm"]);
+    await expect(handleUpstreamRequest(h.args)).rejects.toThrow(/body cannot be shown; send it as JSON/);
+    expect(h.elicitInput).not.toHaveBeenCalled();
+    expect(h.fetchSpy).not.toHaveBeenCalled();
+    expect(h.audit.read().at(-1)).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "opaque-body-on-approval-op",
+      operationId: "updatePayRun",
+    });
   });
 
   it("JSON-typed bytes that do not parse are refused before the dialog", async () => {

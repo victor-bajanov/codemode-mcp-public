@@ -89,3 +89,14 @@ describe("XERO_ATTACHMENT_HINT — staged transfer v2 shapes (issue #59)", () =>
     expect(hint).toMatch(/\.bin/);
   });
 });
+
+// Wave-3 security review: the attachment bytes-update POSTs were removed from
+// the surface review, so the hint must not advertise them.
+describe("XERO_ATTACHMENT_HINT names only operations the surface review allows (wave-3 review)", () => {
+  it("does not advertise the attachment-update POST, and says to re-upload under a new name", () => {
+    expect(hint).not.toMatch(/updateInvoiceAttachmentByFileName|updateCreditNoteAttachmentByFileName/);
+    expect(hint).toContain("createInvoiceAttachmentByFileName");
+    expect(hint).toContain("xero.files.uploadFile");
+    expect(hint).toMatch(/not available[^.]*new file name/);
+  });
+});

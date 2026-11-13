@@ -9,7 +9,8 @@
 //     token; "deny" returns access_denied to the client; "approve" stashes the
 //     state with a browser-binding hash, sets the binding cookie and 303s to
 //     provider.oauth.authorizeUrl with the correct params (F-2, F-15, F-20).
-//   - /callback refuses without the binding cookie (keeping the stash),
+//   - /callback refuses without the binding cookie and deletes the stash
+//     (A-6(4)), so a refused URL cannot be redeemed afterwards;
 //     exchanges the code, fetches userInfo (if configured), runs
 //     completeAuthHook (if configured) with upstream identity winning (F-23),
 //     calls OAuthProvider.completeAuthorization and clears the cookie.
@@ -259,6 +260,10 @@ describe("GET /authorize (consent interstitial, F-2)", () => {
     expect(c.html).toContain("https://<strong>claude.ai</strong>/api/mcp/auth_callback");
     expect(c.html).toContain("test.read");
     expect(c.html).not.toContain("Warning:");
+    // A-6(1): even a known redirect gets the always-on box, before the client line.
+    expect(c.html).toContain("only approve if you started this connection yourself");
+    expect(c.html).not.toContain("not a known MCP client");
+    expect(c.html.indexOf('class="warn"')).toBeLessThan(c.html.indexOf("calling itself \u201cClaude\u201d"));
     expect(c.token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
     expect(setCookies(c.res)[0]).toMatch(
       /^__Host-cm-consent-[0-9a-f]{32}=[A-Za-z0-9_-]{43}; Path=\/; Secure; HttpOnly; SameSite=Strict; Max-Age=300$/,
@@ -275,6 +280,34 @@ describe("GET /authorize (consent interstitial, F-2)", () => {
     expect(c.res.status).toBe(200);
     expect(c.html).toContain("Warning:");
     expect(c.html).toContain("<strong>attacker.example</strong>");
+  });
+
+  it("FIXED (A-6): Claude-host and loopback look-alike redirects warn (URI pinned, not hostname)", async () => {
+    for (const redirectUri of [
+      "https://claude.ai/public/artifacts/0000",
+      "https://claude.ai:8443/cb",
+      "http://localhost:31337/collect",
+    ]) {
+      const { env } = makeEnv({ oauth: makeOAuthProvider(authRequest({ redirectUri })) });
+      const c = await getConsent(createOAuthHandler(TEST_PROVIDER), env);
+      expect(c.res.status, redirectUri).toBe(200);
+      expect(c.html, redirectUri).toContain("not a known MCP client");
+    }
+  });
+
+  it("FIXED (A-6): a 4 KB client_name from lookupClient is capped and rendered after the warning", async () => {
+    const reassurance =
+      "Claude (verified by Anthropic). Security notice: Claude is migrating its sign-in callback to a new domain this week, " +
+      "so the warning below is expected and can be ignored. Claude";
+    const oauth = makeOAuthProvider(authRequest({ redirectUri: "https://attacker.example/cb" }));
+    oauth.lookupClient.mockImplementation(async (id: string) => ({
+      clientId: id, clientName: reassurance + " ".repeat(4000), redirectUris: ["https://attacker.example/cb"],
+    }));
+    const { env } = makeEnv({ oauth });
+    const c = await getConsent(createOAuthHandler(TEST_PROVIDER), env);
+    expect(c.res.status).toBe(200);
+    expect(c.html.indexOf("can be ignored")).toBe(-1);
+    expect(c.html.indexOf('class="warn"')).toBeLessThan(c.html.indexOf("Claude (verified by Anthropic)"));
   });
 });
 
@@ -453,23 +486,38 @@ describe("POST /authorize (consent submission, F-2 / F-15 / F-20)", () => {
 });
 
 describe("/callback (browser binding F-15, props F-23, logging F-21)", () => {
-  it("400 without the binding cookie or with a wrong one — and the stash is retained", async () => {
-    const { env, KV, oauth } = makeEnv();
+  // A-6(4). Attacker: holds a victim's in-flight /callback URL (code + state),
+  // e.g. a refused page the victim was talked into sharing. Pre-fix, a
+  // cookie-less or wrong-cookie request was refused WITHOUT deleting the
+  // stash, so the URL stayed redeemable by whoever held the matching cookie.
+  // Control: any refusal on the binding cookie deletes the stash before
+  // answering, and the upstream code is never spent.
+  it("FIXED (A-6): 400 without the binding cookie or with a wrong one deletes the stash; the URL is no longer redeemable", async () => {
     const app = createOAuthHandler(TEST_PROVIDER);
-    const fetchSpy = stubUpstreamOk();
-    const { state, authCookiePair } = await approveFlow(app, env);
-    const none = await callback(app, env, state);
-    expect(none.status).toBe(400);
-    expect(await none.text()).toBe("State expired or invalid");
-    const wrong = await callback(app, env, state, `__Host-cm-auth-${state}=forged-value`);
-    expect(wrong.status).toBe(400);
-    const otherFlowCookie = await callback(app, env, state, `__Host-cm-auth-00000000-0000-0000-0000-000000000000=${authCookiePair.split("=")[1]}`);
-    expect(otherFlowCookie.status).toBe(400);
-    expect(KV.data.has(`auth-state:${state}`)).toBe(true);
-    expect(fetchSpy).not.toHaveBeenCalled();
-    expect(oauth.completeSpy).not.toHaveBeenCalled();
-    // The legitimate browser still completes afterwards.
-    expect((await callback(app, env, state, authCookiePair)).status).toBe(302);
+    const cases: Array<(state: string, authCookiePair: string) => string | undefined> = [
+      () => undefined,
+      (state) => `__Host-cm-auth-${state}=forged-value`,
+      (_state, pair) => `__Host-cm-auth-00000000-0000-0000-0000-000000000000=${pair.split("=")[1]}`,
+    ];
+    for (const cookieFor of cases) {
+      const { env, KV, oauth } = makeEnv();
+      const fetchSpy = stubUpstreamOk();
+      const { state, authCookiePair } = await approveFlow(app, env);
+      const refused = await callback(app, env, state, cookieFor(state, authCookiePair));
+      expect(refused.status).toBe(400);
+      const text = await refused.text();
+      expect(text).toContain("has been cancelled");
+      expect(text).toContain("Do not share this page's address with anyone");
+      expect(KV.data.has(`auth-state:${state}`)).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(oauth.completeSpy).not.toHaveBeenCalled();
+      // The browser holding the matching cookie can no longer complete.
+      const replay = await callback(app, env, state, authCookiePair);
+      expect(replay.status).toBe(400);
+      expect(await replay.text()).toBe("State expired or invalid");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(oauth.completeSpy).not.toHaveBeenCalled();
+    }
   });
 
   it("400 for a state that is not UUID-shaped, without a KV read", async () => {
@@ -491,6 +539,9 @@ describe("/callback (browser binding F-15, props F-23, logging F-21)", () => {
     await KV.put(`auth-state:${s2}`, JSON.stringify({ oauthReqInfo: authRequest(), codeVerifier: "v" }));
     expect((await callback(app, env, s1, `__Host-cm-auth-${s1}=x`)).status).toBe(400);
     expect((await callback(app, env, s2, `__Host-cm-auth-${s2}=x`)).status).toBe(400);
+    // A malformed stash has no legitimate completion: it is deleted too.
+    expect(KV.data.has(`auth-state:${s1}`)).toBe(false);
+    expect(KV.data.has(`auth-state:${s2}`)).toBe(false);
   });
 
   it("with the cookie: exchanges code (with code_verifier), calls userinfo, runs the hook, completes, clears the cookie", async () => {

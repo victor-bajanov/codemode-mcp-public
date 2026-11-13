@@ -8,6 +8,64 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** `a, b, c (+N)`: the first three of a list, and how many more. */
+export function firstThree(list: readonly string[]): string {
+  return list.slice(0, 3).join(", ") + (list.length > 3 ? ` (+${list.length - 3})` : "");
+}
+
+/** A JSON object body (not an array). */
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return isObject(value) && !Array.isArray(value);
+}
+
+/** Message keys Gmail reads on messages.send / messages.import: everything else
+ *  on the resource is output-only, and `payload` in particular is never used to
+ *  build the sent message — a carried `payload` is a decoy (F1-1), a carried
+ *  `message` on messages.send is a decoy (F1-3). */
+export const MESSAGE_INPUT_KEYS: ReadonlySet<string> = new Set(["raw", "threadId", "labelIds"]);
+/** Inside a Draft's `message` on drafts.send, `id` may also ride along
+ *  (drafts.get returns it). */
+const DRAFT_MESSAGE_KEYS: ReadonlySet<string> = new Set([...MESSAGE_INPUT_KEYS, "id"]);
+/** Keys of the Draft resource read on drafts.send. */
+const DRAFT_KEYS: ReadonlySet<string> = new Set(["id", "message"]);
+
+/** What Gmail builds the sent message from, for `unexpectedKeyDecision`. */
+const SENT_FROM_RAW = "the sent message from `raw`";
+const SENT_FROM_MESSAGE_RAW = "the sent message from `message.raw`";
+
+/** "a", "a and b", "a, b and c". */
+function listWords(words: readonly string[]): string {
+  if (words.length <= 1) return words.join("");
+  return `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/**
+ * Deny when `obj` has an own key outside `accepted`. Gmail ignores unknown and
+ * output-only members on input, so a key the inspector does not read could
+ * only be a decoy that makes the judged message differ from the sent one; it
+ * is refused rather than ignored. `where` names the operation (and the member,
+ * for a nested object) and `builtFrom` what Gmail builds the message from
+ * (e.g. "the sent message from `message.raw`"), both in the caller-facing
+ * message.
+ */
+export function unexpectedKeyDecision(
+  obj: Record<string, unknown>,
+  accepted: ReadonlySet<string>,
+  where: string,
+  builtFrom: string,
+): InspectResult | null {
+  const stray = Object.keys(obj).filter((k) => !accepted.has(k)).sort();
+  if (stray.length === 0) return null;
+  return {
+    decision: "deny",
+    category: "malformed",
+    reason: "send-unexpected-key",
+    message:
+      `Only ${listWords([...accepted])} are read ${where}; remove: ${stray.join(", ")}. ` +
+      `Gmail builds ${builtFrom} alone; \`payload\` is an output-only view.`,
+  };
+}
+
 /** Decode standard/url-safe base64 to its raw bytes via the global `atob`
  *  (available in both Node 18+ and Workers). */
 function base64ToBytes(b64: string): Uint8Array {
@@ -24,7 +82,7 @@ function base64ToBytes(b64: string): Uint8Array {
  * mojibake'd. Decoding is non-fatal: invalid sequences in the discarded body
  * region become U+FFFD rather than throwing.
  */
-function base64UrlDecode(s: string): string {
+export function base64UrlDecode(s: string): string {
   let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
   while (b64.length % 4 !== 0) b64 += "=";
   return new TextDecoder("utf-8").decode(base64ToBytes(b64));
@@ -146,7 +204,7 @@ function normaliseLineEndings(text: string): string {
  * from judging a recipient set Gmail's MTA might not use (F-3). The body is
  * not examined.
  */
-function lineEndingDecision(text: string): InspectResult | null {
+export function lineEndingDecision(text: string): InspectResult | null {
   const ambiguous: InspectResult = {
     decision: "deny",
     category: "malformed",
@@ -217,7 +275,7 @@ function unfoldedHeaderLines(rfc822: string): string[] {
  * judge a message on a recipient set Gmail does not use (F-3). Structured
  * fields are not parsed further.
  */
-function parseHeaders(rfc822: string): Map<string, string[]> {
+export function parseHeaders(rfc822: string): Map<string, string[]> {
   const headers = new Map<string, string[]>();
   for (const line of unfoldedHeaderLines(rfc822)) {
     const colon = line.indexOf(":");
@@ -244,7 +302,7 @@ const FIELD_NAME = /^[\x21-\x39\x3b-\x7e]+$/;
  * treat it as one. Whitespace between the name and the colon (RFC 5322
  * obsolete syntax) is tolerated. Lines without a colon are left alone.
  */
-function headerNameDecision(text: string): InspectResult | null {
+export function headerNameDecision(text: string): InspectResult | null {
   for (const line of unfoldedHeaderLines(text)) {
     const colon = line.indexOf(":");
     if (colon < 0) continue;
@@ -263,7 +321,7 @@ function headerNameDecision(text: string): InspectResult | null {
 }
 
 /** First occurrence of a header (display-only fields such as Subject). */
-function firstHeader(headers: Map<string, string[]>, name: string): string | undefined {
+export function firstHeader(headers: Map<string, string[]>, name: string): string | undefined {
   return headers.get(name)?.[0];
 }
 
@@ -333,11 +391,6 @@ function bytesPrefixToText(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: false, ignoreBOM: false }).decode(slice);
 }
 
-/** True when a multipart part's content-type is JSON metadata. */
-function isJsonPart(contentType: string | undefined): boolean {
-  return typeof contentType === "string" && /application\/(?:[\w.+-]+\+)?json\b/i.test(contentType);
-}
-
 /** True when the scanned prefix, with line endings normalised as
  *  `parseHeaders` does (CRLF to LF; a lone CR is not a line ending),
  *  contains the header/body blank-line terminator or begins with an empty
@@ -361,51 +414,19 @@ function judgeableCandidate(text: string): string | null {
   return hasHeaderTerminatorWithinScan(text) || lineEndingDecision(text) !== null ? text : null;
 }
 
-/** Locate the uploaded message text in a non-JSON effective payload
- *  (rawBody = uploadType=media; multipart = uploadType=multipart). Returns null
- *  when no candidate message can be found, its terminator falls outside the
- *  scanned prefix, or it fails to decode — caller fails closed in all cases. */
-function rfc822FromNonJson(req: InspectRequest): string | null {
-  if (req.rawBody !== undefined) {
-    // Note: the string branch slices by UTF-16 code units, not bytes, unlike
-    // the byte-array branch below. The scan window is generous enough for
-    // header-only text that this distinction doesn't matter in practice.
-    const text =
-      typeof req.rawBody === "string"
-        ? req.rawBody.slice(0, RFC822_HEADER_SCAN_BYTES)
-        : bytesPrefixToText(req.rawBody instanceof Uint8Array ? req.rawBody : new Uint8Array(req.rawBody));
-    return judgeableCandidate(text);
-  }
-  if (Array.isArray(req.multipart)) {
-    const parts = req.multipart;
-    const rfc822Part = parts.find((p) => (p.contentType ?? "").toLowerCase().includes("message/rfc822"));
-    let chosen = rfc822Part;
-    if (!chosen) {
-      // No part is explicitly typed message/rfc822. Only fall back to a
-      // single unambiguous non-JSON part; two or more candidates could
-      // disagree with which part Gmail's media parser actually selects, so
-      // fail closed rather than guess.
-      const nonJsonParts = parts.filter((p) => !isJsonPart(p.contentType));
-      if (nonJsonParts.length === 1) chosen = nonJsonParts[0];
-    }
-    if (!chosen) return null;
-
-    let text: string | null = null;
-    if (typeof chosen.value === "string") {
-      text = chosen.value.slice(0, RFC822_HEADER_SCAN_BYTES);
-    } else if (typeof chosen.bodyBase64 === "string") {
-      // Bound the decode: 4 base64 chars → 3 bytes.
-      const cap = Math.ceil(RFC822_HEADER_SCAN_BYTES / 3) * 4;
-      try {
-        text = bytesPrefixToText(base64ToBytes(chosen.bodyBase64.slice(0, cap)));
-      } catch {
-        return null;
-      }
-    }
-    if (text === null) return null;
-    return judgeableCandidate(text);
-  }
-  return null;
+/** Locate the uploaded message text in a media upload's `rawBody`. Returns
+ *  null when there is no rawBody or the header block's terminator falls outside
+ *  the scanned prefix — caller fails closed in both cases. */
+function rfc822FromRawBody(req: InspectRequest): string | null {
+  if (req.rawBody === undefined) return null;
+  // Note: the string branch slices by UTF-16 code units, not bytes, unlike
+  // the byte-array branch. The scan window is generous enough for header-only
+  // text that this distinction doesn't matter in practice.
+  const text =
+    typeof req.rawBody === "string"
+      ? req.rawBody.slice(0, RFC822_HEADER_SCAN_BYTES)
+      : bytesPrefixToText(req.rawBody instanceof Uint8Array ? req.rawBody : new Uint8Array(req.rawBody));
+  return judgeableCandidate(text);
 }
 
 /** Caller-facing explanation for a recipient element that cannot be read as
@@ -444,9 +465,8 @@ function decideRecipients(
       category: "external_data_flow",
       reason: "mass-send",
       summary: {
-        recipients:
-          recipients.slice(0, 3).join(", ") + (recipients.length > 3 ? ` (+${recipients.length - 3})` : ""),
-        subject: String(subject ?? "").slice(0, 200),
+        recipients: firstThree(recipients),
+        subject: String(subject ?? ""),
         count: recipients.length,
         ...extraSummary,
       },
@@ -456,235 +476,166 @@ function decideRecipients(
 }
 
 /**
- * Extract the Subject header from a Gmail Message resource. Looks at
- * `message.raw` first; falls back to `message.payload.headers`. Returns an
- * empty string when no subject can be found.
+ * Judge a base64url RFC 822 `raw` (the JSON send paths): undecodable or
+ * recipient-less → deny/malformed/send-no-recipients; ambiguous line endings,
+ * a malformed header name or a repeated To/Cc/Bcc deny as in
+ * `recipientsFromRfc822`; then the shared recipient decision.
  */
-function extractSubject(message: Record<string, unknown>): string {
-  const raw = message["raw"];
-  if (typeof raw === "string" && raw.length > 0) {
-    let decoded: string;
-    try {
-      decoded = base64UrlDecode(raw);
-    } catch {
-      decoded = "";
-    }
-    if (decoded.length > 0) {
-      return decodeEncodedWords(firstHeader(parseHeaders(decoded), "subject") ?? "");
-    }
+function judgeRawMessage(
+  raw: string,
+  allowlist: readonly string[],
+  extraSummary?: Record<string, string>,
+): InspectResult {
+  let decoded: string;
+  try {
+    decoded = base64UrlDecode(raw);
+  } catch {
+    decoded = "";
   }
-  const payload = message["payload"];
-  if (isObject(payload)) {
-    const headers = payload["headers"];
-    if (Array.isArray(headers)) {
-      for (const h of headers) {
-        if (!isObject(h)) continue;
-        const name = h["name"];
-        const value = h["value"];
-        if (typeof name === "string" && typeof value === "string" && name.toLowerCase() === "subject") {
-          return decodeEncodedWords(value);
-        }
-      }
-    }
+  if (decoded.length === 0) {
+    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
   }
-  return "";
+  const parsed = recipientsFromRfc822(decoded);
+  if ("deny" in parsed) return parsed.deny;
+  if (parsed.recipients.length === 0) {
+    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
+  }
+  return decideRecipients(parsed.recipients, allowlist, () => subjectFromRfc822(decoded), extraSummary);
 }
 
 /**
- * Extract recipient addresses from a Gmail Message resource. Looks at
- * `message.raw` (base64url-encoded RFC 822) first; falls back to
- * `message.payload.headers`. Returns deduplicated, lowercase-normalised
- * addresses, or a deny when `raw` has ambiguous header line endings
- * (ambiguous-line-ending), a header name that is not RFC 5322 ftext
- * (malformed-header-name) or repeats a To/Cc/Bcc header
- * (duplicate-recipient-header). (`payload.headers` already yields every
- * occurrence, which is what Gmail sends to, so that path collects them all
- * and is not denied.)
- */
-function extractRecipients(message: Record<string, unknown>): { recipients: string[] } | { deny: InspectResult } {
-  const collected: string[] = [];
-
-  const raw = message["raw"];
-  if (typeof raw === "string" && raw.length > 0) {
-    let decoded: string;
-    try {
-      decoded = base64UrlDecode(raw);
-    } catch {
-      decoded = "";
-    }
-    if (decoded.length > 0) {
-      const lineEndingDeny = lineEndingDecision(decoded);
-      if (lineEndingDeny) return { deny: lineEndingDeny };
-      const nameDeny = headerNameDecision(decoded);
-      if (nameDeny) return { deny: nameDeny };
-      const headers = parseHeaders(decoded);
-      const deny = recipientHeaderDecision(headers);
-      if (deny) return { deny };
-      collected.push(...recipientsFromHeaders(headers));
-    }
-  } else {
-    const payload = message["payload"];
-    if (isObject(payload)) {
-      const headers = payload["headers"];
-      if (Array.isArray(headers)) {
-        for (const h of headers) {
-          if (!isObject(h)) continue;
-          const name = h["name"];
-          const value = h["value"];
-          if (typeof name !== "string" || typeof value !== "string") continue;
-          const lower = name.toLowerCase();
-          if (lower === "to" || lower === "cc" || lower === "bcc") {
-            collected.push(...splitAddresses(value));
-          }
-        }
-      }
-    }
-  }
-
-  const normalized = collected
-    .map((s) => s.trim().toLowerCase())
-    .filter((s) => s.length > 0);
-  return { recipients: Array.from(new Set(normalized)) };
-}
-
-/**
- * Inspector for outbound Gmail sends: messages.send directly, and drafts.send
- * update-and-send bodies via `inspectDraftSend`. (drafts.create / drafts.update
- * are deliberately NOT inspected — a draft is inert until sent, so it may
- * address anyone; the allowlist bites at send time instead.)
+ * Inspector for `gmail.users.messages.send`, the JSON endpoint. (drafts.create /
+ * drafts.update are deliberately NOT inspected — a draft is inert until sent,
+ * so it may address anyone; the allowlist bites at send time instead, here, in
+ * `inspectDraftSend` and in `inspectOutboundMessageMedia`.)
  *
- * Dispatches by the *effective* payload channel (see `InspectRequest`):
+ * Gmail builds the sent message from the top-level `raw` and nothing else, so
+ * that is the only thing judged (F1-1, F1-3):
  *
- *   JSON body (`req.body`):
- *     1. Body must be an object. (Otherwise → deny/malformed/send-no-recipients.)
- *     2. If body looks like a draft wrapper with no usable message (`id`
- *        present, no usable `message`), return deny/malformed/draft-update-no-message.
- *     3. Unwrap `body.message` if present (drafts.send update-and-send).
- *     4. Extract recipients from `raw` or `payload.headers`. A `raw` message
- *        with a lone CR, or mixed CRLF and bare LF, in its header block →
- *        deny/malformed/ambiguous-line-ending; one with a header name that
- *        is not RFC 5322 ftext → deny/malformed/malformed-header-name; one
- *        that repeats a To, Cc or Bcc header →
- *        deny/malformed/duplicate-recipient-header. Empty → deny/malformed.
- *
- *   Non-JSON payload (`req.rawBody` media upload, or `req.multipart` upload):
- *     Locate the uploaded RFC 822 message and extract recipients from its
- *     headers. No candidate message → deny/malformed; ambiguous header line
- *     endings → deny/malformed/ambiguous-line-ending; a header name that is
- *     not RFC 5322 ftext → deny/malformed/malformed-header-name; a repeated
- *     To, Cc or Bcc header → deny/malformed/duplicate-recipient-header; no
- *     recipients found → deny/malformed (fail closed).
- *
- *   RFC 822 text is read as RFC 5322 does: CRLF (or bare LF) line endings,
- *   the header block ending at the first empty line (see `parseHeaders`). A
- *   lone CR or mixed endings in the header block deny rather than pick one
- *   reading (see `lineEndingDecision`).
- *
- *   Either path then applies the same recipient decision:
- *     5. Any recipient off the deployment's allowlist (from the
- *        OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list, so
- *        every recipient denies) → deny/external_data_flow/external-send.
- *        An address that is not a plain addr-spec (two `@`, quotes, group
- *        syntax, …) is never on the allowlist, so it denies the same way;
- *        that includes any address-list element with a quoted string or a
- *        comment, which `splitAddresses` returns unread.
- *        (Off-allowlist wins over mass-send.)
- *     6. Recipient count > MASS_SEND_THRESHOLD → elicit/mass-send.
- *     7. Otherwise → allow.
+ *   1. a `rawBody` or `multipart` channel, or a body that is not a JSON
+ *      object → deny/malformed/send-no-raw. Google parses a non-JSON body its
+ *      own way (a form field or a JSON-ish text body can carry a `raw` the
+ *      inspector never reads), so the only upload path is
+ *      gmail.users.messages.send.media, which has its own inspector;
+ *   2. any key other than raw, threadId, labelIds — so a `message` wrapper or
+ *      Gmail's output-only `payload` — → deny/malformed/send-unexpected-key;
+ *   3. `raw` not a non-empty string → deny/malformed/send-no-raw;
+ *   4. `raw` decoded and judged (`judgeRawMessage`): RFC 822 text is read as
+ *      RFC 5322 does — CRLF (or bare LF) line endings, the header block ending
+ *      at the first empty line (see `parseHeaders`); a lone CR or mixed
+ *      endings in the header block deny (`lineEndingDecision`), as do a header
+ *      name outside RFC 5322 ftext and a repeated To/Cc/Bcc; no recipients →
+ *      deny/malformed/send-no-recipients. Then:
+ *        - any recipient off the deployment's allowlist (from the
+ *          OUTBOUND_RECIPIENT_ALLOWLIST var; missing env/var → empty list, so
+ *          every recipient denies) → deny/external_data_flow/external-send.
+ *          An address that is not a plain addr-spec (two `@`, quotes, group
+ *          syntax, …) is never on the allowlist, so it denies the same way;
+ *          that includes any address-list element with a quoted string or a
+ *          comment, which `splitAddresses` returns unread. (Off-allowlist wins
+ *          over mass-send.)
+ *        - recipient count > MASS_SEND_THRESHOLD → elicit/mass-send;
+ *        - otherwise → allow.
  */
 export function inspectOutboundMessage(req: InspectRequest, env?: InspectEnv): InspectResult {
-  const allowlist = outboundAllowlistFromEnv(env);
-  if (isObject(req.body)) {
-    const body = req.body;
-
-    // Detect the Draft resource wrapper (drafts.send update-and-send).
-    let message: Record<string, unknown>;
-    if ("message" in body) {
-      const inner = body["message"];
-      if (!isObject(inner)) {
-        if ("id" in body) {
-          return {
-            decision: "deny",
-            category: "malformed",
-            reason: "draft-update-no-message",
-          };
-        }
-        return {
-          decision: "deny",
-          category: "malformed",
-          reason: "send-no-recipients",
-        };
-      }
-      message = inner;
-    } else if ("id" in body && !("raw" in body) && !("payload" in body)) {
-      // Bare {id} — drafts.update with no message provided.
-      return {
-        decision: "deny",
-        category: "malformed",
-        reason: "draft-update-no-message",
-      };
-    } else {
-      message = body;
-    }
-
-    const extracted = extractRecipients(message);
-    if ("deny" in extracted) return extracted.deny;
-    const recipients = extracted.recipients;
-    if (recipients.length === 0) {
-      return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
-    }
-    return decideRecipients(recipients, allowlist, () => extractSubject(message));
+  const body = req.body;
+  if (req.rawBody !== undefined || req.multipart !== undefined || !isJsonObject(body)) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "send-no-raw",
+      message:
+        "gmail.users.messages.send takes a JSON Message object { raw } (base64url RFC 822). To upload the " +
+        "message as message/rfc822 bytes, use gmail.users.messages.send.media " +
+        "(POST /upload/gmail/v1/users/{userId}/messages/send?uploadType=media).",
+    };
   }
-
-  // Non-JSON effective payload: media upload (rawBody) or multipart upload.
-  const text = rfc822FromNonJson(req);
-  if (text === null) {
-    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
+  const keyDeny = unexpectedKeyDecision(body, MESSAGE_INPUT_KEYS, "on gmail.users.messages.send", SENT_FROM_RAW);
+  if (keyDeny) return keyDeny;
+  const raw = body["raw"];
+  if (typeof raw !== "string" || raw.length === 0) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "send-no-raw",
+      message: "gmail.users.messages.send reads the message from `raw` only (base64url RFC 822); supply it.",
+    };
   }
-  const parsed = recipientsFromRfc822(text);
-  if ("deny" in parsed) return parsed.deny;
-  const recipients = parsed.recipients;
-  if (recipients.length === 0) {
-    return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
-  }
-  return decideRecipients(recipients, allowlist, () => subjectFromRfc822(text));
+  return judgeRawMessage(raw, outboundAllowlistFromEnv(env));
 }
 
+/** Caller-facing explanation for a drafts.send that does not carry its message. */
+const DRAFT_SEND_UNVETTED_MESSAGE =
+  "Refusing to send a draft whose content is not carried in the request: drafts are stored without " +
+  "recipient checks and cannot be read at send time, so nothing here could be checked against the " +
+  "outbound allowlist. Send { id, message: { raw } } carrying the full message.";
+
 /**
- * Inspector for `drafts.send`. Drafts are created and updated WITHOUT
- * recipient gating (a draft is inert, and may legitimately address anyone or
- * no one while being composed), so a stored draft's recipients are unvetted.
- * Inspectors are synchronous and see only the request, so a bare `{id}` send
- * — whose recipients live server-side in the stored draft — cannot be checked
- * against the allowlist and must fail closed.
+ * Inspector for `gmail.users.drafts.send`. Drafts are created and updated
+ * WITHOUT recipient gating (a draft is inert, and may legitimately address
+ * anyone or no one while being composed), so a stored draft's recipients are
+ * unvetted, and a synchronous inspector cannot read the stored draft.
  *
- * The workable send path is update-and-send: `{id, message}` replaces the
- * draft's content with the carried message before Gmail sends it, so the
- * carried recipients ARE the send's recipients. That shape (and any non-JSON
- * media/multipart channel) is delegated to `inspectOutboundMessage`, where
- * the allowlist and mass-send checks bite exactly as for messages.send.
+ * The only accepted shape is `{ id, message: { raw } }`: with `message.raw`
+ * present Gmail replaces the draft's content before sending, so the judged
+ * recipients are the delivered ones. Gmail never builds a message from
+ * `payload` (its output-only parsed view), so a carried `payload` would be
+ * judged while the stored draft went out (F1-1); it is refused. In order:
+ *
+ *   1. a non-JSON channel, or a body that is not an object →
+ *      deny/malformed/draft-send-body-not-object;
+ *   2. a key other than id, message → deny/malformed/send-unexpected-key;
+ *   3. `id` not a non-empty string → deny/malformed/draft-send-no-id;
+ *   4. `message` an object with a key other than raw, threadId, labelIds, id
+ *      → deny/malformed/send-unexpected-key (checked before step 5, so a
+ *      `payload` decoy is named whatever `raw` holds);
+ *   5. `message` absent or not an object, or `message.raw` not a non-empty
+ *      string (a bare `{ id }` included) →
+ *      deny/external_data_flow/draft-send-unvetted-recipients;
+ *   6. `message.raw` judged exactly as messages.send's `raw`.
  */
 export function inspectDraftSend(req: InspectRequest, env?: InspectEnv): InspectResult {
-  if (
-    isObject(req.body) &&
-    !("message" in req.body) &&
-    !("raw" in req.body) &&
-    !("payload" in req.body)
-  ) {
+  const body = req.body;
+  if (req.rawBody !== undefined || req.multipart !== undefined || !isJsonObject(body)) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "draft-send-body-not-object",
+      message: "gmail.users.drafts.send takes a JSON Draft object: { id, message: { raw } }.",
+    };
+  }
+  const keyDeny = unexpectedKeyDecision(body, DRAFT_KEYS, "on gmail.users.drafts.send", SENT_FROM_MESSAGE_RAW);
+  if (keyDeny) return keyDeny;
+  const id = body["id"];
+  if (typeof id !== "string" || id.length === 0) {
+    return {
+      decision: "deny",
+      category: "malformed",
+      reason: "draft-send-no-id",
+      message: "gmail.users.drafts.send needs the draft's `id` (a non-empty string): { id, message: { raw } }.",
+    };
+  }
+  const message = body["message"];
+  let raw: unknown;
+  if (isJsonObject(message)) {
+    const messageKeyDeny = unexpectedKeyDecision(
+      message,
+      DRAFT_MESSAGE_KEYS,
+      "in message on gmail.users.drafts.send",
+      SENT_FROM_MESSAGE_RAW,
+    );
+    if (messageKeyDeny) return messageKeyDeny;
+    raw = message["raw"];
+  }
+  if (typeof raw !== "string" || raw.length === 0) {
     return {
       decision: "deny",
       category: "external_data_flow",
       reason: "draft-send-unvetted-recipients",
-      message:
-        "Refusing to send a draft by id alone: recipients are not checked at " +
-        "draft time and the stored draft cannot be read at send time, so its " +
-        "recipients cannot be verified against the outbound allowlist. Send " +
-        "it as an update-and-send instead — POST the same drafts.send request " +
-        "with { id, message: { raw } } carrying the full message — so the " +
-        "recipients ride in the request and pass inspection.",
+      message: DRAFT_SEND_UNVETTED_MESSAGE,
     };
   }
-  return inspectOutboundMessage(req, env);
+  return judgeRawMessage(raw, outboundAllowlistFromEnv(env));
 }
 
 // ---------------------------------------------------------------------------
@@ -816,8 +767,8 @@ function summaryFilename(name: string | null): string {
  *      bytes are base64 (or, for a sole identity segment, the whole message),
  *      so after the blank line they cannot become headers; before it they
  *      could carry recipients the inspector never saw;
- *   5. recipients are then read from the header block and decided exactly as
- *      for the JSON send (`inspectOutboundMessage`'s non-JSON path), the
+ *   5. recipients are then read from the header block (the same RFC 822
+ *      reading and recipient decision as the JSON send's `raw`), the
  *      mass-send summary listing the staged attachments.
  *
  * A JSON or multipart body on this endpoint has no readable message and is
@@ -888,7 +839,7 @@ export function inspectOutboundMessageMedia(req: InspectRequest, env?: InspectEn
   }
 
   const allowlist = outboundAllowlistFromEnv(env);
-  const text = rfc822FromNonJson(req);
+  const text = rfc822FromRawBody(req);
   if (text === null) {
     return { decision: "deny", category: "malformed", reason: "send-no-recipients" };
   }

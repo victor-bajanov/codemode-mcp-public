@@ -32,6 +32,17 @@ import type { InspectRequest, SurfaceReview } from "@local/shared";
 
 const spec = gmailProvider.spec as unknown as OpenApiSpec;
 
+// Wave 2: a calendar write needs CALENDAR_WRITE_ALLOWLIST (fail-closed when
+// unset) and first looks up the stored event. Answer that GET with an event the
+// caller organises, and the PATCH with `{}`.
+const OWN_EVENT = { id: "evt1", organizer: { email: "u1@example.com", self: true }, attendees: [{ email: "u1@example.com", self: true }] };
+function calendarFetch() {
+  return vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const json = (init?.method ?? "GET").toUpperCase() === "GET" ? OWN_EVENT : {};
+    return new Response(JSON.stringify(json), { status: 200, headers: { "content-type": "application/json" } });
+  });
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -110,7 +121,7 @@ describe("C2 query/fragment smuggled via a path param (FIXED F-6)", () => {
     expect(resolveOperation(spec, "PATCH", path)).not.toBeNull();
     expect(resolveOperation(spec, "PATCH", "/calendar/v3/calendars/primary/events/evt123%23frag")).not.toBeNull();
     vi.spyOn(console, "log").mockImplementation(() => {});
-    const fetchSpy = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response("{}", { status: 200 }));
+    const fetchSpy = calendarFetch();
     vi.stubGlobal("fetch", fetchSpy);
     await expect(
       handleUpstreamRequest({
@@ -121,7 +132,7 @@ describe("C2 query/fragment smuggled via a path param (FIXED F-6)", () => {
         deploymentName: "poc",
         props: { userId: "u1", refreshToken: "r" },
         server: {} as never,
-        env: {},
+        env: { CALENDAR_WRITE_ALLOWLIST: "primary" },
         oauth: {
           refreshTokenAccessor: () => "r",
           userIdAccessor: () => "u1",
@@ -130,10 +141,18 @@ describe("C2 query/fragment smuggled via a path param (FIXED F-6)", () => {
         audit: {},
       }),
     ).resolves.toBeDefined();
-    const sent = new URL(String(fetchSpy.mock.calls[0]![0]));
-    expect(sent.pathname).toBe("/calendar/v3/calendars/primary/events/evt123%3FsendUpdates%3Dall");
-    expect(sent.search).toBe("");
-    expect(sent.searchParams.get("sendUpdates")).toBeNull();
+    // The first call is now the wave-2 stored-event lookup GET; both it and
+    // the PATCH must keep the encoded value inside the path.
+    const calls = fetchSpy.mock.calls.map(([url, init]) => ({ url: new URL(String(url)), method: (init?.method ?? "GET").toUpperCase() }));
+    const patch = calls.find((c) => c.method === "PATCH");
+    const lookup = calls.find((c) => c.method === "GET");
+    expect(patch).toBeDefined();
+    expect(lookup).toBeDefined();
+    for (const sent of [patch!.url, lookup!.url]) {
+      expect(sent.pathname).toBe("/calendar/v3/calendars/primary/events/evt123%3FsendUpdates%3Dall");
+      expect(sent.search).toBe("");
+      expect(sent.searchParams.get("sendUpdates")).toBeNull();
+    }
     vi.restoreAllMocks();
   });
 

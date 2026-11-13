@@ -22,6 +22,15 @@ stream. From there:
 
 Both `AUDIT` lines and any `DEBUG-ELICIT` lines share the same sink.
 
+Sandbox (LLM) code does not write to this stream. The sandbox runs in
+its own Worker Loader isolate, whose console output and uncaught errors
+reach neither the parent Worker's `wrangler tail` nor its Workers Logs
+(verified live on gmail-dev, 2026-11-12; §7.12), so a sandbox cannot
+print a line that looks like an `AUDIT` line (C-2). As defence in
+depth, codemode captures `console.log`, `warn` and `error` into the
+run's `logs` and the scaffold's prelude routes every other `console`
+method (`info`, `debug`, `table`, `trace`, ...) into the same capture.
+
 ## 2. Default redaction (post this branch)
 
 By default, every `AUDIT` line drops the PII-bearing values inside
@@ -41,6 +50,30 @@ By default, every `AUDIT` line drops the PII-bearing values inside
 - `ts`
 - `elicitationOutcome`
 - `upstreamStatus`
+- `queryKeys` — the sorted names of the request's query parameters
+  (never their values), on every line emitted once the operation is
+  matched. Bounded because the names are caller-chosen: at most the
+  first 32 names, each cut to 64 code points with a trailing `…`
+- `queryKeyCount` — the true number of query names, alongside
+  `queryKeys` (so a capped list is visible as such)
+- `pathLength` — the true length of `path` in code points, present only
+  when the sink cut it
+- `phase` — `"dispatch"` on the extra line written before a
+  host-assembled body goes out (§7.12)
+- `outcome` — `"failed"` on the line of an allowed request whose send or
+  response handling failed; `reason` says how (§7.12)
+- `staging` — `{ event, fileRef?, byteLength?, status }` on staging
+  lines (§7.12); `fileRef` is a 12-hex digest of the file handle
+- `stagedRefs` — the `fileRef`s of the files a host-assembled send
+  attached
+
+**Caps.** The sink caps the fields a caller can influence, in code
+points: `method` 32, `path` 1024, `reason` 128, `category` 64,
+`operationId` 256. A cut value is the first `max − 1` code points
+followed by `…`, and a cut `path` adds `pathLength`. The caps bound each
+field, not the line's byte size: JSON escaping can make a field up to
+about six times its cap in bytes (a control character serialises as
+`\uXXXX`).
 
 **Replaced** (`elicitFields` is rewritten):
 
@@ -129,8 +162,9 @@ purge for tail-only investigations.
 
 `OAUTH_KV` holds the OAuth library's own grant, token and client
 records plus the scaffold keys below. Every scaffold key expires on its
-own, is rewritten in normal use, or (`clientreg:<id>`) is removed with
-its client by the scheduled sweep.
+own or is rewritten in normal use; the library's `client:<id>` records
+carry a TTL the scaffold sets (below). No scheduled job reads this
+namespace.
 
 ### `auth-state:<state>` — in-flight sign-in (600 s TTL)
 
@@ -164,14 +198,25 @@ same token cannot be submitted twice. The TTL outlives the token's own
 300 s lifetime. The value is a constant marker; nothing sensitive is
 stored.
 
-### `clientreg:<id>` — client registration stamps (no TTL)
+### `client:<id>` — library client records (30-day TTL on registration, 120 days after each successful `/token`)
 
-Written when `POST /register` succeeds, recording the new client's
-registration time (`{"registeredAt": <ms>}`) so the scheduled sweep can
-age it. It has no TTL: the 30-day inactive-client sweep deletes it
-together with its `client:<id>` record once the client is older than
-the window and no grant references it. A client that holds a grant
-keeps its stamp. Nothing sensitive is stored.
+The OAuth library's own record of a dynamically registered MCP client
+(name, redirect URIs, auth method; a confidential client's secret is
+stored hashed). The library writes it with no expiry; the hardening
+wrapper (`enforceOAuthHardening`, A-5 of the 2026-11 review, section
+7.13) re-puts it verbatim with a TTL: `OAUTH_CLIENT_TTL_SECONDS` (30
+days) after a successful `POST /register`, and the grant lifetime (90
+days) plus `OAUTH_CLIENT_TTL_SECONDS` (120 days in all) after every 200
+from `POST /token` whose `grant_type` is `authorization_code` or
+`refresh_token`, sent as an `application/x-www-form-urlencoded` body
+(Content-Type essence exact). A revocation 200, a failed exchange and
+`GET /authorize` do not renew it. An expired record makes the library
+answer `invalid_client` / "Invalid client", and the MCP client must
+register again (remove and re-add the connector). Records written
+before wave 5 have no TTL until
+`scripts/upgrade/2026-11-11-oauth-client-ttl.sh` gives them one; the
+same script deletes the orphaned `clientreg:<id>` stamps of the removed
+sweep.
 
 ### `token-slot:<userId>:<sha256>` — per-grant upstream token slots (180-day TTL)
 
@@ -377,8 +422,9 @@ refresh token meanwhile.
 
 ### `ratelimit:*` — throttle counters
 
-Fixed-window counters for `/register` and `/token`, keyed by endpoint
-and client identity, plus `ratelimit:staging-fail:<client>:<window>`
+Fixed-window counters for `/register`, `/token`, `/authorize` and
+`/callback` (`ratelimit:<endpoint>:<client>:<window>`, section 7.13),
+keyed by endpoint and client identity, plus `ratelimit:staging-fail:<client>:<window>`
 counters for the staging failure throttle (section 7.6). They expire
 with their window. Client identities are the IPv4 address or, for IPv6,
 the client's /64 (`ip6:<h0>:<h1>:<h2>:<h3>::/64`).
@@ -408,21 +454,41 @@ added later, with four more optional variables.
 ### 7.1 `/authorize` consent page
 
 `GET /authorize` no longer redirects straight to the upstream IdP. It
-renders a consent page showing the provider, the MCP client's
-registered name, the redirect URI with its host in bold (and a warning
-unless it is `https://` to `claude.ai` or `claude.com`, or `http://` or
-`https://` to a loopback host; a known host under any other scheme,
-such as `evil://claude.ai/cb`, is warned about) and the upstream
-scopes, one per line. Nothing goes upstream until
+renders a consent page showing the provider, a warning box, the MCP
+client's self-declared name, the redirect URI with its host in bold
+and the upstream scopes, one per line. Since wave 5 of the 2026-11
+review (section 7.13) the box is on every page: it tells the user to
+approve only a connection they started themselves, from their MCP
+client, just now, and to choose **Deny** otherwise. When the redirect
+URI is not a known MCP client the box adds a `Warning:` naming where
+access will go. Known means exactly
+`https://claude.ai/api/mcp/auth_callback` or
+`https://claude.com/api/mcp/auth_callback` (`KNOWN_REDIRECT_URIS` in
+`oauth-consent.ts`; no port, query, fragment or userinfo), or
+`http(s)://` to `localhost`, `127.0.0.1` or `[::1]` on any port with
+the path exactly `/callback` (Claude Code) or `/oauth/callback` (MCP
+Inspector). Any other claude.ai path or port, any other loopback path
+and a known host under another scheme (`evil://claude.ai/cb`) warn;
+nothing is refused for it (the library already refuses a redirect the
+client did not register). The client name is shown after the box as a
+quoted claim ("An application calling itself “…”"), cut to 64
+characters with control, zero-width and bidi characters removed and
+quote characters mapped to `'`, so a 4 KB "security notice" registered
+as a name cannot talk the user past the box. Nothing goes upstream until
 the operator clicks **Approve**, which submits `POST /authorize`, and
 nothing is written to KV until the operator approves or denies (only
 the spent-token marker is written on **Deny**, which returns
 `error=access_denied` to the client).
 
-- **Access gating.** The form posts back to the same path, so the
-  Cloudflare Access application on `/authorize` (path-scoped and
-  method-agnostic) gates both the `GET` and the `POST`. Nothing new
-  sits outside Access.
+- **Cloudflare Access is defence in depth only.** The 2026-11 review
+  assumes no Access anywhere: the Worker must not need it. Where an
+  operator still runs an Access application on `/authorize`
+  (path-scoped and method-agnostic, so it covers the `GET` and the
+  `POST`; `infra/modules/worker`), it adds a layer in front of the
+  page and nothing more. It never covered `/callback`, `/token`,
+  `/register`, `/mcp` or `/staging/*`, and since wave 5 (section 7.13)
+  the consent page stands alone: the warning box is always on, and a
+  `/callback` from the wrong browser cancels the flow.
 - **Consent token.** The form carries an HMAC-SHA256 token signed with
   `COOKIE_ENCRYPTION_KEY`, valid for **300 s** and **single-use** (a
   `consent-used:<id>` KV marker, section 6; the consent cookie is also
@@ -433,9 +499,14 @@ the spent-token marker is written on **Deny**, which returns
 - **`__Host-cm-auth-<state>` cookie** (`SameSite=Lax`, so it survives
   the top-level redirect back from the IdP). Set on approval; its
   SHA-256 is stored as `bindingHash` in the `auth-state:` envelope, and
-  `/callback` refuses, without consuming the state, unless the cookie
-  matches. A state string alone, in a different browser, can no longer
-  complete the flow.
+  `/callback` refuses unless the cookie matches. Since wave 5 (section
+  7.13) the refusal also deletes the stash and answers "This sign-in
+  could not be completed in this browser and has been cancelled. Do
+  not share this page's address with anyone. …", so the refused
+  address is not a credential the matching browser can redeem later;
+  the upstream code is not spent. A state string alone, in a different
+  browser, can neither complete the flow nor keep it alive for whoever
+  holds the cookie.
 - The page is sent with `Cache-Control: no-store`,
   `frame-ancestors 'none'` and `X-Frame-Options: DENY` against
   clickjacking. It deliberately sets no CSP `form-action`, because
@@ -456,12 +527,13 @@ restart the connection from the MCP client; the first flow's
 still pass the state check twice. The upstream's authorisation code is
 single-use, so the second exchange fails.
 
-**AUTH-VULN-01 (mitigated).** The residual named in
-`oauth-client-sweep.ts`, an attacker-registered client capturing the
-operator's grant through a consent-less `/authorize`, is mitigated by
-the consent page, the MCP-client PKCE requirement (7.2) and the
-`/register` redirect-URI rule (7.2). The `/register` rate limit and the
-30-day inactive-client sweep remain as accumulation bounds.
+**AUTH-VULN-01 (mitigated).** The residual once named in the (since
+removed) `oauth-client-sweep.ts`, an attacker-registered client
+capturing the operator's grant through a consent-less `/authorize`, is
+mitigated by the consent page, the MCP-client PKCE requirement (7.2)
+and the `/register` redirect-URI rule (7.2). The `/register` rate limit
+and the 30-day TTL on unused client records (section 7.13; the sweep
+is gone) remain as accumulation bounds.
 
 ### 7.2 MCP client requirements
 
@@ -474,6 +546,14 @@ the consent page, the MCP-client PKCE requirement (7.2) and the
   (`localhost`, `127.0.0.1`, `[::1]`). Every other redirect URI must be
   `https://`. There is no host allowlist, so other legitimate MCP
   clients keep working.
+- **The consent page's "known MCP client" list (7.1) is not an
+  allowlist.** A client whose redirect URI is not pinned still works;
+  its users see the `Warning:` sentence on the page.
+- **Request bodies are capped** (section 7.13): `POST /register` at
+  1 MiB, `POST /authorize` and `POST /token` at 16 KiB, answered 413
+  (`invalid_request`, "Request body too large") before the library
+  reads them. Every legitimate registration and token form is far
+  under both.
 
 ### 7.3 Grant lifetime, `COOKIE_ENCRYPTION_KEY` and MCP scope
 
@@ -499,22 +579,31 @@ the consent page, the MCP-client PKCE requirement (7.2) and the
 Each MCP session Durable Object records the principal it was
 initialised for (`audit.principalIdAccessor(props)`, falling back to
 `props.userId`). A request routed to that session whose bearer resolves
-to a different principal is refused
-(`mcp-session-principal-mismatch`, surfaced as a 5xx at the edge), and
-the upstream request path re-checks the principal before every call.
+to a different principal is refused (`mcp-session-principal-mismatch`),
+and the upstream request path re-checks the principal before every call.
+The refusal is answered with the MCP "Session not found" 404 (JSON-RPC
+error -32001, the agents SDK's own answer for an unknown session) and an
+`AUDIT` deny line with reason `session-principal-mismatch`, the caller's
+principal and no session id. It used to surface as a 5xx at the edge,
+which left clients retrying the refused session id indefinitely: seen on
+optical-dev (2026-11-13) after a re-sign-in returned a different `sub`,
+where Claude.ai and Claude Code stayed on 502 until reconnected by hand.
+On the 404 a client re-initialises with a fresh session bound to its own
+principal; the refused session and its data are untouched.
 
 ### 7.5 Sandbox execution limits
 
 codemode's own 70 s timeout runs inside the sandbox and can be
-disabled by the code it limits, so the host now enforces two limits on
+disabled by the code it limits, so the host now enforces these limits on
 every sandbox run:
 
 | Variable | Default | Effect |
 |---|---|---|
 | `EXECUTE_HOST_TIMEOUT_MS` | `75000` | The host stops waiting for the run after this long and refuses every later upstream call that run makes. |
-| `EXECUTE_MAX_UPSTREAM_CALLS` | `1000` | Upstream requests one run may make (`codemode.request` plus `__stagingHost.stageFromUpstreamJson` / `stageFromAttachment`). Sized below Cloudflare's paid-plan limit of 10,000 subrequests per invocation (each budgeted call costs at most about four), so a large run fails with the budget's clear error rather than the platform's. If you raise it, keep it under a quarter of the Worker's `limits.subrequests`. |
+| `EXECUTE_MAX_UPSTREAM_CALLS` | `1000` | Upstream requests one run may make (`codemode.request` plus the four budgeted staging fns `__stagingHost.getFile` / `putFile` / `stageFromUpstreamJson` / `stageFromAttachment`; `getFile` and `putFile` joined in wave 4). Sized below Cloudflare's paid-plan limit of 10,000 subrequests per invocation (each budgeted call costs at most about four), so a large run fails with the budget's clear error rather than the platform's. If you raise it, keep it under a quarter of the Worker's `limits.subrequests`. |
+| `EXECUTE_MAX_DENIED_CALLS` | `32` | Refused calls one run may make (wave 4, §7.12): a `codemode.request` or budgeted staging call that rejects, or a staging call answering `ok: false`. Past it every further call from the run is refused before it reaches the handler ("too many refused requests in this execution"), with one `denial-budget-exceeded` audit line, so a run cannot flood the log with capped deny lines. |
 
-Both are optional Wrangler vars; a value that is not a positive integer
+All three are optional Wrangler vars; a value that is not a positive integer
 is a configuration error. The `search` tool's sandbox no longer
 receives `__stagingHost` (it has no upstream channel at all) and the
 tool is annotated `readOnlyHint: true`.
@@ -536,7 +625,8 @@ failures read the same count and lose increments, and KV's eventual
 consistency and edge caching widen that. A burst of parallel guesses
 can therefore pass well beyond the budget before it bites; it bounds
 sustained, sequential guessing, not a burst. The same holds for the
-`/register` and `/token` rate limits. A guaranteed bound would need
+`/register`, `/token`, `/authorize` and `/callback` rate limits
+(section 7.13). A guaranteed bound would need
 atomic counting (a Durable Object or the Workers Rate Limiting
 binding). Nothing depends on the throttle for access: staging tokens
 are 256-bit.
@@ -562,8 +652,8 @@ cap, whether or not the client sent `Content-Length`.
   `redirect: "manual"`; any 3xx response other than 304 becomes an
   `upstream_redirect` error envelope (the `Location` is not echoed) and
   is never staged.
-- **Rate-limit identity.** `/register`, `/token` and the staging
-  throttle bucket IPv6 clients by /64. A request without
+- **Rate-limit identity.** `/register`, `/token`, `/authorize`,
+  `/callback` and the staging throttle bucket IPv6 clients by /64. A request without
   `CF-Connecting-IP` falls back to one shared `unknown` bucket; on
   Cloudflare the edge always sets the header, so this only affects
   local `wrangler dev` (accepted residual).
@@ -711,9 +801,14 @@ so a truncated send the upstream still answered 2xx shows up as
 `bodyComplete: false`. The approval dialog adds an `Attachments:` line
 of sanitised names and sizes. A staged reference that fails to resolve
 is reported by segment or part index and a status word (`not found`,
-`upload incomplete`, `expired`, `corrupt`, `legacy format`). Staging
-tokens, file handles and file bytes never appear in audit lines, error
-messages, elicitation payloads or debug logs.
+`upload incomplete`, `expired`, `corrupt`, `legacy format`). Since wave 4
+(§7.12) the same line also carries `stagedRefs` (each attached file's
+`fileRef`), staging itself writes `staging.*` lines, and a file is
+followed across them by its `fileRef`: the first 12 hex characters of
+SHA-256 of the file handle, which cannot be turned back into the handle
+or used to open the file. Staging tokens, file handles and file bytes
+still never appear in audit lines, error messages, elicitation payloads
+or debug logs.
 
 **Proof-of-concept tests.** The D-series asserts each of these controls
 with the original attack payloads as regression inputs:
@@ -729,3 +824,792 @@ smuggling through the composed channel). Run them with
 **Rollout.** Apply migration 0002 to each deployment's remote
 `STAGING_D1` before deploying the new code, with
 `scripts/upgrade/2026-10-15-staging-v2.sh` (see `infra/README.md`).
+
+### 7.9 Approval dialogs and request policy (2026-11 wave 1)
+
+**Approval dialogs.** The scaffold, not the provider, composes every
+approval message: a headline, `Request: <METHOD> <path>`, a `Query:`
+line with every defined pair, up to eight facts the provider's renderer
+resolved from the request (targets come from the path, never from a
+body field the caller could relabel), the `Attachments:` line for staged files,
+and a fixed trailer. All of it is sanitised (control, separator and
+bidi characters become spaces) and length-bounded. The requested schema
+is always the single boolean `confirm`; only an answer whose sole key is
+`confirm` with the value `true` approves, anything else is `declined`.
+Facts are shown, never asked for. A raw or inline-multipart body on an
+approval-only operation is denied before any dialog (it cannot be
+shown), as is a query with more than 16 pairs. A client that does not
+advertise elicitation, or exposes no capabilities accessor, is denied
+with outcome `unsupported` (fail-closed); Claude.ai therefore denies
+every `elicit` operation.
+
+**Query parameter names (D-2).** After the operation is matched, and
+before the URL is built (so before inspection, approval and token
+mint), every query name must be declared by that operation's own
+`parameters` (`in: "query"`, inline or through
+`#/components/parameters/*`) or be in the provider's
+`standardQueryParams` (Gmail: `fields`, `prettyPrint`, `quotaUser`,
+`upload_protocol`; Xero and Optical: none). Names starting with `$`,
+credential names (`access_token`, `oauth_token`, `key`, `api_key`,
+`apikey`, `token`, `bearer`, `authorization`) and method-override names
+(`_method`, `method`, `httpmethod`, `x-http-method-override`) are
+refused case-insensitively even when declared. Values must be a string,
+number or boolean. The one exception is a parameter the operation
+declares as a comma-separated list (`schema.type: "array"` with
+`explode: false`, style `form` or unset, such as Xero's `IDs`,
+`InvoiceNumbers`, `ContactIDs`, `Statuses` and `References`): it takes
+an array of strings, numbers or booleans and goes out comma-joined,
+byte-for-byte as before. Any other array, and any nested array or object
+element, is refused; a repeated parameter (for example Gmail's
+`metadataHeaders`) carries one value per request.
+Parameters declared at path-item level are not read (refused,
+fail-closed). Denials are audited as `forbidden-query-param`,
+`undeclared-query-param` (category `url_safety`) or
+`query-value-not-primitive` (category `malformed`).
+
+**Content type (D-3, C-4).** `contentType`, when given, must parse as a
+media type (`type/subtype` plus parameters) of at most 100 characters
+on every operation, else `invalid-content-type`. On an inspected or
+approval operation a JSON payload (an object `body`, or raw bytes
+labelled JSON) must carry a JSON label with no parameter other than
+`charset=utf-8`; it is then sent, and shown to the inspector, as exactly
+`application/json`. Any other label is denied before inspection as
+`json-body-non-json-content-type`. Raw JSON-labelled bytes on those
+operations are decoded as strict UTF-8 (a byte-order mark or an invalid
+sequence is `unparseable-json-body`) and sent re-serialised. Plain
+`allow` operations keep the caller's label.
+
+**Untrusted response fields (F2-8).** A provider may name a spec
+extension (`untrustedFieldExtension`; Optical: `x-optical-untrusted`)
+that flags response fields holding third-party text. Every string such
+a field reaches is returned as `⟦untrusted⟧…⟦/untrusted⟧`, with any
+fence bracket inside the text replaced by U+FFFD, for the response's
+status (its `NXX` range, or its `default` response), in the result
+and in the error message of a non-2xx response. A status the operation
+does not declare at all fails closed: the flags of every declared
+status apply. The `docs` envelope section tells the model what the
+markers mean and to strip them before reusing a value. Fencing runs
+before the 64 KiB result truncation, so a flagged string cut by
+truncation keeps its opening marker but loses its closing one. Staged
+bodies are not fenced: `returnAs: "stage"` and the internal path that
+plucks a JSON field to store it keep the upstream bytes unchanged, and
+sandbox code can read them back through `__stagingHost.getFile`. A
+provider that enabled both staging and an untrusted-field extension
+would need fencing there; none does today (Optical has no staging
+bindings).
+
+### 7.10 Gmail sends and Calendar writes (2026-11 wave 2)
+
+**Send paths judge `raw` and nothing else.** The recipients a send is
+judged on are read from the base64url RFC 822 message in `raw`, the
+same bytes Gmail delivers. Each send path has a closed key allow-list,
+and any other key is denied before the recipient check
+(`send-unexpected-key`), so a decoy `payload` or wrapper is refused
+rather than left for Gmail to ignore:
+
+- `messages.send`: a JSON object with top-level `raw`, `threadId`,
+  `labelIds` only. A missing or empty `raw`, or a non-JSON body, is
+  denied (`send-no-raw`; bytes go through `messages.send.media`).
+- `drafts.send`: a JSON object `{ id, message }`, with `message`
+  holding only `raw`, `threadId`, `labelIds` and `id`
+  (`draft-send-body-not-object`, `draft-send-no-id` otherwise). Keys
+  inside `message` are checked before `raw`, so a `payload` decoy is
+  named whatever `raw` holds. `message.raw` is required and is the only
+  part judged; sending a stored draft by `id` alone, or with an empty
+  `raw`, stays denied (`draft-send-unvetted-recipients`), because drafts
+  are written without recipient checks.
+- `messages.import`: the same `raw`-only rule, applied before approval
+  is sought (`import-body-not-object`, `import-no-raw`). A repeated
+  `From`, `To`, `Subject` or `Date` header is denied
+  (`duplicate-summary-header`): mail readers disagree on which one they
+  show. The dialog's `From`, `To`, `Subject` and `Date` (first
+  occurrence, RFC 2047 encoded words decoded, absent headers left out)
+  come from the same parse that judges the message.
+
+**Residual (F1-1, upstream-dependent).** `drafts.send` judges
+`message.raw` and relies on two Gmail behaviours this project has not
+checked live: that Gmail replaces the stored draft's content with
+`message.raw` before sending, and that a concurrent `drafts.update` of
+the same draft (uninspected by design) cannot slip its content in
+between that replacement and the send. Gmail has no draft version or
+etag to pin either. The operator should run one live check in the dev
+deployment with two of their own addresses: store a draft to A, send
+it with `{ id, message: { raw: <To: B> } }`, and confirm that B and
+only B receives it. If the check fails, the fallback is a static deny
+of `drafts.send` (sandbox code then uses `drafts.get?format=raw`,
+`messages.send` and `drafts.delete`).
+
+One RFC 822 header parser serves all three, so header-block rules
+(duplicate recipient headers, ambiguous line endings, malformed header
+names; §7.9 and the 2026-10 changes) apply equally.
+
+**Calendar write allow-list (`CALENDAR_WRITE_ALLOWLIST`).** A Gmail
+wrangler var: comma-separated calendar ids the agent may write events
+to (`events.insert`, `update`, `patch`, `import`, `move`). Entries are
+trimmed, must be printable ASCII, and are lower-cased; each must be the
+literal `primary` or a plain `addr@host`-shaped id (the operator may list
+the user's own address as well as `primary`, and secondary calendars as
+`c_…@group.calendar.google.com`). `*@domain`, non-ASCII text and any
+other shape make the parse throw, so every event
+write is denied until the entry is fixed. Any throw from a sync
+`inspect` (this one, or a malformed `OUTBOUND_RECIPIENT_ALLOWLIST`) is
+denied by the handler as `inspector-threw` (category `malformed`, with
+an audit line; a sync `inspect` that returns something other than an
+inspect result, such as `{}` or a Promise, is denied the same way as
+`inspector-invalid-result`); the caller gets fixed text, never the exception's
+message, which quotes the offending config entry. Unset or blank means an empty
+list: every Calendar event write is denied (`calendar-not-allowlisted`,
+category `external_data_flow`), the same fail-closed rule as
+`OUTBOUND_RECIPIENT_ALLOWLIST`. `primary` is never implied; list it. The
+calendar id is taken from the matched path parameters, never from the
+body, and is never trimmed: an id with edge whitespace or any character
+outside printable ASCII is denied before it is lower-cased (so, for
+example, a Kelvin sign cannot fold onto `k`). Reads are unaffected. The var lives in `apps/gmail/wrangler.jsonc`
+(prod, `env.dev`, `env.tester`), so changing it is a redeploy;
+`scripts/upgrade/2026-11-10-calendar-write-allowlist.sh` refuses to run
+unless all three blocks declare it uncommented with a non-blank value.
+
+Per write:
+
+- `events.update` / `events.patch` read the stored event first (below),
+  after the synchronous checks (calendar, `declineMessage`, request
+  attendees) have passed. The read is `calendar.events.get` on the same
+  `calendarId` and `eventId` as the write (re-encoded from the decoded
+  path parameters, so it targets exactly the written event), with none
+  of the sandbox's query. Missing path parameters deny
+  (`event-path-params-missing`). An event whose `organizer.self` is not
+  the boolean `true` (or a stored body that is not an object) is denied
+  (`event-not-organised-by-user`): a guest's edit propagates to the
+  organiser's copy whatever `sendUpdates` says. A 404 is
+  `event-not-found`, any other non-2xx is `event-read-failed` (status
+  only, no body), and on the user's own event a truncated guest list
+  (`attendeesOmitted`) is denied (`event-attendees-omitted`).
+- The one exception on a foreign event is an RSVP: `events.patch`
+  whose body has exactly one key, `attendees`, equal to the stored list
+  (same length, same order, every other entry structurally identical)
+  except that the user's own entry may differ in `responseStatus`,
+  whose value must be `accepted`, `declined`, `tentative` or
+  `needsAction`. The user's own entry is the single stored entry with
+  `self: true` or with the address of a `creator` marked `self: true`;
+  zero or several matches deny. That entry may not carry `comment` or
+  `additionalGuests` at all (even unchanged), and a truncated stored
+  list denies. Such a patch is allowed without a dialog, `sendUpdates`
+  included; anything else is `event-not-organised-by-user`.
+  `events.update` on a foreign event stays denied. Because the
+  synchronous inspector defers the attendee check of an attendees-only
+  `events.patch` body to this hook, the hook applies it on the user's
+  own event (`external-attendee`, `mass-invite`).
+- **Residual (accepted).** The RSVP exception is a covert channel to the
+  organiser of a foreign event: each patch picks one of four statuses
+  (about 2 bits), and Calendar notifies the organiser of the change.
+  Repeated patches can carry more. Accepted to keep RSVPs working (the
+  values are a closed enum, no free text).
+- On the user's own event, stored guests off the outbound allowlist
+  raise an approval (`event-has-external-guests`). Stored-guest reading
+  is strict: the user's own entry and Google rooms are skipped, and an
+  entry without a readable address counts as off the allowlist. The
+  dialog facts are `guests` (first three, `+N`) plus the facts below.
+- On every non-deny, the hook returns the dialog facts for the write,
+  every key set so they override whatever the sync inspector put there:
+  who is affected from the STORED event (`organizer`; `guests` when it
+  asks), what the event will say from the BODY (`summary`, `start`,
+  `end` when the body sets them, else the stored ones; a non-string
+  value shown as JSON), and `changes`, the body's top-level keys sorted
+  (e.g. `description, summary`). A body `organizer` is never shown. So a
+  patch that retitles an event or fills its description is approved
+  under the new title, with `description` named in `changes`.
+- An `outOfOfficeProperties` or `focusTimeProperties` `declineMessage`
+  (either spelling, any non-empty value) is denied
+  (`event-decline-message`): Calendar emails it to the organiser of
+  every conflicting invitation.
+- `events.move` takes no body and needs `destination`; both the source
+  calendar and `destination` must be on the allow-list.
+- `events.quickAdd` is denied statically: its free text is parsed by an
+  undocumented grammar that turns addresses into guests.
+
+**Host-side upstream reads (`inspectUpstream`).** A surface-review
+entry may pair its synchronous `inspect` with an async `inspectUpstream`
+that receives a lookup able to `GET` other paths of the same provider
+with the caller's credentials. Gmail's `events.update` and
+`events.patch` use it, and (since wave 3, §7.11) the Xero contact,
+invoice, credit-note and repeating-invoice writes. Limits:
+
+- It must be paired with `inspect`: the provider battery checks this,
+  and at request time an unpaired hook denies
+  (`upstream-inspector-without-inspect`) rather than being skipped.
+- It runs only after `inspect` did not deny, and only on a JSON body or
+  no body; a raw, multipart or host-assembled body is denied
+  (`opaque-body-on-upstream-inspected-op`). Its decision merges with
+  the most restrictive rule; its category, reason and message apply
+  only when its decision is the one that stands (a hook `allow` never
+  relabels a sync `elicit`). Its summary facts merge over the sync ones.
+- A lookup may only read a path whose matched GET operation is a plain
+  `allow` with no `inspect` and no `inspectUpstream`. Anything else (a
+  gated, denied or unmatched path) throws before any fetch. The path is
+  passed encoded (`encodeLookupPath` builds it from the decoded
+  `pathParams`), and the hook never forwards the sandbox's query.
+- At most four lookups per request; the fifth throws. Lookups are
+  refused once the hook has settled, and the handler waits for any
+  lookup the hook started without awaiting.
+- Fail closed: if any lookup threw (refused, failed in transport, or
+  aborted by the run's deadline), even one the hook caught, or the hook
+  itself threw or returned something that is not an inspect result, the
+  write is denied with `upstream-inspect-failed`. The caller's error
+  names only the lookup's own fixed refusal text, never a path, query
+  or upstream content. A non-2xx answer is not a failure: the hook gets
+  the status and decides.
+- The read goes through the same request handler as any call: origin
+  and path guards, query policy, no redirects, the run's deadline. It
+  does not count against `EXECUTE_MAX_UPSTREAM_CALLS`, and its body is
+  never shown to the model (it is neither fenced nor truncated).
+- It writes its own `allow` audit line (operation `calendar.events.get`,
+  with `upstreamStatus`) before the write's decision line, so an
+  `update`/`patch` that reads the stored event produces two audit lines
+  (three when it raises an approval: the read, the elicitation outcome,
+  then the write). No new audit field marks the read as a lookup.
+- On those two operations the upstream token is minted for the read,
+  before the write's allow/elicit/deny decision. The token stays on the
+  host either way.
+
+**Claude.ai.** Claude.ai does not support elicitation, so every
+`elicit` outcome above is a deny there (`unsupported`). That covers
+`event-has-external-guests`, more than 25 recipients or attendees, and
+every `messages.import` and `events.import`. To let the agent edit an own event with outside
+guests from Claude.ai, add those guests to
+`OUTBOUND_RECIPIENT_ALLOWLIST`; there is no per-request override.
+
+**Dialog text.** Inspectors no longer cut subjects and event titles at
+200 characters; the scaffold's length bound applies, and it marks the
+cut with `…`. String fact values are shown as quoted JSON strings, so a
+value cannot pose as a further fact line. The Gmail renderer's
+`external_data_flow` facts are the path parameters (`calendarId`,
+`eventId`; `userId` dropped) followed by these summary keys in order,
+within the eight-fact cap: `recipients`, `from`, `to`, `subject`,
+`date`, `count`, `attendees`, `guests`, `organizer`, `changes`,
+`summary`, `start`, `end`, `attachments`. Who is affected and what the
+write changes come before the descriptive facts, so the cap drops only
+a descriptive one. Message imports show From/To/Subject/Date; event
+imports show the body's organiser, title, start and end;
+`events.insert` shows no organiser; update/patch show the stored
+organiser and guests, the title and times the write sets (else the
+stored ones) and `changes` (see above).
+
+### 7.11 Xero contacts, posted documents, repeating invoices and attachments (2026-11 wave 3)
+
+All rules below are in the Xero app's surface review
+(`packages/providers/xero/src/surface-review.ts`) and its inspectors
+(`packages/providers/xero/src/inspectors/`). No var, secret or migration
+is involved: the change lands on the next ordinary redeploy of the Xero
+app. Every gated key is read case-insensitively, as Xero reads it, and a
+key spelt two ways (or with a non-ASCII lookalike) is denied.
+
+**Contacts (`createContacts` PUT, `updateOrCreateContacts` POST).**
+
+- A create (an item with neither `ContactID` nor `ContactNumber`) is
+  allowed with any fields, bank details included: a new contact has no
+  money attached, and every path that pays or bills it is gated
+  elsewhere. A bulk of creates is allowed too.
+- An item carrying `ContactID` or `ContactNumber` is an edit. An edit
+  carrying `BankAccountDetails`, `BatchPayments`, `EmailAddress`,
+  `ContactStatus`, `TaxNumber` or `ContactPersons` (a second
+  invoice-delivery address), or one that changes `Name` or
+  `XeroNetworkKey` from the stored contact (user decision on F2-1),
+  needs approval (`elicit`, category `financial_legal`, reason
+  `contact-sensitive-edit`). The host reads the stored contact first
+  (`GET /Contacts/{id}`) and the dialog (`contactChange` renderer) shows
+  the contact id, its stored name, and `old → new` for each field the
+  edit carries. An edit that echoes the stored `Name` unchanged is
+  allowed after the read; any edit carrying `Name` or `XeroNetworkKey`
+  therefore costs one extra GET even when nothing changes. Other edits
+  (address, phones, defaults) are allowed without a read.
+- Such an edit must be the only item in its request
+  (`contact-one-per-request`); it may carry at most 3 `ContactPersons`
+  (`contact-too-many-persons`); every fact must fit the dialog uncut
+  (`contact-too-many-fields`, `contact-value-too-long`: old and new text
+  together at most 200 characters). Nothing may sit beside the
+  `Contacts` array, on any request (`contact-unexpected-key`). In such
+  an edit, when both `ContactID` and `ContactNumber` are sent, the stored
+  contact's number must match exactly (`contact-number-mismatch`).
+- An edit keyed by `ContactNumber` alone is read by that number; a 404
+  is treated as a create (old values shown as `(none)`, name
+  `(new contact)`). A 404 on a `ContactID` is `contact-not-found`; any
+  other non-2xx is `contact-read-failed`; an answer that is not exactly
+  the requested contact is `contact-read-unreadable`.
+- The by-id `updateContact`, contact-group membership, contact history
+  and contact attachments stay out of the surface review (denied `not in
+  surface review`).
+
+**Invoices and credit notes (`createInvoices`, `updateOrCreateInvoices`,
+`updateInvoice`, and the three credit-note twins).**
+
+- `Status` is required on every item and must be the string `DRAFT` or
+  `SUBMITTED` (`<prefix>-status-required`, `<prefix>-not-draft`,
+  `<prefix>-bad-status`). Omitting it no longer means "keep the current
+  status".
+- Every item carrying an id is read from Xero before the write
+  (`getInvoice` / `getCreditNote`) and is denied unless the stored
+  document's status is `DRAFT` or `SUBMITTED`
+  (`<prefix>-not-draft-upstream`); a 404 is `<prefix>-not-found`, any
+  other non-2xx `<prefix>-read-failed`, an unreadable answer
+  `<prefix>-read-unreadable`. At most four items carrying an id or a
+  number per request, numbered creates count (`<prefix>-too-many-updates`). An item with no id but an
+  `InvoiceNumber` / `CreditNoteNumber` is read by that number first
+  (Xero may key an update on it): a 404 is a create, an existing
+  document must itself be a draft (`<prefix>-number-matches-posted`).
+  The number must be a string without edge spaces (`<prefix>-bad-number`);
+  a number containing `/` cannot be read and is refused
+  (`upstream-inspect-failed`). Trade-offs, accepted: one GET per
+  numbered create, and a bill whose supplier reference equals a posted
+  bill's number is refused.
+- On the by-id endpoints the body takes exactly one item
+  (`<prefix>-by-id-multiple-items`), a body id must equal the path id
+  (`<prefix>-id-mismatch`), and the read uses the path id. No key may
+  sit beside the wrapper (`<prefix>-unexpected-key`).
+- An inline `Contact` carrying any of the six sensitive contact fields is
+  denied (`<prefix>-inline-contact-details`): whether Xero applies
+  inline contact fields to an existing contact is unverified; change
+  the contact through `/Contacts`.
+- Every outcome here is a deny, never a dialog. Nothing the sandbox can
+  do moves a document out of DRAFT/SUBMITTED between the read and the
+  write, because every status transition is denied by the same inspector.
+
+**Repeating invoices (`createRepeatingInvoices`,
+`updateOrCreateRepeatingInvoices`, `updateRepeatingInvoice`).** Each item
+must carry `Status: "DRAFT"` (`repeating-status-required`,
+`repeating-not-draft`); `ApprovedForSending`, `SendCopy`, `MarkAsSent`
+and `IncludePDF` set are denied (`repeating-send-flag`, category
+`external_data_flow`); `RepeatingInvoiceID` and `ID` must agree and match
+the path id; the inline `Contact` rule above applies. An item naming a
+template is read first (`getRepeatingInvoice`) and denied unless the
+stored template is `DRAFT` (`repeating-not-draft-upstream`). Approving a
+template for sending is done in Xero.
+
+**Attachments (`create{Invoice,CreditNote}AttachmentByFileName`, the PUTs).**
+The inspector is wired, with `acceptsStaged` (a composed staged body is
+accepted; its size is the assembled length). The body must be the
+file's bytes (`attachment-not-bytes` for a JSON or multipart body), the
+MIME type one of the accepted set (`attachment-bad-mime`), at most
+25 MiB (`attachment-too-large`). `IncludeOnline` with any value other
+than `false` is denied (`attachment-include-online`, category
+`external_data_flow`): it publishes the file on the customer's online
+invoice. A differently cased `includeonline` is refused earlier as
+`undeclared-query-param` (§7.9). The bytes-update POSTs
+(`update{Invoice,CreditNote}AttachmentByFileName`) are removed from the
+surface review (denied `not in surface review`): an update could
+overwrite a file already published on the online invoice, and the POST
+does not declare `IncludeOnline`, so it can neither be checked nor reset
+there. A new version is uploaded under a new file name with the PUT.
+Attaching to an
+authorised invoice without `IncludeOnline` stays allowed (the file is
+internal). `xero.files.uploadFile` and `createFolder` (the Files API,
+not customer-facing) remain bare allows.
+
+**Host-side reads and audit.** The stored reads are `inspectUpstream`
+hooks (§7.10), so the limits there apply: plain-allow GETs only, at most
+four per request, any lookup failure or hook throw denies with
+`upstream-inspect-failed`. Each read costs one extra Xero API call
+(counting against Xero's rate limits, not `EXECUTE_MAX_UPSTREAM_CALLS`)
+and writes its own `allow` audit line (e.g. operation
+`xero.accounting.getInvoice`, with `upstreamStatus`) before the write's
+decision line. Contact reads are audited under
+`xero.accounting.getContactByContactNumber`: the path matcher labels
+`GET /Contacts/{x}` that way even when the read is keyed by `ContactID`.
+A contact edit that raises an approval writes the read,
+the elicitation outcome, then the write. No lookup string reaches the
+model: deny messages carry at most the HTTP status, and stored values go
+only into the dialog's facts.
+
+**Claude.ai.** Claude.ai cannot elicit, so a contact edit that needs
+approval (payee, delivery or status fields, or a rename) is denied there
+(`unsupported`). Creates and other edits keep working.
+
+**Left for the operator (live checks, not run).**
+
+- Whether Xero keeps an attachment's `IncludeOnline` when its bytes are
+  replaced (`POST …/Attachments/{name}`). If an update resets it to
+  false, the two attachment-update POSTs could be offered again behind
+  the same inspector.
+
+- Xero `GET /Invoices/{InvoiceNumber}` and `GET /CreditNotes/{CreditNoteNumber}`
+  resolve a document by number. The numbered-create read relies on it:
+  if Xero answers 404 for an existing number, the read treats the item
+  as a create and the control fails open for updates keyed by number.
+- Xero does not upsert contacts by `Name` (an item with no id but the
+  name of an existing contact must create a new contact, not edit the
+  stored one). If it does, a create carrying payee details would edit
+  an existing contact without approval.
+- The review's §6 checks in the demo company: F2-2, `PUT
+  /RepeatingInvoices` with `Status: "AUTHORISED"` and
+  `ApprovedForSending: true`; F2-4, an update of an authorised unpaid
+  test invoice with no `Status`. The fixes do not depend on the outcome.
+
+**Residual (accepted).** Creates stay open, so a lookalike contact (for
+example a name with a Cyrillic `е`) can be created with any bank
+details; paying or billing it is gated elsewhere. Payroll
+`updateEmployee` still shows only the generic dialog (payroll write
+scopes are not requested, so it fails upstream with 403).
+
+### 7.12 Staged-file ownership and the audit trail (2026-11 wave 4)
+
+Wave 4 of the 2026-11 review fixes binds every staged file to the
+principal that created it, limits the public download to
+`STAGING_FETCH_MAX_USES` uses (default 5), audits
+staging, closes the remaining unaudited exits of `codemode.request`,
+caps and budgets audit lines, and keeps sandbox console output out of
+the host log stream. Nothing here elicits, so Claude.ai (which cannot)
+behaves exactly as other clients do.
+
+**Owner rule.** Every staging row carries `owner`: the session's audit
+principal (`principalOf`, the OAuth `sub`, the same value as the audit
+`principalId` and the session binding of §7.4). `register_file_handle`,
+`putFile`, `returnAs: "stage"` and `stageFromUpstreamJson` write it;
+`getFile` and `composed` / `multipart[].staged` resolution require the
+caller's principal to equal it. A row owned by someone else, or by no
+one, is the same 403 "file not found or not yours" as a wrong token,
+checked before state and expiry, so the answer is no ownership oracle.
+An empty-string principal is treated as no owner on both sides. A
+session without a truthy principal gets no `__stagingHost` and no
+`register_file_handle` tool, and the capabilities themselves refuse to
+store without one ("staging requires an authenticated principal").
+The owner's own reuse of a `{ file_handle, token }` in later turns
+(send again, `getFile`) is unchanged.
+
+**Use-limited public download.** `GET /staging/fetch/<handle>` still
+takes only the `stg_` bearer (its consumer is a human's `curl` with no
+MCP token), but each open is counted against `STAGING_FETCH_MAX_USES`
+(positive integer, default 5; no unlimited setting, and `0` or a
+non-integer is a configuration error like every other `STAGING_*`
+integer). After the row checks and before any R2 read, one atomic
+`UPDATE staging SET fetch_count=fetch_count+1 WHERE … AND fetch_count<? AND expires_at>? RETURNING …`
+counts the download; when it returns no row the `GET` is 410 `gone`.
+A download that fails after counting (corrupt block, R2 error) still
+counts. N+k concurrent `GET`s at limit N give exactly N 200s and k 410s.
+The 410 does not count against the staging failure throttle (§7.6; only
+403 does). The model-facing staging docs say the link allows a limited
+number of downloads (default 5). In-MCP use by the owner (`getFile`,
+staged sends) is not counted. The limit pairs with
+`STAGING_FETCH_TTL_SECONDS`: a strict operator can set
+`STAGING_FETCH_MAX_USES=1` and a short TTL.
+*Residual (accepted):* a leaked `{ handle, token }` pair yields up to N
+anonymous downloads (N = `STAGING_FETCH_MAX_USES`) within the fetch
+TTL. A leak needs a channel out of the model's output, and every
+download is audited with the owner's principal, so it is visible.
+
+**Rows from before the migration.** Rows written before
+`0003_owner.sql` have `owner` NULL and are refused by every reader:
+403 from `getFile` and staged sends (`staged-ref-unresolved`), bare
+`forbidden` from `/staging/fetch`. There is no shim; such rows expire
+within the upload TTL (5 min) or fetch TTL (1 h) of the deploy.
+
+**Staging audit lines.** Every staging event writes one line with
+`operationId: "staging.<event>"`, a `method`/`path` naming the
+capability or route (never the handle), and
+`staging: { event, fileRef?, byteLength?, status }`. Refusals are
+`decision: "deny"`, `reason: "staging-refused"`; `fileRef` (12 hex
+characters of SHA-256 of the handle) joins the lines of one file.
+
+| Event | `method` / `path` | Written | `principalId` |
+|---|---|---|---|
+| `register` | `TOOL` / `register_file_handle` | every reservation (`byteLength` = the declared `expected_byte_len`) | the session's |
+| `upload` | `POST` / `/staging/upload` | every outcome after the token lookup, including a 500 logged just before a storage error is rethrown; the earlier refusals (no bearer, malformed or over-cap `Content-Length`) log nothing | the row's owner; none when no row matched |
+| `store` | `HOST` / `__stagingHost.putFile` or `__stagingHost.stageFromUpstreamJson` | every call | the session's |
+| `store` (`returnAs: "stage"`) | the operation's own `allow` line gains `staging` | after the upstream answered | the session's |
+| `read` | `HOST` / `__stagingHost.getFile` | every call; `fileRef` only when the reference resolved to the caller's own row (absent on a cross-owner or legacy deny) | the session's |
+| `attach` | the request's `staged-ref-unresolved` deny line gains `staging` | a staged reference that does not resolve (`status` 500 when the lookup itself threw) | the session's |
+| `download` | `GET` / `/staging/fetch` | every request, including a missing bearer (403) or handle (404) | the row's owner when the row has one (legacy owner-less rows log none) |
+
+Example (a 410 second download; `deployment` and `ts` omitted):
+
+```
+AUDIT {"method":"GET","path":"/staging/fetch","operationId":"staging.download","decision":"deny","reason":"staging-refused","principalId":"<sub>","staging":{"event":"download","fileRef":"3f9a0c1d2b4e","status":410}}
+```
+
+`stageFromAttachment` is an alias of `stageFromUpstreamJson`, so its
+store line logs `path: "__stagingHost.stageFromUpstreamJson"`.
+A successful `putFile` also returns `file_ref` to the sandbox (it is not
+a secret). Host-assembled sends carry `stagedRefs` (§7.8).
+
+**Budgets.** `getFile` and `putFile` now count against
+`EXECUTE_MAX_UPSTREAM_CALLS` with `stageFromUpstreamJson` and
+`stageFromAttachment` (§7.5). The denial budget
+(`EXECUTE_MAX_DENIED_CALLS`, default 32) counts every budgeted call that
+rejects and every staging call answering `{ ok: false }`; once a run has
+reached it, every further call is refused before the handler with
+"too many refused requests in this execution", and one line
+`{ "method": "RUN", "path": "execute", "decision": "deny", "category":
+"malformed", "reason": "denial-budget-exceeded" }` is written per run.
+Because a refusal is counted only when its call settles, at most
+`EXECUTE_MAX_DENIED_CALLS` budgeted calls of one run are in flight at
+once; the rest wait for a slot (they do not fail for it), so at most
+twice the budget in refusals ever reaches a handler. Code that codemode
+could not parse (and would splice into its module verbatim, ahead of its
+console overrides) is refused before the run: the tool answers
+"code is not valid JavaScript" and writes one `RUN` deny line with
+`reason: "code-not-parseable"` (`path` `execute` or `search`).
+
+**Caps.** The sink caps `method`, `path`, `reason`, `category` and
+`operationId` (§2), and `codemode.request` refuses a `method` over 32 or
+a `path` over 4096 code points before matching
+(`oversize-method-or-path`), so a 300 KB path never reaches the matcher
+or the log. *Residual:* the caps bound fields, not lines, and allowed
+calls are not in the denial budget; roughly 700 allowed calls with long
+paths in one run could still exceed the platform's log limit if that
+limit applies per invocation (unproven). The operator's lever is
+`EXECUTE_MAX_UPSTREAM_CALLS`. The caps count code points, not bytes: a
+capped deny line can still be about 6 KB once JSON escapes C0 controls
+and lone surrogates, so 32 denials can write about 200 KB in one run,
+close to a 256 KB per-invocation log budget.
+
+**Header validation.** Sandbox-supplied `headers` are checked at entry,
+before any token mint or approval, and every refusal writes a
+`malformed` deny line whose `reason` is the only record (names and
+values are never logged): `invalid-header-value` (not a plain object,
+or a value that is not a string of at most 4096 characters free of CR,
+LF, NUL and characters above U+00FF), `too-many-headers` (more than
+32), `invalid-header-name` (not an RFC 7230 token, or over 256
+characters), `content-type-header`, `forbidden-header`,
+`duplicate-header` (two casings of one name), and, after matching,
+`headers-on-gated-op` (any header on an inspected or approval
+operation). The forbidden set: `authorization`, `proxy-authorization`,
+`cookie`, `host`, `content-length`, `transfer-encoding`, `connection`,
+`content-type`, `x-http-method-override`, `x-http-method`,
+`x-method-override`, and the credential and project-attribution headers
+`x-goog-api-key`, `x-goog-user-project`, `x-goog-authuser`,
+`x-goog-iam-authorization-token`, `x-goog-iam-authority-selector`,
+`x-api-key`, `api-key`, `x-auth-token` (exact names; `Idempotency-Key`
+and the like stay allowed).
+
+**Other refusals now audited.** `invalid-body-base64`,
+`multipart-part-malformed`, `staging-not-configured`,
+`raw-body-not-string`, `no-principal`, `staged-ref-unresolved` when the
+staged lookup itself throws, and URL build failures other than the two
+mismatches (`upstream-url-build-failed`, category `url_safety`). A
+`returnAs: "stage"` without a staging store writes the operation's allow
+line (with `upstreamStatus`) before it throws.
+
+**Dispatch and outcome lines.** A host-assembled send
+(`composed` / `multipart[].staged`) writes an `allow` line with
+`phase: "dispatch"` (and `stagedCount`, `stagedBytes`,
+`assembledBytes`, `stagedRefs`) before its first byte goes out, then its
+ordinary outcome line; consumers counting one line per request must
+ignore `phase: "dispatch"`. An allowed request whose processing fails
+after the decision writes one `allow` line with `outcome: "failed"` and
+a fixed `reason`, then rethrows: `token-mint-failed`,
+`request-headers-failed` (the provider's header hook threw),
+`transfer-gate-failed`, `transfer-aborted` (the run's host deadline),
+`transfer-timeout`, `upstream-closed`, `staged-read-failed`,
+`upstream-request-failed`, `response-read-failed` or
+`stage-store-failed`. No error text is logged.
+
+**Sandbox console (C-2).** codemode overrides only `console.log`,
+`warn` and `error` in the sandbox. The scaffold's `__docsHost` provider
+(given to every run, `search` included) carries a prelude that codemode
+emits after those overrides and before the LLM code: every other
+`console` method is replaced by a forwarder to the captured
+`console.log`, so `console.info("AUDIT {…}")` lands in the run's `logs`,
+not in the Worker's log stream. Code that codemode would splice in
+unparsed (its `normalizeCode` falls back to the raw text when acorn
+fails) is refused before it reaches the sandbox (`code-not-parseable`),
+because brace-unbalanced text can close `evaluate()` and run at module
+scope, before the console overrides and every prelude.
+
+*Live result (gmail-dev, 2026-11-12, pre-wave-4 code: no prelude, no
+parse guard).* Neither `wrangler tail` nor Workers Logs showed any line
+from the sandbox isolate, while a refused request's genuine `AUDIT`
+line appeared in both as the control. Probes: `console.info`, `debug`,
+`table` and `log`; `Object.getPrototypeOf(console).info.call(…)`;
+`delete console.info` then `console.info`; `reportError`; a throwing
+`queueMicrotask`; and a brace escape whose `console.info`/`console.log`
+and a `throw` ran at module scope (the escape itself worked: its
+injected `return` became the tool result). The forged-line threat
+therefore does not exist in production; the prelude and the parse guard
+are defence in depth, and HMAC tagging of `AUDIT` lines is not needed.
+The same run confirmed the isolate has no network either way: `fetch`,
+`cloudflare:sockets` `connect()` and `node:net` `connect()` (dynamic
+`import()` or static imports via the escape) all fail with the
+runtime's "not permitted to access the internet" error
+(`globalOutbound: null`), `node:http` is not available, and module-scope
+I/O is refused by the runtime.
+
+**Rollout.** Apply `0003_owner.sql` (adds `owner TEXT` and
+`fetch_count INTEGER NOT NULL DEFAULT 0`) to each deployment's remote `STAGING_D1` before
+its new code goes live: new code on an unmigrated database refuses every
+store with 500 ("d1 insert failed"). `scripts/upgrade/2026-11-11-staging-owner.sh`
+checks the migration and the `migrations_dir` bindings, then migrates
+and deploys each deployment in turn (`--dry-run`, `--env-only=<name>`).
+No new secret; two new optional vars, `STAGING_FETCH_MAX_USES` and
+`EXECUTE_MAX_DENIED_CALLS`.
+
+**Live checks (run).** The C-2 console check ran on 2026-11-12 (see
+*Live result* above). The per-invocation log cap ran on gmail-dev on
+2026-11-13: with `EXECUTE_MAX_DENIED_CALLS` raised to 400 for the run,
+one `execute` made 300 refused requests with ~1 KB paths and then one
+allowed request; all 301 lines reached Workers Logs, the allowed
+request's `AUDIT` line included. `EXECUTE_MAX_UPSTREAM_CALLS` stays at
+its default.
+
+### 7.13 OAuth public legs and the release changelog (2026-11 wave 5)
+
+Wave 5 of the 2026-11 review fixes closes A-6 (the consent page
+under-warned and a refused `/callback` stayed redeemable), A-3 (the
+browser legs were public, unthrottled and buffered any body), A-5 (the
+client sweep amplified junk and reaped legitimate clients) and G-4 (the
+release changelog published private commit subjects). The end-to-end
+regression suite is `src/__tests__/oauth-flow-attacks.test.ts` (through
+the real worker composition: library, handler, hardening wrapper);
+unit-level probes are in `oauth-handler.test.ts`,
+`oauth-consent.test.ts`, `oauth-hardening.test.ts` and
+`oauth-public-legs.test.ts`.
+
+**Rate limits (A-3).** `enforceOAuthHardening` classifies four
+endpoints and gives each its own fixed-window counter
+(`ratelimit:<endpoint>:<client>:<window>`, section 6), keyed by the
+client identity of 7.7:
+
+| Endpoint | Default | Variables | KV key prefix |
+|---|---|---|---|
+| `POST /register` | 1 per 300 s | `OAUTH_REGISTER_RATE_LIMIT`, `OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS` | `ratelimit:register:` |
+| `POST /token` | 20 per 60 s | `OAUTH_TOKEN_RATE_LIMIT`, `OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS` | `ratelimit:token:` |
+| `GET`/`HEAD`/`POST /authorize` | 30 per 300 s | `OAUTH_AUTHORIZE_RATE_LIMIT`, `OAUTH_AUTHORIZE_RATE_LIMIT_WINDOW_SECONDS` | `ratelimit:authorize:` |
+| `GET`/`HEAD /callback` | 10 per 300 s | `OAUTH_CALLBACK_RATE_LIMIT`, `OAUTH_CALLBACK_RATE_LIMIT_WINDOW_SECONDS` | `ratelimit:callback:` |
+
+A flow is one `GET` and one `POST` on `/authorize` and one `/callback`,
+so the defaults allow fifteen connections per five minutes from one
+address. `/callback` is the tighter bucket because each one costs an
+upstream token request carrying the deployment's client secret. The 429
+(with `Retry-After`) is answered before the handler: a refused request
+costs one KV read and no write, so an abusive address writes at most
+2 × 30 keys (`consent-used:` and `auth-state:`) per window instead of
+without bound. The path is compared after percent-decoding, because
+Hono decodes `%xx` before routing: `/%61uthorize` counts against the
+`/authorize` bucket and gets the same body cap. A path holding a
+malformed escape (`%ZZ`, a trailing `%`) is refused 400
+(`invalid_request`, "Malformed request path") before anything else, on
+every path the wrapper sees, `/mcp` included (the `/staging/*`
+routes are matched on the raw path before the wrapper, so a malformed
+escape there fails the handle lookup with 403 instead); before wave 5 the library
+answered such paths itself (for example 401 on `/mcp%ZZ`). No
+legitimate client sends one.
+
+*Inherited caveat (A-2, open).* These buckets use the same best-effort
+counter as the "The throttle is best-effort" paragraph of 7.6: a
+parallel burst can pass by a small margin, and one abusive neighbour
+behind a shared IPv4 address or IPv6 /64 locks the others out of that
+endpoint for the rest of the window. Browser legs come from users' own
+addresses rather than a hosted client's egress pool, so the lock-out
+risk there is narrower than for `/token`. An atomic counter (a Durable
+Object or the Workers Rate Limiting binding) and keying `/token` on
+`client_id` are on the maintainers' backlog.
+
+**Body caps (A-3).** Every hardened request body is read once, under a
+streaming cap (`readBodyCapped`): a `Content-Length` over the cap is
+refused without reading a byte; otherwise the stream is read chunk by
+chunk and cancelled the moment the running total passes the cap, so at
+most the cap plus one chunk is ever pulled. `POST /register` is capped
+at 1 MiB (every registration the code accepted before still fits),
+`POST /authorize` and `POST /token` at 16 KiB (a consent token is 1–2
+KB, a code a few hundred bytes, a PKCE verifier 128 characters). Over
+the cap is 413 (`invalid_request`, "Request body too large", no-store).
+The handler receives a copy of the request rebuilt from the bytes
+already read (same method, URL and headers), so nothing is tee'd or
+buffered twice; the library's own 1 MiB check on `/register`, which
+buffers the whole body first, is never reached with a larger one.
+
+**Consent page (A-6(1-3)).** The warning box is on every page and
+precedes the client name (7.1); the "known MCP client" rule is an exact
+list plus path-pinned loopback; the client name is a capped, sanitised,
+quoted claim. Clients whose users now see the `Warning:` sentence
+where they did not before: any `claude.ai` or `claude.com` redirect
+other than `/api/mcp/auth_callback` (including one with a port or
+query), a loopback client whose path is not `/callback` or
+`/oauth/callback`, and custom-scheme redirects (already warned).
+Claude.ai, Claude desktop and mobile, Claude Code and MCP Inspector
+keep a page with the box only. Before deploying, confirm the live
+hosted client's registered redirect (`client:<id>` → `redirectUris`,
+section 6) is one of the two pinned URIs; if it differs, add the exact
+URI to `KNOWN_REDIRECT_URIS`. A miss costs a warning, never a refusal.
+
+**Refused `/callback` (A-6(4)).** A `/callback` whose
+`__Host-cm-auth-<state>` cookie is missing or wrong deletes the
+`auth-state:` stash before answering 400 with the do-not-share text
+(7.1), and never spends the upstream code (that would cost an upstream
+call with the client secret per forged request; without the stash,
+which holds the PKCE verifier, the code is useless here anyway). A
+malformed stash is deleted the same way. So the split flow — the
+attacker approves the page in their own browser, sends the IdP sign-in
+link to the victim, and talks the victim into sharing the address of
+the error page they land on — ends at that error page: the attacker's
+replay with the matching cookie gets "State expired or invalid", no
+grant exists, and no bearer resolves to the victim.
+
+*Accepted residual.* A party who learns an in-flight `state` (122
+random bits; only the IdP and the user's browser see it) can hit
+`/callback` without a cookie and cancel that sign-in; the user
+restarts. One restart beats one account takeover, and nothing else is
+reachable with a state alone. *Second residual (same class as the
+F-15 double submission of 7.1).* The stash delete is a KV write, and
+KV is eventually consistent: a replay at the attacker's own location
+within about 60 s of their approval may still read a cached copy of
+the stash their `POST /authorize` wrote there. It needs the victim to
+sign in and share the address within that minute; the refusal text
+tells them not to.
+
+**Client records (A-5).** The library's `client:<id>` record carries a
+KV TTL (section 6): `OAUTH_CLIENT_TTL_SECONDS` (30 days; values under
+60 are raised to 60, KV's minimum) from a successful `/register`, and
+the grant lifetime (90 days, 7.3) plus `OAUTH_CLIENT_TTL_SECONDS` —
+120 days — from each `/token` 200 whose `grant_type` is
+`authorization_code` or `refresh_token`, only for an
+`application/x-www-form-urlencoded` body (Content-Type essence exact:
+the library also accepts a multipart body whose type merely includes
+that string, which would let a smuggled part name another client).
+A grant's last refresh is at
+most 90 days after authorisation, so a client in use is never forgotten
+while its grant lives and keeps 30 days to re-authorise after. A
+revocation 200 does not renew (the library answers 200 for any
+`token=` value, so renewing on it would let anyone who knows a public
+`client_id` keep it alive for ever), nor does `GET /authorize` (it is
+anonymous; a phishing client could poll it). The five-minute
+`oauth-client-sweep.ts` and its `clientreg:<id>` stamps are removed:
+the cron issues no `OAUTH_KV` operation (the staging sweep still uses
+it). User-visible: a connector not used for 120 days must be removed
+and re-added in the MCP client; before wave 5 any connector whose
+grant had lapsed (after 90 days) hit the same error within five
+minutes. How Claude.ai reacts to `invalid_client` after 120 days
+(re-register silently, or require remove-and-re-add) is unverified;
+both are acceptable.
+
+**Upgrade.** `scripts/upgrade/2026-11-11-oauth-client-ttl.sh` deploys
+each deployment first (so the old code stops stamping and sweeping),
+then lists the `client:*` keys with no expiration, reads them with
+`wrangler kv bulk get` (100 keys per file) and writes them back in one
+`wrangler kv bulk put` with a per-item `expiration_ttl` of the active
+TTL (wrangler 4.87 ignores `--ttl` on a remote bulk put), then
+`bulk delete`s the orphaned `clientreg:*` stamps. One `op run` wraps
+the whole run; `--dry-run` prints every command and runs none;
+`--env-only=<deployment>` picks one; `--app=<apps/dir>
+--wrangler-env=<name>` covers any other environment. Idempotent and
+safe to re-run. Until it runs, legacy client records never expire and
+the orphaned stamps stay.
+
+**Release changelog (G-4).** `scripts/release/changelog.sh` lists a
+commit only when a touched path is allowlisted, not denylisted and not
+rsync-excluded from the public mirror (`.github`, `scripts/release`,
+`tests/release`, at any depth; bare denylist entries match as globs,
+as `sanitize.sh` applies them), so a commit touching only
+`docs/security`, `docs/plans`, `docs/todo.md` or the release scripts
+never prints its subject. The surviving subjects pass through
+`leak_guard_text` (the leak patterns applied to text, UUIDs included):
+a hit makes the script exit 1 naming the commit and the pattern, never
+the subject, and the release aborts; the remedy is a token in
+`lib/changelog-exclude-subjects.txt` or a reworded subject, then
+re-tag. CI's copy of the patterns is self-scrubbed, so `promote.sh`
+preflights the same range (previous release tag to the source SHA)
+twice before committing anything: once with the intact patterns from
+the source checkout, and once with the scrubbed copy from the scrubbed
+tree, because the scrubbed placeholders (for example `adam`,
+`your-subdomain`) can false-positive on benign subjects and would
+otherwise fail only in CI, after the tag was pushed. A mixed or squash
+commit that touches a public path still publishes its subject; only
+the token filter and the leak guard apply to it, so squash-merge the
+security branch to one neutral subject.
