@@ -167,7 +167,7 @@ export interface ShadowConflict {
 /**
  * Same-method template pairs that overlap (equal segment count, and at every
  * position equal literals or at least one parameter) while their surface
- * review entries differ in `decision` or `inspect`. `matchOperation` is
+ * review entries differ in `decision`, `inspect` or `inspectUpstream`. `matchOperation` is
  * first-template-wins, and the re-resolve check uses the same matcher, so it
  * cannot see a literal route shadowed by an earlier parameter template that
  * an upstream router would prefer. Today every overlap in the bundled specs
@@ -176,7 +176,9 @@ export interface ShadowConflict {
  */
 export function findShadowConflicts(
   spec: OpenApiSpec,
-  surfaceReview: Readonly<Record<string, { decision: string; inspect?: unknown } | undefined>>,
+  surfaceReview: Readonly<
+    Record<string, { decision: string; inspect?: unknown; inspectUpstream?: unknown } | undefined>
+  >,
 ): ShadowConflict[] {
   const ops: Array<{ template: string; segments: CompiledPath["segments"]; method: string; operationId: string }> = [];
   for (const cp of compiledOf(spec)) {
@@ -197,7 +199,13 @@ export function findShadowConflicts(
       if (!overlaps) continue;
       const ra = surfaceReview[a.operationId];
       const rb = surfaceReview[b.operationId];
-      if (ra?.decision === rb?.decision && ra?.inspect === rb?.inspect) continue;
+      if (
+        ra?.decision === rb?.decision &&
+        ra?.inspect === rb?.inspect &&
+        ra?.inspectUpstream === rb?.inspectUpstream
+      ) {
+        continue;
+      }
       out.push({
         method: a.method,
         first: { template: a.template, operationId: a.operationId },

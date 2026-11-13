@@ -151,6 +151,33 @@ describe("B3 — path traversal operation confusion (FIXED F-1)", () => {
     // eslint-disable-next-line no-console
     console.log(`[B3] xero: ${hits.length} confusions, ${targets.size} distinct gated targets, ${refused} candidates refused\n${summarise(hits)}`);
     expect(hits.length).toBe(0);
+    // Wave 3 made every Xero attachment upload inspect+allow, which removed
+    // every plain-allow PUT/DELETE/POST source with a matching gated target:
+    // the attack's precondition no longer exists on the real surface, so no
+    // candidate is generated at all.
+    expect(refused).toBe(0);
+  });
+
+  it("FIXED (F-1): Xero with the pre-wave-3 attachment surface: every candidate path is still refused", () => {
+    // Keep the F-1 check non-vacuous: strip `inspect` from the attachment
+    // upload allow entries (their pre-wave-3 shape) so the enumeration again
+    // has plain-allow sources, and assert the matcher refuses every candidate.
+    const stripped: SurfaceReview = {};
+    let strippedCount = 0;
+    for (const [opId, entry] of Object.entries(xeroProvider.surfaceReview)) {
+      if (/Attachment(ByFileName|ById)$/.test(opId) && entry.decision === "allow" && entry.inspect) {
+        const { inspect: _inspect, ...rest } = entry;
+        stripped[opId] = rest as SurfaceReview[string];
+        strippedCount++;
+      } else {
+        stripped[opId] = entry;
+      }
+    }
+    expect(strippedCount).toBeGreaterThan(0);
+    const { hits, refused } = enumerate(xeroProvider.spec, stripped, xeroProvider.apiBaseUrl);
+    // eslint-disable-next-line no-console
+    console.log(`[B3] xero (stripped inspect on ${strippedCount} attachment ops): ${hits.length} confusions, ${refused} candidates refused\n${summarise(hits)}`);
+    expect(hits.length).toBe(0);
     expect(refused).toBeGreaterThan(0);
   });
 

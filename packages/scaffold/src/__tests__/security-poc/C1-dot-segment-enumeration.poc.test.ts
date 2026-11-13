@@ -190,10 +190,12 @@ describe("C1 dot-segment normalisation after operation match (FIXED F-1)", () =>
     const spec = xeroProvider.spec as unknown as OpenApiSpec;
     const path = "/api.xro/2.0/Invoices/./Attachments/..";
     expect(resolveOperation(spec, "PUT", path)).toBeNull();
-    // A well-formed attachment path still resolves to the (uninspected) op.
+    // A well-formed attachment path still resolves to the op (inspect+allow
+    // since wave 3).
     const ok = resolveOperation(spec, "PUT", "/api.xro/2.0/Invoices/inv-1/Attachments/a.pdf");
     expect(ok?.operationId).toBe("xero.accounting.createInvoiceAttachmentByFileName");
-    expect(xeroProvider.surfaceReview[ok!.operationId!]?.inspect).toBeUndefined();
+    expect(xeroProvider.surfaceReview[ok!.operationId!]?.decision).toBe("allow");
+    expect(xeroProvider.surfaceReview[ok!.operationId!]?.inspect).toBeTypeOf("function");
     expect(() => buildUpstreamUrl(xeroProvider.apiBaseUrl, path)).toThrow(PATH_MISMATCH);
   });
 

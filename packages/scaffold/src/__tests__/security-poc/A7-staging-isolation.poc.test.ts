@@ -6,6 +6,9 @@
 //
 // Against the real handlers with the project's own FakeD1/FakeR2 fixtures.
 //
+//   FIXED (E-1, 2026-11): the public download is limited to
+//            STAGING_FETCH_MAX_USES GETs (default 5); the next GET of the right
+//            pair is 410 (it was unlimited within the fetch TTL).
 //   REFUTED: user B's token cannot read user A's handle and vice-versa; the
 //            handle alone (the fetch_url) is useless without the bearer; a
 //            pending row is reaped once its upload TTL passes.
@@ -50,7 +53,7 @@ const b64 = (s: string) => btoa(s);
 describe("A7 staging token/handle isolation", () => {
   it("REFUTED: cross-user — B's token with A's handle, and A's token with B's handle, are both 403", async () => {
     const d = deps();
-    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w" });
+    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w", owner: "user-A" });
     const a = await putFile(b64("alice-secret"), "text/plain", "a.txt");
     const b = await putFile(b64("bob-secret"), "text/plain", "b.txt");
     if (!a.ok || !b.ok) throw new Error("putFile failed");
@@ -58,14 +61,40 @@ describe("A7 staging token/handle isolation", () => {
     const get = (handle: string, token: string) =>
       handleFetch(new Request(`https://w/staging/fetch/${handle}`, { headers: { Authorization: `Bearer ${token}` } }), d);
 
-    expect((await get(a.file_handle, a.token)).status).toBe(200);
-    expect(await (await get(a.file_handle, a.token)).text()).toBe("alice-secret");
     expect((await get(a.file_handle, b.token)).status).toBe(403);
     expect((await get(b.file_handle, a.token)).status).toBe(403);
     // fetch_url alone (what a user might paste around) is useless without the bearer.
     expect((await handleFetch(new Request(a.fetch_url), d)).status).toBe(403);
     // Hash lookup: the row is keyed by SHA-256(token); a wrong token simply finds no row.
     expect(d.d1.rows.size).toBe(2);
+    // The right pair still works (the refusals above burnt nothing).
+    expect(await (await get(a.file_handle, a.token)).text()).toBe("alice-secret");
+  });
+
+  it("FIXED (E-1): the public download is use-limited — default 5 GETs, the right pair's 6th GET is 410 (was unlimited)", async () => {
+    const d = deps();
+    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w", owner: "user-A" });
+    const a = await putFile(b64("alice-secret"), "text/plain", "a.txt");
+    if (!a.ok) throw new Error("putFile failed");
+    const get = () =>
+      handleFetch(new Request(`https://w/staging/fetch/${a.file_handle}`, { headers: { Authorization: `Bearer ${a.token}` } }), d);
+    for (let i = 0; i < 5; i++) {
+      const res = await get();
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("alice-secret");
+    }
+    expect((await get()).status).toBe(410);
+  });
+
+  it("FIXED (E-1): with STAGING_FETCH_MAX_USES 1 the right pair's second GET is 410", async () => {
+    const d = { ...deps(), config: { ...config, fetchMaxUses: 1 } };
+    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w", owner: "user-A" });
+    const a = await putFile(b64("alice-secret"), "text/plain", "a.txt");
+    if (!a.ok) throw new Error("putFile failed");
+    const get = () =>
+      handleFetch(new Request(`https://w/staging/fetch/${a.file_handle}`, { headers: { Authorization: `Bearer ${a.token}` } }), d);
+    expect((await get()).status).toBe(200);
+    expect((await get()).status).toBe(410);
   });
 
   it("REFUTED: tokens are 256-bit random, handles 128-bit random — not derived from each other", () => {
@@ -117,7 +146,7 @@ describe("A7 staging token/handle isolation", () => {
 
   it("FIXED (F-13): without a Content-Length header an oversize body is cancelled once past maxBytes", async () => {
     const d = deps();
-    const tool = registerFileHandleTool({ STAGING_D1: d.STAGING_D1, config, uploadOrigin: "https://w", now: () => 1000 });
+    const tool = registerFileHandleTool({ STAGING_D1: d.STAGING_D1, config, uploadOrigin: "https://w", owner: "user-A", now: () => 1000 });
     const { token } = await tool.handler({});
     let pulled = 0;
     const big = new ReadableStream<Uint8Array>({
@@ -145,7 +174,7 @@ describe("A7 staging token/handle isolation", () => {
 
   it("REFUTED: a pending row that was never uploaded is reaped once its upload TTL passes", async () => {
     const d = deps();
-    const tool = registerFileHandleTool({ STAGING_D1: d.STAGING_D1, config, uploadOrigin: "https://w", now: () => 1000 });
+    const tool = registerFileHandleTool({ STAGING_D1: d.STAGING_D1, config, uploadOrigin: "https://w", owner: "user-A", now: () => 1000 });
     await tool.handler({});
     expect(d.d1.rows.size).toBe(1);
     await runSweep({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, now: () => 1000 + 299 });
@@ -156,7 +185,7 @@ describe("A7 staging token/handle isolation", () => {
 
   it("REFUTED: a claimed row's ciphertext in R2 is useless without the token (HKDF(token, handle) key)", async () => {
     const d = deps();
-    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w" });
+    const putFile = createPutFileCapability({ STAGING_D1: d.STAGING_D1, STAGING_R2: d.STAGING_R2, config, uploadOrigin: "https://w", owner: "user-A" });
     const a = await putFile(b64("alice-secret"), "text/plain", null);
     if (!a.ok) throw new Error();
     const blob = [...d.r2.store.values()][0]!;

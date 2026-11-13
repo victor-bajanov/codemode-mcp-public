@@ -106,6 +106,7 @@ export const STAGING_BLOCK =
   "  curl -H \"Authorization: Bearer <token>\" <fetch_url> -o file.bin\n\n" +
   "That response carries `Content-Type` and `Content-Disposition: attachment`; when the staging recorded a filename, it also carries `X-Filename` and a `filename=` clause.\n\n" +
   "Notes:\n" +
+  "- The fetch_url allows a limited number of downloads (the deployment's limit, default 5) before it expires. Every GET counts, including one that failed part-way; past the limit a GET returns 410. To download it again after that, re-stage it (putFile or returnAs: \"stage\") and use the new fetch_url.\n" +
   "- The token is short-lived (default 60 min, matches getFile). After expiry the row is swept and the URL returns 410.\n" +
   "- A later turn in this same conversation can send the same file again (or read it, if small) with the same file_handle and token until it expires.\n\n";
 

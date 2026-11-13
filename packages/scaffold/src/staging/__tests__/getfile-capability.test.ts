@@ -4,7 +4,8 @@ import { FakeR2 } from "./__fixtures__/fake-r2";
 import { handleUpload } from "../upload-handler";
 import { insertPending } from "../repo";
 import { mintToken, mintFileHandle } from "../tokens";
-import { sha256Bearer } from "../crypto";
+import { fileRefOf, sha256Bearer } from "../crypto";
+import type { AuditSink } from "../../audit";
 import { createGetFileCapability } from "../getfile-capability";
 import { seedV1Row } from "./__fixtures__/v1-row";
 import type { StagingConfig } from "../types";
@@ -21,6 +22,7 @@ async function uploadFixture(now: number, body: Uint8Array, ct = "image/png") {
   const token = mintToken();
   const handle = mintFileHandle();
   await insertPending(d1 as unknown as D1Database, {
+    owner: "user-A",
     token_hash: await sha256Bearer(token),
     file_handle: handle,
     content_type_hint: null,
@@ -56,6 +58,7 @@ describe("createGetFileCapability", () => {
       new Uint8Array([1, 2, 3]),
     );
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -75,6 +78,7 @@ describe("createGetFileCapability", () => {
       new Uint8Array([1]),
     );
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -92,6 +96,7 @@ describe("createGetFileCapability", () => {
       new Uint8Array([1]),
     );
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -114,7 +119,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
     const x = new Uint8Array(size);
     for (let i = 0; i < size; i++) x[i] = (i * 7 + 3) & 0xff;
     const out = await stageFromBlocks(
-      { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: cfg, uploadOrigin: "https://x.test", now: () => 1_000_000 },
+      { owner: "user-A", STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: cfg, uploadOrigin: "https://x.test", now: () => 1_000_000 },
       blockSourceFromBytes(x), "text/csv", "a.csv",
     );
     if (!out.ok) throw new Error("stage failed");
@@ -125,6 +130,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
     const cfg = { ...CFG, getFileMaxBytes: 100 };
     const { d1, r2, ref } = await staged(101, cfg);
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: cfg, now: () => 1_000_002,
     });
     const out = await getFile(ref.file_handle, ref.token);
@@ -138,6 +144,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
   it("round-trips an 8 MiB file without per-byte string building", async () => {
     const { d1, r2, x, ref } = await staged(BIG);
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => 1_000_002,
     });
     const spy = vi.spyOn(String, "fromCharCode");
@@ -160,6 +167,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
     const runKey = {};
     const signal = new AbortController().signal;
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => 1_000_002,
       transferGate: gate, currentRun: () => ({ runKey, signal }),
     });
@@ -176,6 +184,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
     const gate = new FakeGate();
     gate.rejectWith = new Error("one staged transfer at a time per execution; await each before starting the next");
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => 1_000_002,
       transferGate: gate, currentRun: () => undefined,
     });
@@ -191,6 +200,7 @@ describe("createGetFileCapability — v2 cap and gate", () => {
     r2.store.clear();
     const gate = new FakeGate();
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => 1_000_002,
       transferGate: gate, currentRun: () => undefined,
     });
@@ -205,11 +215,12 @@ describe("createGetFileCapability — filename sanitising (review item 5)", () =
     const d1 = new FakeD1();
     const r2 = new FakeR2();
     const out = await stageFromBlocks(
-      { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", now: () => 1_000_000 },
+      { owner: "user-A", STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", now: () => 1_000_000 },
       blockSourceFromBytes(new Uint8Array([1])), "text/plain", "a\r\nb\u202E\uD800.txt",
     );
     if (!out.ok) throw new Error("stage failed");
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => 1_000_002,
     });
     const f = await getFile(out.file_handle, out.token);
@@ -223,6 +234,7 @@ describe("createGetFileCapability — legacy rows", () => {
     const r2 = new FakeR2();
     const ref = await seedV1Row(d1, r2, new Uint8Array([1, 2, 3]), { now: 1_000_000 });
     const getFile = createGetFileCapability({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       STAGING_R2: r2 as unknown as R2Bucket,
       config: CFG,
@@ -234,5 +246,54 @@ describe("createGetFileCapability — legacy rows", () => {
       message: "stored in a legacy format; re-stage the file",
     });
     expect(r2.getCalls).toBe(0);
+  });
+});
+
+// E-1 (2026-11 review): pre-fix a getFile call wrote no audit line, so reading a staged file
+// (the sandbox's only way to pull file bytes into code) left no trace.
+describe("createGetFileCapability — staging.read audit (E-1)", () => {
+  type Line = Parameters<AuditSink>[0];
+  it("FIXED (E-1): an allowed read logs one line with fileRef and byteLength, never the handle or token", async () => {
+    const { d1, r2, token, handle } = await uploadFixture(1_000_000, new Uint8Array([1, 2, 3]));
+    const lines: Line[] = [];
+    const getFile = createGetFileCapability({
+      owner: "user-A", STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket,
+      config: CFG, now: () => 1_000_002, audit: (e) => { lines.push(e); },
+    });
+    expect((await getFile(handle, token)).ok).toBe(true);
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.getFile", operationId: "staging.read", decision: "allow",
+      staging: { event: "read", fileRef: await fileRefOf(handle), byteLength: 3, status: 200 },
+    }]);
+    expect(JSON.stringify(lines)).not.toContain(handle);
+    expect(JSON.stringify(lines)).not.toContain(token);
+  });
+
+  it("FIXED (E-1): a refusal after the row resolved (over the getFile cap) logs a deny with its fileRef", async () => {
+    const { d1, r2, token, handle } = await uploadFixture(1_000_000, new Uint8Array(10));
+    const lines: Line[] = [];
+    const getFile = createGetFileCapability({
+      owner: "user-A", STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket,
+      config: { ...CFG, getFileMaxBytes: 4 }, now: () => 1_000_002, audit: (e) => { lines.push(e); },
+    });
+    expect(await getFile(handle, token)).toMatchObject({ ok: false, status: 413 });
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.getFile", operationId: "staging.read", decision: "deny",
+      reason: "staging-refused",
+      staging: { event: "read", fileRef: await fileRefOf(handle), byteLength: 10, status: 413 },
+    }]);
+  });
+
+  it("a malformed call logs a deny with no fileRef", async () => {
+    const lines: Line[] = [];
+    const getFile = createGetFileCapability({
+      owner: "user-A", STAGING_D1: new FakeD1() as unknown as D1Database, STAGING_R2: new FakeR2() as unknown as R2Bucket,
+      config: CFG, audit: (e) => { lines.push(e); },
+    });
+    await getFile(42 as unknown as string, "x");
+    expect(lines).toEqual([{
+      method: "HOST", path: "__stagingHost.getFile", operationId: "staging.read", decision: "deny",
+      reason: "staging-refused", staging: { event: "read", status: 400 },
+    }]);
   });
 });

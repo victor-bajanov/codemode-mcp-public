@@ -64,6 +64,14 @@ const OPERATION_IDS = {
   // Self-serve account deletion (hosted-trial re-vendor). Optical publishes
   // this operationId itself; listed for completeness like the poll ops.
   "/v1/account":                   { delete: "deleteAccount" },
+  // Delegated access (act-as re-vendor): the caller's act-as targets. Optical
+  // publishes this operationId itself; listed for completeness.
+  "/v1/act-as":                    { get: "listActAs" },
+  // Internal meeting find (meeting-find re-vendor): rank common slots, then
+  // book one with the find's token. Optical publishes these operationIds
+  // itself; listed for completeness.
+  "/v1/meeting-find":              { post: "findMeetingTime" },
+  "/v1/meeting-find/book":         { post: "bookMeetingTime" },
 };
 
 // The webhook ops are vendored since e8d81ba (2026-08-19): subscribeWebhook is
@@ -115,10 +123,10 @@ for (const ms of Object.values(newPaths)) {
 console.log(`vendored optical spec → ${TARGET}`);
 console.log(`  paths: ${Object.keys(newPaths).length}`);
 console.log(`  operationIds: ${ids.size}`);
-// 50 = every operationId optical publishes (webhook ops included — see the
+// 53 = every operationId optical publishes (webhook ops included — see the
 // exclusion note above). Bump deliberately when optical's surface grows, in
 // the same commit that adds the new ops to surface-review.ts and its test.
-if (ids.size !== 50) {
-  console.error(`expected 50 operationIds, got ${ids.size}; check OPERATION_IDS table and the source spec.`);
+if (ids.size !== 53) {
+  console.error(`expected 53 operationIds, got ${ids.size}; check OPERATION_IDS table and the source spec.`);
   process.exit(1);
 }

@@ -25,6 +25,7 @@ import {
   type SandboxExecuteResult,
 } from "../mcp-agent-factory";
 import type { RunContext } from "../staging/gate-dep";
+import { SANDBOX_CONSOLE_PRELUDE } from "../sandbox-console";
 import { ToolError } from "../elicit";
 import { annotateSpecWithSurfaceReview } from "../annotate-spec";
 import type { ApiProvider } from "../api-provider";
@@ -146,6 +147,7 @@ describe("register_file_handle tool wiring", () => {
       STAGING_D1: d1 as unknown as D1Database,
       config: { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 },
       uploadOrigin: "https://x.test",
+      owner: "u1",
       now: () => 1,
     });
     const result = await tool.handler({});
@@ -863,7 +865,8 @@ describe("init() docs surface (Task 4)", () => {
       ...namedProvider,
       attachmentHint: "ATTACH-MARKER step three",
     } as unknown as ApiProvider;
-    const { client, close } = await connectToAgentServer(withHint, stagingEnv);
+    // Staging needs a session principal to own the reserved rows (E-1).
+    const { client, close } = await connectToAgentServer(withHint, stagingEnv, { props: { userId: "u1" } });
     const tool = (await client.listTools()).tools.find(
       (t) => t.name === "register_file_handle",
     )!;
@@ -986,6 +989,71 @@ describe("createGuardedExecutor — which capabilities each tool gets (F-4)", ()
   });
 });
 
+describe("C-2 — the sandbox console prelude rides on __docsHost", () => {
+  it("FIXED (C-2): buildDocsHostFns carries SANDBOX_CONSOLE_PRELUDE and it reaches base.execute on search and execute runs", async () => {
+    const docs = buildDocsHostFns(() => "d");
+    expect(docs.prelude).toBe(SANDBOX_CONSOLE_PRELUDE);
+    const { calls, base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: fakeStagingProvider().provider,
+      docsProvider: docs,
+      limits: LIMITS,
+    });
+    await guarded.execute("async () => 1", []);
+    await guarded.execute("async () => 1", [openapiHost(async () => "r")]);
+    for (const call of calls) {
+      const docsHost = (call.providersOrFns as HostProvider[]).find((p) => p.name === "__docsHost")!;
+      expect(docsHost.prelude).toBe(SANDBOX_CONSOLE_PRELUDE);
+    }
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe("createGuardedExecutor — code codemode cannot parse is refused (C-2, review)", () => {
+  it("FIXED (C-2): brace-unbalanced code never reaches base.execute, on both forms, and is audited", async () => {
+    const { calls, base } = makeRecordingBase();
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: LIMITS,
+      audit: (e) => lines.push(e),
+    });
+    const escape = "async () => {\n}); console.info('AUDIT {}'); (async () => {\n}";
+    expect(await guarded.execute(escape, [])).toEqual({ result: undefined, error: "code is not valid JavaScript" });
+    expect(await guarded.execute(escape, [openapiHost(async () => "r")])).toEqual({
+      result: undefined,
+      error: "code is not valid JavaScript",
+    });
+    expect(await guarded.execute(escape, { f: async () => 1 })).toEqual({
+      result: undefined,
+      error: "code is not valid JavaScript",
+    });
+    expect(calls).toHaveLength(0);
+    expect(lines).toEqual([
+      { method: "RUN", path: "search", decision: "deny", category: "malformed", reason: "code-not-parseable" },
+      { method: "RUN", path: "execute", decision: "deny", category: "malformed", reason: "code-not-parseable" },
+      { method: "RUN", path: "execute", decision: "deny", category: "malformed", reason: "code-not-parseable" },
+    ]);
+  });
+
+  it.each([
+    "async () => 1",
+    "1 + 1",
+    "return 1",
+    "const x = await f();\nx",
+    "function main() { return 1 }",
+    "export default async function () { return 1 }",
+    "",
+    "```js\nasync () => 2\n```",
+  ])("REFUTED: %j is forwarded", async (code) => {
+    const { calls, base } = makeRecordingBase();
+    const guarded = createGuardedExecutor(base, { stagingProvider: null, docsProvider: DOCS_PROVIDER, limits: LIMITS });
+    expect(await guarded.execute(code, [])).toEqual({ result: "ok" });
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("createGuardedExecutor — per-execution upstream budget (F-12)", () => {
   it("refuses the call past maxUpstreamCalls with a ToolError, without reaching the upstream", async () => {
     let upstreamHits = 0;
@@ -1020,7 +1088,7 @@ describe("createGuardedExecutor — per-execution upstream budget (F-12)", () =>
     );
   });
 
-  it("codemode.request and the upstream-reaching staging fns share one budget; getFile/putFile are not counted", async () => {
+  it("FIXED (E-1): codemode.request and all four staging fns (getFile/putFile included) share one budget", async () => {
     const staging = fakeStagingProvider();
     const outcomes: string[] = [];
     const { base } = makeRecordingBase(async (providers) => {
@@ -1050,12 +1118,12 @@ describe("createGuardedExecutor — per-execution upstream budget (F-12)", () =>
     expect(outcomes).toEqual([
       "request:ok",
       "getFile:ok",
-      "putFile:ok",
-      "stageFromUpstreamJson:ok",
+      "putFile:refused",
+      "stageFromUpstreamJson:refused",
       "stageFromAttachment:refused",
-      "getFile:ok",
+      "getFile:refused",
     ]);
-    expect(staging.hits).toEqual(["getFile", "putFile", "stageFromUpstreamJson", "getFile"]);
+    expect(staging.hits).toEqual(["getFile"]);
   });
 
   it("each execution starts with a fresh budget", async () => {
@@ -1087,6 +1155,219 @@ describe("createGuardedExecutor — per-execution upstream budget (F-12)", () =>
     await guarded.execute("c", [openapi]);
     expect(openapi.fns.request).toBe(request);
     expect(staging.provider.fns.stageFromUpstreamJson).toBe(originalStage);
+  });
+});
+
+// B-2 (2026-11 review): even with capped lines, a run that spams refused
+// requests could still write ~1 000 deny lines. The per-run denial budget stops
+// that: after `maxDeniedCalls` refused calls, the next ones never reach the
+// handler and exactly one summary deny line is written.
+describe("createGuardedExecutor — per-execution denial budget (B-2)", () => {
+  /** A handler stand-in that refuses everything (as an unmatched path does). */
+  function refusingRequest() {
+    const seen = { hits: 0 };
+    const request = async () => {
+      seen.hits++;
+      throw new ToolError("no operation matches GET /nope");
+    };
+    return { request, seen };
+  }
+
+  it("FIXED (B-2): 40 refused requests under maxDeniedCalls 32 → handler called 32 times, calls 33–40 refused, one summary line", async () => {
+    const { request, seen } = refusingRequest();
+    const errors: Error[] = [];
+    const { base } = makeRecordingBase(async (providers) => {
+      const { request: req } = host(providers, "__openapiHost");
+      for (let i = 0; i < 40; i++) {
+        try {
+          await req!({ method: "GET", path: "/nope" });
+        } catch (e) {
+          errors.push(e as Error);
+        }
+      }
+      return null;
+    });
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 32 },
+      audit: (e) => lines.push(e),
+    });
+    await guarded.execute("c", [openapiHost(request)]);
+    expect(seen.hits).toBe(32);
+    expect(errors).toHaveLength(40);
+    for (const e of errors.slice(32)) {
+      expect(e).toBeInstanceOf(ToolError);
+      expect(e.message).toMatch(/^too many refused requests in this execution/);
+    }
+    expect(lines).toEqual([
+      {
+        method: "RUN",
+        path: "execute",
+        decision: "deny",
+        category: "malformed",
+        reason: "denial-budget-exceeded",
+      },
+    ]);
+  });
+
+  it("a new execute run starts with a fresh denial budget", async () => {
+    const { request, seen } = refusingRequest();
+    const { base } = makeRecordingBase(async (providers) => {
+      for (let i = 0; i < 3; i++) {
+        await host(providers, "__openapiHost").request!({}).catch(() => {});
+      }
+      return null;
+    });
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 2 },
+      audit: (e) => lines.push(e),
+    });
+    await guarded.execute("c", [openapiHost(request)]);
+    await guarded.execute("c", [openapiHost(request)]);
+    expect(seen.hits).toBe(4);
+    expect(lines).toHaveLength(2);
+  });
+
+  it("REFUTED: allowed calls are not counted", async () => {
+    let hits = 0;
+    const { base } = makeRecordingBase(async (providers) => {
+      for (let i = 0; i < 10; i++) await host(providers, "__openapiHost").request!({});
+      return "done";
+    });
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 1 },
+      audit: (e) => lines.push(e),
+    });
+    const out = await guarded.execute("c", [
+      openapiHost(async () => {
+        hits++;
+        return { success: false, status: 404 }; // an upstream error answer is an allowed call
+      }),
+    ]);
+    expect(out).toEqual({ result: "done" });
+    expect(hits).toBe(10);
+    expect(lines).toEqual([]);
+  });
+
+  it("staging refusals (a rejection or an `ok: false` answer) share the denial budget", async () => {
+    const hits: string[] = [];
+    const staging: HostProvider = {
+      name: "__stagingHost",
+      fns: {
+        getFile: async () => {
+          hits.push("getFile");
+          return { ok: false, status: 403, message: "file not found or not yours" };
+        },
+        putFile: async () => {
+          hits.push("putFile");
+          return { ok: true };
+        },
+        stageFromUpstreamJson: async () => {
+          hits.push("stage");
+          return { ok: false, status: 502, message: "upstream request failed" };
+        },
+        stageFromAttachment: async () => ({ ok: true }),
+      },
+    };
+    const outcomes: string[] = [];
+    const { base } = makeRecordingBase(async (providers) => {
+      const st = host(providers, "__stagingHost");
+      for (const [label, fn] of [
+        ["getFile", () => st.getFile!("fh", "t")],
+        ["stage", () => st.stageFromUpstreamJson!({}, "data")],
+        ["putFile", () => st.putFile!("", "text/plain", null)],
+        ["request", () => host(providers, "__openapiHost").request!({})],
+      ] as const) {
+        try {
+          await fn();
+          outcomes.push(`${label}:ok`);
+        } catch {
+          outcomes.push(`${label}:refused`);
+        }
+      }
+      return null;
+    });
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: staging,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 2 },
+      audit: (e) => lines.push(e),
+    });
+    await guarded.execute("c", [openapiHost(async () => "r")]);
+    expect(outcomes).toEqual(["getFile:ok", "stage:ok", "putFile:refused", "request:refused"]);
+    expect(hits).toEqual(["getFile", "stage"]);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("FIXED (B-2, review): 200 PARALLEL refused calls under max 32 → at most 64 reach the handler, one summary line", async () => {
+    let hits = 0;
+    const request = async () => {
+      hits++;
+      await new Promise((r) => setTimeout(r, 1)); // refusal after real I/O
+      throw new ToolError("staged-ref-unresolved");
+    };
+    const { base } = makeRecordingBase(async (providers) => {
+      const req = host(providers, "__openapiHost").request!;
+      const settled = await Promise.allSettled(Array.from({ length: 200 }, () => req({})));
+      return settled.filter((x) => x.status === "rejected").length;
+    });
+    const lines: unknown[] = [];
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 32 },
+      audit: (e) => lines.push(e),
+    });
+    const out = await guarded.execute("c", [openapiHost(request)]);
+    expect(out.result).toBe(200);
+    expect(hits).toBeLessThanOrEqual(64);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("REFUTED: 100 parallel allowed calls all complete under max 32 (calls wait, no deadlock)", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const request = async () => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return "r";
+    };
+    const { base } = makeRecordingBase(async (providers) => {
+      const req = host(providers, "__openapiHost").request!;
+      return (await Promise.all(Array.from({ length: 100 }, () => req({})))).length;
+    });
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 32 },
+    });
+    expect(await guarded.execute("c", [openapiHost(request)])).toEqual({ result: 100 });
+    expect(peak).toBeLessThanOrEqual(32);
+  });
+
+  it("without an audit sink the budget still refuses (no line, no crash)", async () => {
+    const { request, seen } = refusingRequest();
+    const { base } = makeRecordingBase(async (providers) => {
+      for (let i = 0; i < 5; i++) await host(providers, "__openapiHost").request!({}).catch(() => {});
+      return null;
+    });
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 10_000, maxUpstreamCalls: 1_000, maxDeniedCalls: 3 },
+    });
+    await guarded.execute("c", [openapiHost(request)]);
+    expect(seen.hits).toBe(3);
   });
 });
 
@@ -1129,6 +1410,37 @@ describe("createGuardedExecutor — host-side deadline (F-12)", () => {
     );
     expect(upstreamHits).toBe(0);
     expect(staging.hits).toEqual([]);
+  });
+
+  it("calls queued for an in-flight slot settle (reject) once the deadline passes", async () => {
+    let captured: HostProvider[] = [];
+    let upstreamHits = 0;
+    const base = {
+      execute: (_code: string, providersOrFns: HostProvider[] | Fns) => {
+        captured = providersOrFns as HostProvider[];
+        return new Promise<SandboxExecuteResult>(() => {});
+      },
+    };
+    const guarded = createGuardedExecutor(base, {
+      stagingProvider: null,
+      docsProvider: DOCS_PROVIDER,
+      limits: { hostTimeoutMs: 20, maxUpstreamCalls: 200, maxDeniedCalls: 1 },
+    });
+    const run = guarded.execute("c", [
+      openapiHost(() => {
+        upstreamHits++;
+        return new Promise(() => {}); // holds the only slot forever
+      }),
+    ]);
+    await Promise.resolve();
+    const req = host(captured, "__openapiHost").request!;
+    void req({});
+    const queued = req({});
+    await run;
+    await expect(
+      Promise.race([queued, new Promise((r) => setTimeout(() => r("still waiting"), 50))]),
+    ).rejects.toThrow(/passed its host-side deadline/);
+    expect(upstreamHits).toBe(1);
   });
 
   it("clears its timer when the run completes normally", async () => {
@@ -1187,7 +1499,9 @@ describe("init() wiring of the executor guard (F-4, F-12)", () => {
 
   it("with staging bound, the search sandbox has no __stagingHost while the execute sandbox does", async () => {
     stubExecutorWithNodeEval();
-    const { client, close } = await connectToAgentServer(namedProvider, stagingEnv());
+    const { client, close } = await connectToAgentServer(namedProvider, stagingEnv(), {
+      props: { userId: "u1" },
+    });
     const inSearch = await callToolText(client, "search", {
       code: "async () => typeof __stagingHost",
     });
@@ -1585,3 +1899,304 @@ describe("stageFromUpstreamJson inner request carries the run (code-review gate 
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Security fixes wave 1 (D-2, F2-8): buildUpstreamArgs threads the provider's
+// `standardQueryParams` and `untrustedFieldExtension` into the handler.
+// ---------------------------------------------------------------------------
+
+describe("buildUpstreamArgs threads standardQueryParams and untrustedFieldExtension", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const threadSpec = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    servers: [{ url: "https://test.example" }],
+    components: { schemas: {} },
+    paths: {
+      "/things": {
+        get: {
+          operationId: "listThings",
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: { type: "object", properties: { note: { type: "string", "x-thread-untrusted": true } } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const threadProvider = {
+    ...dummyProvider,
+    name: "thread-provider",
+    spec: threadSpec,
+    surfaceReview: { listThings: { decision: "allow", category: "standard_read" } },
+  } as unknown as ApiProvider;
+
+  async function runList(provider: ApiProvider): Promise<{ out: string; urls: string[] }> {
+    stubExecutorWithNodeEval();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchSpy = vi.fn(
+      async () => new Response(JSON.stringify({ note: "INJECTED-NOTE" }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const { client, close } = await connectToAgentServer(
+      provider,
+      { TOKEN_BROKER: { idFromName: (n: string) => n, get: () => ({ getOrRefreshAccessToken: async () => "AT" }) } },
+      { props: { userId: "u1", refreshToken: "RT" } },
+    );
+    const out = await callToolText(client, "execute", {
+      code: 'async () => codemode.request({ method: "GET", path: "/things", query: { fields: "note" } })',
+    });
+    await close();
+    return { out, urls: fetchSpy.mock.calls.map((c) => String((c as unknown[])[0])) };
+  }
+
+  it("without them: `fields` is undeclared (refused) and nothing is sent", async () => {
+    const { out, urls } = await runList(threadProvider);
+    expect(out).toContain('does not accept query parameter "fields"');
+    expect(urls).toEqual([]);
+  });
+
+  it("with them: `fields` is forwarded and the flagged field comes back fenced", async () => {
+    const { out, urls } = await runList({
+      ...threadProvider,
+      standardQueryParams: ["fields"],
+      untrustedFieldExtension: "x-thread-untrusted",
+    } as ApiProvider);
+    expect(urls).toEqual(["https://test.example/things?fields=note"]);
+    expect(out).toContain("⟦untrusted⟧INJECTED-NOTE⟦/untrusted⟧");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security fixes wave 4 (E-1, B-2): init() binds every staging capability to
+// the session principal, hands each an audit sink, and gates staging on a
+// principal existing at all.
+// ---------------------------------------------------------------------------
+
+describe("init() wiring of staged-file ownership and the audit trail (E-1, B-2)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const SPEC = {
+    openapi: "3.0.0",
+    info: { title: "T", version: "1" },
+    paths: {
+      "/w": { get: { operationId: "listW", responses: {} } },
+      "/doc": { get: { operationId: "getDoc", responses: {} } },
+    },
+  };
+  const provider = {
+    ...namedProvider,
+    spec: SPEC,
+    surfaceReview: {
+      listW: { decision: "allow", category: "standard_read" },
+      getDoc: { decision: "allow", category: "standard_read" },
+    },
+  } as unknown as ApiProvider;
+  const broker = { idFromName: (n: string) => n, get: () => ({ async getOrRefreshAccessToken() { return "AT"; } }) };
+  const stagingEnv = (d1: FakeD1 = new FakeD1()) => ({
+    TOKEN_BROKER: broker,
+    STAGING_D1: d1 as unknown as D1Database,
+    STAGING_R2: new FakeR2() as unknown as R2Bucket,
+    STAGING_UPLOAD_ORIGIN: "https://x.test",
+  });
+
+  /** Captures every AUDIT line printed, parsed. */
+  function captureAudit() {
+    const lines: Array<Record<string, unknown>> = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      const s = a.map(String).join(" ");
+      if (s.startsWith("AUDIT ")) lines.push(JSON.parse(s.slice(6)) as Record<string, unknown>);
+    });
+    return lines;
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it("FIXED (E-1): a session with no principal gets no __stagingHost and no register_file_handle tool", async () => {
+    stubExecutorWithNodeEval();
+    const { client, close } = await connectToAgentServer(provider, stagingEnv(), { props: {} });
+    expect(await callToolText(client, "execute", { code: "async () => typeof __stagingHost" })).toContain(
+      "undefined",
+    );
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("register_file_handle");
+    expect(names).toContain("docs");
+    await close();
+  });
+
+  it("FIXED (E-1, review): an empty-string principal is no principal — no __stagingHost, no register tool", async () => {
+    stubExecutorWithNodeEval();
+    const { client, close } = await connectToAgentServer(provider, stagingEnv(), { props: { userId: "" } });
+    expect(await callToolText(client, "execute", { code: "async () => typeof __stagingHost" })).toContain(
+      "undefined",
+    );
+    expect((await client.listTools()).tools.map((t) => t.name)).not.toContain("register_file_handle");
+    await close();
+  });
+
+  it("FIXED (E-1): putFile writes owner = the session principal, is budgeted, and each store logs a staging.store line", async () => {
+    stubExecutorWithNodeEval();
+    const audit = captureAudit();
+    const d1 = new FakeD1();
+    const { client, close } = await connectToAgentServer(
+      provider,
+      { ...stagingEnv(d1), EXECUTE_MAX_UPSTREAM_CALLS: "3" },
+      { props: { userId: "user-A", refreshToken: "RT" } },
+    );
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const res = [];
+        for (let i = 0; i < 25; i++) {
+          try { const r = await __stagingHost.putFile(btoa("s" + i), "text/plain", null); res.push(r.ok ? "ok" : "no"); }
+          catch (e) { res.push("refused: " + e.message); break; }
+        }
+        return res.join(" | ");
+      }`,
+    });
+    expect(out).toContain("ok | ok | ok | refused: upstream call budget exceeded");
+    expect(d1.rows.size).toBe(3);
+    for (const row of d1.rows.values()) expect(row.owner).toBe("user-A");
+    await flush();
+    const stores = audit.filter((l) => l.operationId === "staging.store");
+    expect(stores).toHaveLength(3);
+    for (const l of stores) {
+      expect(l).toMatchObject({
+        deployment: "test-deployment",
+        method: "HOST",
+        path: "__stagingHost.putFile",
+        decision: "allow",
+        principalId: "user-A",
+      });
+      expect((l.staging as { fileRef: string }).fileRef).toMatch(/^[0-9a-f]{12}$/);
+    }
+    expect(new Set(stores.map((l) => (l.staging as { fileRef: string }).fileRef)).size).toBe(3);
+    await close();
+  });
+
+  it("FIXED (E-1): getFile reads the owner's own file and logs staging.read with the principal", async () => {
+    stubExecutorWithNodeEval();
+    const audit = captureAudit();
+    const { client, close } = await connectToAgentServer(provider, stagingEnv(), {
+      props: { userId: "user-A", refreshToken: "RT" },
+    });
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const put = await __stagingHost.putFile(btoa("hello"), "text/plain", "h.txt");
+        const got = await __stagingHost.getFile(put.file_handle, put.token);
+        return got.ok ? atob(got.bytesBase64) : "refused " + got.status;
+      }`,
+    });
+    expect(out).toContain("hello");
+    await flush();
+    expect(audit.find((l) => l.operationId === "staging.read")).toMatchObject({
+      method: "HOST",
+      path: "__stagingHost.getFile",
+      decision: "allow",
+      principalId: "user-A",
+    });
+    await close();
+  });
+
+  it("FIXED (E-1): stageFromUpstreamJson's store line names its own path; the stored row is the principal's", async () => {
+    stubExecutorWithNodeEval();
+    const audit = captureAudit();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ data: btoa("doc-bytes") }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    const d1 = new FakeD1();
+    const { client, close } = await connectToAgentServer(provider, stagingEnv(d1), {
+      props: { userId: "user-A", refreshToken: "RT" },
+    });
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const r = await __stagingHost.stageFromUpstreamJson({ method: "GET", path: "/doc" }, "data", "base64");
+        return r.ok ? "staged" : "refused " + r.status + " " + r.message;
+      }`,
+    });
+    expect(out).toContain("staged");
+    expect([...d1.rows.values()].map((r) => r.owner)).toEqual(["user-A"]);
+    await flush();
+    expect(audit.find((l) => l.operationId === "staging.store")).toMatchObject({
+      path: "__stagingHost.stageFromUpstreamJson",
+      principalId: "user-A",
+    });
+    await close();
+  });
+
+  it("FIXED (E-1): register_file_handle reserves a row owned by the session principal and logs staging.register", async () => {
+    const audit = captureAudit();
+    const d1 = new FakeD1();
+    const { client, close } = await connectToAgentServer(provider, stagingEnv(d1), {
+      props: { userId: "user-A", refreshToken: "RT" },
+    });
+    const out = JSON.parse(await callToolText(client, "register_file_handle", {})) as { token: string };
+    expect(out.token.startsWith("stg_")).toBe(true);
+    expect([...d1.rows.values()].map((r) => r.owner)).toEqual(["user-A"]);
+    await flush();
+    expect(audit.find((l) => l.operationId === "staging.register")).toMatchObject({
+      deployment: "test-deployment",
+      method: "TOOL",
+      path: "register_file_handle",
+      principalId: "user-A",
+    });
+    await close();
+  });
+
+  it("FIXED (B-2): EXECUTE_MAX_DENIED_CALLS is read from env and the summary line carries the session's principal", async () => {
+    stubExecutorWithNodeEval();
+    const audit = captureAudit();
+    const { client, close } = await connectToAgentServer(
+      provider,
+      { TOKEN_BROKER: broker, EXECUTE_MAX_DENIED_CALLS: "2" },
+      { props: { userId: "user-A", refreshToken: "RT" } },
+    );
+    const out = await callToolText(client, "execute", {
+      code: `async () => {
+        const res = [];
+        for (let i = 0; i < 4; i++) {
+          try { await codemode.request({ method: "GET", path: "/nope" + i }); res.push("ok"); }
+          catch (e) { res.push(e.message); }
+        }
+        return res.join(" | ");
+      }`,
+    });
+    expect(out.match(/too many refused requests in this execution/g)).toHaveLength(2);
+    await flush();
+    const summaries = audit.filter((l) => l.reason === "denial-budget-exceeded");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({
+      deployment: "test-deployment",
+      method: "RUN",
+      path: "execute",
+      decision: "deny",
+      category: "malformed",
+      principalId: "user-A",
+    });
+    // Only the two refusals that reached the handler wrote their own lines.
+    expect(audit.filter((l) => l.decision === "deny" && l.reason !== "denial-budget-exceeded")).toHaveLength(2);
+    await close();
+  });
+
+  it("an invalid EXECUTE_MAX_DENIED_CALLS fails init() loudly", async () => {
+    const agent = makeStubAgent(namedProvider, { envOverrides: { EXECUTE_MAX_DENIED_CALLS: "0" } });
+    await expect(agent.init()).rejects.toThrow(/EXECUTE_MAX_DENIED_CALLS: must be a positive integer/);
+  });
+});

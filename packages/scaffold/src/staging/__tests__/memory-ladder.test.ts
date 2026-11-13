@@ -108,10 +108,11 @@ describe.skipIf(!gc)("memory ladder (in-process)", () => {
       const handle = mintFileHandle();
       const token_hash = await sha256Bearer(token);
       await insertPending(d1 as unknown as D1Database, {
+        owner: "user-A",
         token_hash, file_handle: handle, content_type_hint: null,
         expected_byte_len: null, filename: null, created_at: NOW, expires_at: NOW + 300,
       });
-      const deps = { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, now: () => NOW + 1 };
+      const deps = { STAGING_D1: d1 as unknown as D1Database, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, owner: "user-A", now: () => NOW + 1 };
 
       // Phase 1: upload.
       meter.reset();

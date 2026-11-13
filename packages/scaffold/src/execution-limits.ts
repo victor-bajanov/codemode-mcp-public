@@ -9,8 +9,8 @@
 //     codemode's in-sandbox 70 s plus a margin, so the cooperative timeout
 //     still fires first whenever the sandbox lets it.
 //   • EXECUTE_MAX_UPSTREAM_CALLS — upstream requests one run may make
-//     (`codemode.request` plus `__stagingHost.stageFromUpstreamJson` /
-//     `stageFromAttachment`). Default 1 000. Sized to sit below Cloudflare's
+//     (`codemode.request` plus the four `__stagingHost` fns: getFile,
+//     putFile, stageFromUpstreamJson, stageFromAttachment). Default 1 000. Sized to sit below Cloudflare's
 //     paid-plan subrequest limit (10 000 per invocation since 2026-02-11) so
 //     an ambitious run stops with this budget's clear error rather than the
 //     platform's "Too many subrequests": a budgeted call costs at most ~4
@@ -18,13 +18,25 @@
 //     when staging), so 1 000 calls stay under 4 000. The deadline usually
 //     binds first for sequential loops. Raise both together if the Worker
 //     sets a higher `limits.subrequests`.
+//   • EXECUTE_MAX_DENIED_CALLS — refused calls one run may make (B-2,
+//     2026-11 review): a `codemode.request` or staging call that rejects, or
+//     a staging call answering `ok: false`. Past it, every further call from
+//     that run is refused without reaching the handler, and one summary
+//     audit line (`reason: "denial-budget-exceeded"`) is written — so a run
+//     cannot flood the log with capped deny lines. Default 32, far above any
+//     legitimate run.
 
 export const DEFAULT_EXECUTE_HOST_TIMEOUT_MS = 75_000;
 export const DEFAULT_EXECUTE_MAX_UPSTREAM_CALLS = 1_000;
+export const DEFAULT_EXECUTE_MAX_DENIED_CALLS = 32;
 
 export interface ExecutionLimits {
   hostTimeoutMs: number;
   maxUpstreamCalls: number;
+  /** Refused calls per run (B-2). Optional for hand-built limits; the guard
+   *  falls back to DEFAULT_EXECUTE_MAX_DENIED_CALLS. readExecutionLimits
+   *  always sets it. */
+  maxDeniedCalls?: number;
 }
 
 /** Positive-integer env var, falling back when unset/empty. Deliberately a
@@ -44,7 +56,8 @@ function parsePositiveIntVar(
   return n;
 }
 
-/** Reads EXECUTE_HOST_TIMEOUT_MS / EXECUTE_MAX_UPSTREAM_CALLS; unset or "" →
+/** Reads EXECUTE_HOST_TIMEOUT_MS / EXECUTE_MAX_UPSTREAM_CALLS /
+ *  EXECUTE_MAX_DENIED_CALLS; unset or "" →
  *  default; anything that is not a positive integer throws (same contract as
  *  config.ts's positive-integer vars). */
 export function readExecutionLimits(env: Record<string, unknown>): ExecutionLimits {
@@ -54,6 +67,11 @@ export function readExecutionLimits(env: Record<string, unknown>): ExecutionLimi
       env,
       "EXECUTE_MAX_UPSTREAM_CALLS",
       DEFAULT_EXECUTE_MAX_UPSTREAM_CALLS,
+    ),
+    maxDeniedCalls: parsePositiveIntVar(
+      env,
+      "EXECUTE_MAX_DENIED_CALLS",
+      DEFAULT_EXECUTE_MAX_DENIED_CALLS,
     ),
   };
 }

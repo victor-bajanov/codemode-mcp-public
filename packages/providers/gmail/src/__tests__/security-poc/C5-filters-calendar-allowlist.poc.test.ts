@@ -25,7 +25,7 @@ import { inspectFilterCreate } from "../../inspectors/filters";
 import { inspectEventAttendees } from "../../inspectors/calendar-attendees";
 import { isAllowedRecipient } from "../../inspectors/allowlist";
 
-const ENV = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@allowed.example" };
+const ENV = { OUTBOUND_RECIPIENT_ALLOWLIST: "*@allowed.example", CALENDAR_WRITE_ALLOWLIST: "primary" };
 
 describe("C5a filters.create inspector", () => {
   it("removeLabelIds INBOX (archive) requires approval — the documented control", () => {
@@ -64,12 +64,12 @@ describe("C5a filters.create inspector", () => {
 
 describe("C5b calendar attendee inspector", () => {
   it("an external attendee is denied", () => {
-    const r = inspectEventAttendees({ body: { attendees: [{ email: "outsider@evil.example" }] } }, ENV);
+    const r = inspectEventAttendees({ pathParams: { calendarId: "primary" }, body: { attendees: [{ email: "outsider@evil.example" }] } }, ENV);
     expect(r.decision).toBe("deny");
   });
   it("FIXED (F-9): the same address flagged resource:true is no longer exempt from the allowlist", () => {
     const r = inspectEventAttendees(
-      { body: { attendees: [{ email: "outsider@evil.example", resource: true }] } },
+      { pathParams: { calendarId: "primary" }, body: { attendees: [{ email: "outsider@evil.example", resource: true }] } },
       ENV,
     );
     expect(r.decision).toBe("deny");
@@ -77,7 +77,7 @@ describe("C5b calendar attendee inspector", () => {
   });
   it("a real Workspace room (resource:true at resource.calendar.google.com) stays exempt (control)", () => {
     const r = inspectEventAttendees(
-      { body: { attendees: [{ email: "room-101@resource.calendar.google.com", resource: true }] } },
+      { pathParams: { calendarId: "primary" }, body: { attendees: [{ email: "room-101@resource.calendar.google.com", resource: true }] } },
       ENV,
     );
     expect(r.decision).toBe("allow");

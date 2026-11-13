@@ -2,8 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { resolveRenderer } from "../elicit";
 import type { ElicitRenderer, SurfaceReviewEntry } from "@local/shared";
 
-const perOp: ElicitRenderer = vi.fn(() => ({ message: "per-op", fields: { x: 1 } }));
-const perCat: ElicitRenderer = vi.fn(() => ({ message: "per-cat", fields: { x: 2 } }));
+const perOp: ElicitRenderer = vi.fn(() => ({ headline: "per-op", facts: { x: 1 } }));
+const perCat: ElicitRenderer = vi.fn(() => ({ headline: "per-cat", facts: { x: 2 } }));
 
 describe("resolveRenderer", () => {
   it("returns the per-op override when present", () => {

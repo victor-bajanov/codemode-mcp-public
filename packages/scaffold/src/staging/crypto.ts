@@ -38,3 +38,13 @@ export async function deriveContentKey(
 export async function deriveV2Key(token: string, fileHandle: string): Promise<CryptoKey> {
   return deriveContentKey(decodeTokenSecret(token), decodeHandleBytes(fileHandle), HKDF_INFO_V2);
 }
+
+/**
+ * Audit correlation id for a staged file (E-1): the first 6 bytes of SHA-256(handle) as 12
+ * lower-case hex chars. Joins a file's register/store/read/download lines without logging the
+ * handle or token.
+ */
+export async function fileRefOf(file_handle: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", TEXT_ENCODER.encode(file_handle)));
+  return Array.from(digest.subarray(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
+}

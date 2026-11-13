@@ -79,7 +79,7 @@ function world() {
   const d1 = new FakeD1();
   const r2 = new FakeR2();
   const D1 = d1 as unknown as D1Database;
-  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", now: () => NOW };
+  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", owner: "user-A", now: () => NOW };
   const opener = createStagedFileOpener(deps);
   const inspected: InspectRequest[] = [];
   const SR: SurfaceReview = {
@@ -156,6 +156,7 @@ function world() {
     const row = d1.rows.get(key)!;
     d1.rows.delete(key);
     await insertClaimed(D1, {
+      owner: "user-A",
       token_hash: Buffer.from(key, "hex"),
       file_handle: ref.file_handle,
       r2_key: row.r2_key!,

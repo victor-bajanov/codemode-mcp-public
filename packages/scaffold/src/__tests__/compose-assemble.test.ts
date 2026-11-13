@@ -37,7 +37,7 @@ function fileOf(bytes: Uint8Array, contentType = "application/pdf", filename: st
       await onBlock(bytes.slice(off, Math.min(bytes.byteLength, off + BLOCK_BYTES)), i++);
     }
   });
-  const file: OpenStagedFile = { meta: { byteLength: bytes.byteLength, contentType, filename }, readBlocks };
+  const file: OpenStagedFile = { meta: { byteLength: bytes.byteLength, contentType, filename, fileRef: "000000000000" }, readBlocks };
   return { file, readBlocks };
 }
 
@@ -73,6 +73,7 @@ const meta = (n: number, contentType = "application/pdf", filename: string | nul
   byteLength: n,
   contentType,
   filename,
+  fileRef: "000000000000",
 });
 
 describe("assembledLength", () => {

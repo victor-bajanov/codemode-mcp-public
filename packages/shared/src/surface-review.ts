@@ -69,6 +69,51 @@ export interface InspectRequest {
   /** Exact byte length of the assembled outbound body (composed or staged
    *  multipart), staged slots expanded in their encoding. */
   assembledByteLength?: number;
+  /** Path-template parameters of the matched operation (the target that is
+   *  sent), keyed by template parameter name, DECODED (`/things/a%23b` gives
+   *  `{ id: "a#b" }`). Set by the request handler on every inspected call;
+   *  absent in unit probes, where an inspector that needs it must fail
+   *  closed. To read the same target with `UpstreamLookup.get`, re-encode
+   *  each value (`encodeLookupPath`). */
+  pathParams?: Readonly<Record<string, string>>;
+}
+
+/** What `UpstreamLookup.get` returns: the upstream status and its parsed
+ *  JSON body (text when it is not JSON), untruncated. A non-2xx answer is a
+ *  result, not a throw — the hook decides what it means. */
+export interface UpstreamLookupResult {
+  status: number;
+  body: unknown;
+}
+
+/** Build an encoded lookup path from a path template and DECODED parameter
+ *  values (`InspectRequest.pathParams`): each `{name}` becomes
+ *  `encodeURIComponent(value)`, so a value is always exactly one segment.
+ *  Throws when a parameter is missing or empty (the hook then fails closed). */
+export function encodeLookupPath(template: string, params: Readonly<Record<string, string>>): string {
+  return template.replace(/\{([^}]+)\}/g, (_m, name: string) => {
+    const v = Object.hasOwn(params, name) ? params[name] : undefined;
+    if (typeof v !== "string" || v === "") {
+      throw new Error(`encodeLookupPath: path parameter "${name}" is missing or empty`);
+    }
+    return encodeURIComponent(v);
+  });
+}
+
+/** Host-side read handed to `SurfaceReviewEntry.inspectUpstream`. */
+export interface UpstreamLookup {
+  /** GET `path` (with optional `query`) on this provider with the caller's
+   *  credentials, through the same request handler as any other request:
+   *  path guards, query policy, audit, no redirects. Only a path whose
+   *  matched GET operation is a plain `allow` with no inspector or hook may
+   *  be read, at most four times per request; anything else throws before
+   *  any fetch, and any throw (awaited or not) denies the write that asked.
+   *
+   *  `path` is ENCODED: build it with `encodeLookupPath(template,
+   *  req.pathParams)`, never by pasting decoded `pathParams` values (a `#`,
+   *  `?`, `/` or `%` in an id would read another target or be refused).
+   *  `query` is the hook's own: never forward the sandbox's `req.query`. */
+  get(path: string, query?: Record<string, string>): Promise<UpstreamLookupResult>;
 }
 
 export interface InspectResult {
@@ -124,6 +169,21 @@ export interface SurfaceReviewEntry {
    *  missing var the same as an empty policy, never fall back to a permissive
    *  default. */
   inspect?: (req: InspectRequest, env?: InspectEnv) => InspectResult;
+  /** Async check that needs upstream state (e.g. who organises the stored
+   *  event). Runs after `inspect`, only when it did not deny, and only on a
+   *  JSON or empty body (an opaque or staged body is denied instead). Its
+   *  decision is merged with `mostRestrictive` and its `summary` is merged
+   *  over the sync one. `lookup` reads plain-allow GETs only; a failed
+   *  lookup, a throw or a malformed result denies the request. Must be
+   *  paired with `inspect` on a body-bearing method (the provider battery
+   *  checks it). Note: a lookup mints the access token before the decision.
+   *
+   *  The lookup result is upstream data the sandbox did not see: never copy
+   *  its strings (or a lookup error's text) into `message` or `reason`.
+   *  Return them only as `summary` facts, which the scaffold sanitises and
+   *  shows to the user in the approval dialog, never to the model. A throw
+   *  from the hook is reported to the caller without its text. */
+  inspectUpstream?: (req: InspectRequest, lookup: UpstreamLookup, env?: InspectEnv) => Promise<InspectResult>;
   /** Best-effort JSON-body normalizer, applied by the request handler BEFORE
    *  the effective payload is resolved — so inspection, the elicit dialog, and
    *  the upstream send all see the same normalized payload (the inspected ==

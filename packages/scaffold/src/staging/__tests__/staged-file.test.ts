@@ -39,6 +39,7 @@ function makeDeps(config: StagingConfig = CFG) {
       STAGING_R2: r2 as unknown as R2Bucket,
       config,
       uploadOrigin: "https://x.test",
+      owner: "user-A",
       now: () => NOW,
     },
   };
@@ -341,6 +342,7 @@ describe("unknown-length slot (shared with /staging/upload)", () => {
 
     const token = mintToken();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: await sha256Bearer(token), file_handle: mintFileHandle(), content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: NOW, expires_at: NOW + 300,
     });

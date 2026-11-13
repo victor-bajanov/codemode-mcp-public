@@ -10,6 +10,12 @@
 // read gated keys the way Xero does and fail closed whenever the inspector
 // cannot tell which value Xero would apply.
 
+import type { InspectResult } from "@local/shared";
+
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
 export interface CaseInsensitiveLookup {
   /** At least one key matching `key` (ignoring case) is present. */
   present: boolean;
@@ -23,11 +29,11 @@ export interface CaseInsensitiveLookup {
 // some case-insensitive comparers map onto ASCII letters (U+017F long s,
 // U+0131 dotless i, U+212A Kelvin sign, the "st" ligatures), so they are
 // caught as candidates rather than slipping past as unrelated keys.
-function fold(s: string): string {
+export function fold(s: string): string {
   return s.toUpperCase().toLowerCase();
 }
 
-const ASCII_ONLY = /^[\x00-\x7f]*$/;
+export const ASCII_ONLY = /^[\x00-\x7f]*$/;
 
 /** Case-insensitive property lookup. `ambiguous` when two or more keys
  *  differing only by case are present (Xero's deserialiser would pick one;
@@ -54,4 +60,18 @@ export function getCaseInsensitive(
  *  Xero's coercion of them is not something the inspector should second-guess. */
 export function isTruthyFlag(value: unknown): boolean {
   return value !== undefined && value !== null && value !== false;
+}
+
+/** The deny for a key spelt more than one way. `payload` names the body with
+ *  its article, e.g. "an invoice" or "a contact". */
+export function ambiguousKeyDeny(reason: string, payload: string, key: string): InspectResult {
+  return {
+    decision: "deny",
+    category: "malformed",
+    reason,
+    message:
+      `Refusing ${payload} payload that spells "${key}" more than one way (keys differing only by letter ` +
+      "case, or a non-ASCII lookalike). Xero matches property names case-insensitively, so which value it " +
+      `would apply is unclear. Send "${key}" exactly once.`,
+  };
 }

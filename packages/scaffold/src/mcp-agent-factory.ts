@@ -34,7 +34,7 @@
 
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { DynamicWorkerExecutor } from "@cloudflare/codemode";
+import { DynamicWorkerExecutor, normalizeCode } from "@cloudflare/codemode";
 import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 import { z } from "zod";
 import type { ApiProvider } from "./api-provider";
@@ -63,8 +63,14 @@ export { RESPONSE_CHAR_CAP, buildSearchStrategyBlock } from "./descriptions/frag
 import { resolveEndpoints } from "./config";
 import { handleUpstreamRequest, type HandleArgs, type UpstreamCtx } from "./request-handler";
 import { ToolError } from "./elicit";
-import { readExecutionLimits, type ExecutionLimits } from "./execution-limits";
+import {
+  DEFAULT_EXECUTE_MAX_DENIED_CALLS,
+  readExecutionLimits,
+  type ExecutionLimits,
+} from "./execution-limits";
+import { createAuditSink, type AuditSink } from "./audit";
 import { principalOf } from "./principal";
+import { SANDBOX_CONSOLE_PRELUDE } from "./sandbox-console";
 import type { TokenBrokerStub } from "./token-broker";
 import { createGetFileCapability } from "./staging/getfile-capability";
 import { createPutFileCapability, type PutFileCapabilityDeps } from "./staging/putfile-capability";
@@ -103,6 +109,9 @@ export interface ProviderEnv extends Record<string, unknown> {
   // positive integers; unset uses the defaults (75 000 ms / 1 000 calls).
   EXECUTE_HOST_TIMEOUT_MS?: string;
   EXECUTE_MAX_UPSTREAM_CALLS?: string;
+  // Refused calls per execute run before the rest are refused unseen (B-2);
+  // unset uses the default (32).
+  EXECUTE_MAX_DENIED_CALLS?: string;
 }
 
 /**
@@ -260,9 +269,17 @@ export function patchCodemodeDocsAlias(code: string): string {
  */
 export function buildDocsHostFns(
   docs: (section?: DocSection) => string,
-): { name: "__docsHost"; fns: Record<string, (...args: unknown[]) => Promise<unknown>> } {
+): {
+  name: "__docsHost";
+  fns: Record<string, (...args: unknown[]) => Promise<unknown>>;
+  prelude: string;
+} {
   return {
     name: "__docsHost",
+    // C-2: every sandbox run (search included) gets __docsHost, so its
+    // prelude is where the console methods codemode does not capture are
+    // rebound to its capturing console.log (see sandbox-console.ts).
+    prelude: SANDBOX_CONSOLE_PRELUDE,
     fns: {
       // args[0] == null also catches the JSON-marshalled `undefined` from a
       // no-arg `codemode.docs()` — the sandbox RPC serialises it to `null`.
@@ -275,8 +292,10 @@ export function buildDocsHostFns(
 type HostFns = Record<string, (...args: unknown[]) => Promise<unknown>>;
 /** A `{ name, fns }` capability as codemode's executor takes it (its
  *  `ResolvedProvider`, minus the optional fields this module never sets —
- *  they are preserved by the spread in createGuardedExecutor regardless). */
-export type HostProvider = { name: string; fns: HostFns };
+ *  they are preserved by the spread in createGuardedExecutor regardless).
+ *  `prelude` is emitted by codemode after its console overrides and before
+ *  the LLM code (C-2: __docsHost carries SANDBOX_CONSOLE_PRELUDE). */
+export type HostProvider = { name: string; fns: HostFns; prelude?: string };
 export interface SandboxExecuteResult {
   result: unknown;
   error?: string;
@@ -291,10 +310,15 @@ export interface SandboxExecutor {
  *  channel. Its presence is what distinguishes an `execute` run from a
  *  `search` run (which codemode hands an empty array). */
 const OPENAPI_HOST = "__openapiHost";
-/** `__stagingHost` fns that reach the upstream (via handleUpstreamRequest)
- *  and therefore count against the per-execution budget. getFile/putFile
- *  touch only staging storage and are not counted. */
-const STAGING_UPSTREAM_FNS = ["stageFromUpstreamJson", "stageFromAttachment"] as const;
+/** `__stagingHost` fns that count against the per-execution budget: the two
+ *  that reach the upstream (via handleUpstreamRequest), and getFile/putFile,
+ *  which move file-sized data through the host (E-1, 2026-11 review). */
+export const STAGING_BUDGETED_FNS = [
+  "getFile",
+  "putFile",
+  "stageFromUpstreamJson",
+  "stageFromAttachment",
+] as const;
 
 /**
  * Wraps codemode's executor with the host-side controls the sandbox cannot
@@ -306,10 +330,14 @@ const STAGING_UPSTREAM_FNS = ["stageFromUpstreamJson", "stageFromAttachment"] as
  *     the full upstream path (writes included), so handing it to `search`
  *     re-opened what codemode closed (F-4). `__docsHost` is read-only and
  *     goes to both tools.
- *   • Every run gets a fresh upstream budget: `codemode.request` and the two
- *     upstream-reaching staging fns share `limits.maxUpstreamCalls`; the call
+ *   • Every run gets a fresh upstream budget: `codemode.request` and the four
+ *     staging fns (STAGING_BUDGETED_FNS) share `limits.maxUpstreamCalls`; the call
  *     past it throws a ToolError, which the sandbox sees as an ordinary
  *     rejection (F-12).
+ *   • Every run also gets a fresh denial budget (B-2, 2026-11 review): after
+ *     `limits.maxDeniedCalls` refused calls (a rejection, or a staging
+ *     `{ ok: false }` answer) every further call is refused before it reaches
+ *     the handler, with one `denial-budget-exceeded` line on `opts.audit`.
  *   • The host stops waiting after `limits.hostTimeoutMs`, resolving with an
  *     `error` (codemode's Executor contract: never reject). codemode's own
  *     timeout races INSIDE the sandbox and LLM code can neuter it. The host
@@ -378,6 +406,22 @@ function transferGateFor(config: StagingConfig): TransferGate {
   return isolateTransferGate;
 }
 
+/**
+ * True when codemode will wrap `code` as one self-contained arrow function
+ * rather than splice it in raw (C-2, wave-4 review). codemode's own
+ * normalizeCode is the oracle, so the rule is exactly codemode's (same acorn
+ * options): its output is a fixpoint iff it parses as a single arrow-function
+ * expression statement. Snippets codemode wraps (bare expressions, top-level
+ * await/return, function declarations, `export default`, fenced blocks)
+ * still pass; text that leaves the wrapper's braces unbalanced does not.
+ */
+export function isSelfContainedProgram(code: string): boolean {
+  if (typeof code !== "string") return false;
+  const once = normalizeCode(code);
+  if (once === code.trim()) return true;
+  return normalizeCode(once) === once;
+}
+
 export function createGuardedExecutor(
   base: SandboxExecutor,
   opts: {
@@ -386,19 +430,71 @@ export function createGuardedExecutor(
     stagingProvider: HostProvider | ((run: RunContext) => HostProvider) | null;
     docsProvider: HostProvider;
     limits: ExecutionLimits;
+    /** Where the denial budget's summary line goes (B-2). The handler and
+     *  the staging capabilities write their own lines; this sink only ever
+     *  receives `reason: "denial-budget-exceeded"`, once per run. */
+    audit?: AuditSink;
   },
 ): SandboxExecutor {
-  const { stagingProvider, docsProvider, limits } = opts;
+  const { stagingProvider, docsProvider, limits, audit } = opts;
+  const maxDeniedCalls = limits.maxDeniedCalls ?? DEFAULT_EXECUTE_MAX_DENIED_CALLS;
   return {
     execute: async (code, providersOrFns) => {
-      const run = { calls: 0, expired: false };
+      // C-2 (wave-4 review): refuse code codemode would splice in raw. Its
+      // normalizeCode falls back to inserting the source verbatim when acorn
+      // cannot parse it; brace-unbalanced code then closes evaluate() and the
+      // class and runs at module scope of executor.js — before codemode's
+      // console overrides and any prelude. Checked on the exact string
+      // base.execute would receive (the alias patch never unbalances it).
+      const isExecuteRun =
+        !Array.isArray(providersOrFns) || providersOrFns.some((p) => p.name === OPENAPI_HOST);
+      if (!isSelfContainedProgram(code)) {
+        audit?.({
+          method: "RUN",
+          path: isExecuteRun ? "execute" : "search",
+          decision: "deny",
+          category: "malformed",
+          reason: "code-not-parseable",
+        });
+        return { result: undefined, error: "code is not valid JavaScript" };
+      }
+      const run = { calls: 0, denied: 0, deniedSummarised: false, expired: false };
+      // In-flight cap for budgeted calls (B-2, wave-4 review): `run.denied`
+      // only grows once a call settles, so calls launched together would all
+      // pass the denial check. At most `maxDeniedCalls` budgeted calls run at
+      // once; the rest WAIT for a slot (never fail for it) and re-check the
+      // budgets once they hold one — so at most 2 × maxDeniedCalls refusals
+      // ever reach a handler. Nested budgeted calls do not exist (the
+      // staging capability's inner request bypasses the wrapper), so a slot
+      // holder never waits on another slot.
+      const slots = { inFlight: 0, waiters: [] as Array<() => void> };
+      const acquireSlot = async (): Promise<void> => {
+        if (slots.inFlight < maxDeniedCalls) {
+          slots.inFlight++;
+          return;
+        }
+        // The releaser hands its slot straight to the next waiter.
+        await new Promise<void>((resolve) => slots.waiters.push(resolve));
+      };
+      const releaseSlot = (): void => {
+        const next = slots.waiters.shift();
+        if (next) next();
+        else slots.inFlight--;
+      };
+      const assertNotExpired = (): void => {
+        if (run.expired) {
+          throw new ToolError(
+            "this execution passed its host-side deadline; further upstream calls are refused",
+          );
+        }
+      };
       // One controller and key per run: the controller aborts every staged
       // transfer in flight when the deadline fires (D3a); the key is the
       // transfer gate's per-run identity (D8).
       const runController = new AbortController();
       const runCtx: RunContext = { runKey: {}, signal: runController.signal };
       const wrapUpstream =
-        (fn: (...args: unknown[]) => Promise<unknown>) =>
+        (fn: (...args: unknown[]) => Promise<unknown>, staging: boolean) =>
         async (...args: unknown[]): Promise<unknown> => {
           const first = args[0];
           if (first !== null && typeof first === "object" && !Array.isArray(first)) {
@@ -406,23 +502,68 @@ export function createGuardedExecutor(
             RUN_CONTEXT.set(tagged, runCtx);
             args[0] = tagged;
           }
-          if (run.expired) {
-            throw new ToolError(
-              "this execution passed its host-side deadline; further upstream calls are refused",
-            );
+          assertNotExpired();
+          await acquireSlot();
+          try {
+            return await callWithinBudgets(fn, staging, args);
+          } finally {
+            releaseSlot();
           }
-          if (++run.calls > limits.maxUpstreamCalls) {
-            throw new ToolError(
-              `upstream call budget exceeded: at most ${limits.maxUpstreamCalls} upstream requests per execution`,
-            );
-          }
-          return fn(...args);
         };
-      const wrapNamed = (fns: HostFns, names: readonly string[]): HostFns => {
+      const callWithinBudgets = async (
+        fn: (...args: unknown[]) => Promise<unknown>,
+        staging: boolean,
+        args: unknown[],
+      ): Promise<unknown> => {
+        // Re-checked: the deadline may have passed while this call waited.
+        assertNotExpired();
+        // Denial budget (B-2): once the run has had `maxDeniedCalls`
+        // refusals, nothing more reaches the handler or the capabilities,
+        // so no more deny lines are written; one summary line says why.
+        if (run.denied >= maxDeniedCalls) {
+          if (!run.deniedSummarised) {
+            run.deniedSummarised = true;
+            audit?.({
+              method: "RUN",
+              path: "execute",
+              decision: "deny",
+              category: "malformed",
+              reason: "denial-budget-exceeded",
+            });
+          }
+          throw new ToolError(
+            `too many refused requests in this execution: after ${maxDeniedCalls} refused calls every further request is refused`,
+          );
+        }
+        if (++run.calls > limits.maxUpstreamCalls) {
+          throw new ToolError(
+            `upstream call budget exceeded: at most ${limits.maxUpstreamCalls} upstream requests per execution`,
+          );
+        }
+        let out: unknown;
+        try {
+          out = await fn(...args);
+        } catch (err) {
+          run.denied++;
+          throw err;
+        }
+        // The staging capabilities answer a refusal with `{ ok: false }`
+        // (and log a deny line) instead of rejecting.
+        if (
+          staging &&
+          out !== null &&
+          typeof out === "object" &&
+          (out as { ok?: unknown }).ok === false
+        ) {
+          run.denied++;
+        }
+        return out;
+      };
+      const wrapNamed = (fns: HostFns, names: readonly string[], staging: boolean): HostFns => {
         const out: HostFns = { ...fns };
         for (const name of names) {
           const fn = fns[name];
-          if (typeof fn === "function") out[name] = wrapUpstream(fn);
+          if (typeof fn === "function") out[name] = wrapUpstream(fn, staging);
         }
         return out;
       };
@@ -433,6 +574,11 @@ export function createGuardedExecutor(
       const deadline = new Promise<SandboxExecuteResult>((resolve) => {
         timer = setTimeout(() => {
           run.expired = true;
+          // Hand every queued call a slot so it re-checks and rejects instead
+          // of waiting forever on holders that may never settle.
+          const waiting = slots.waiters.splice(0);
+          slots.inFlight += waiting.length;
+          for (const wake of waiting) wake();
           runController.abort(
             new ToolError("staged transfer aborted: this execution passed its host-side deadline"),
           );
@@ -446,15 +592,14 @@ export function createGuardedExecutor(
       let forwarded: Promise<SandboxExecuteResult>;
       try {
         if (Array.isArray(providersOrFns)) {
-          const isExecute = providersOrFns.some((p) => p.name === OPENAPI_HOST);
           const providers = providersOrFns.map((p) =>
-            p.name === OPENAPI_HOST ? { ...p, fns: wrapNamed(p.fns, ["request"]) } : p,
+            p.name === OPENAPI_HOST ? { ...p, fns: wrapNamed(p.fns, ["request"], false) } : p,
           );
           forwarded = base.execute(patchCodemodeDocsAlias(code), [
             ...providers,
-            ...(isExecute && stagingProvider
+            ...(isExecuteRun && stagingProvider
               ? [
-                  ((p: HostProvider) => ({ ...p, fns: wrapNamed(p.fns, STAGING_UPSTREAM_FNS) }))(
+                  ((p: HostProvider) => ({ ...p, fns: wrapNamed(p.fns, STAGING_BUDGETED_FNS, true) }))(
                     typeof stagingProvider === "function" ? stagingProvider(runCtx) : stagingProvider,
                   ),
                 ]
@@ -498,6 +643,53 @@ const SERVER_VERSION = "0.1.0";
  *  for (F-16). Value: `{ principal: string | null }`. */
 export const SESSION_PRINCIPAL_KEY = "codemode:session-principal";
 
+/** Message prefix of the F-16 refusal thrown by `setName` below. */
+export const SESSION_PRINCIPAL_MISMATCH = "mcp-session-principal-mismatch";
+
+type FetchHandler = {
+  fetch: (request: Request, env: unknown, ctx: ExecutionContext) => Promise<Response> | Response;
+};
+
+/**
+ * Wraps the `/mcp` apiHandler so the F-16 refusal reaches the client as the
+ * MCP "Session not found" 404 (the agents SDK's own answer for an unknown
+ * session) instead of an uncaught exception, which the edge turns into a 5xx.
+ * On a 5xx the client keeps retrying a session id it will never be allowed to
+ * use (seen live after a re-sign-in returned a different `sub`); on the 404
+ * it re-initialises with a fresh session bound to its own principal. The
+ * refusal itself is unchanged; it is audited with the caller's principal and
+ * never the session id. Every other error is rethrown untouched.
+ */
+export function withSessionMismatchAs404(
+  inner: FetchHandler,
+  opts: { principalOf: (props: unknown) => string | null },
+): FetchHandler {
+  return {
+    async fetch(request, env, ctx) {
+      try {
+        return await inner.fetch(request, env, ctx);
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.includes(SESSION_PRINCIPAL_MISMATCH)) throw err;
+        const principal = opts.principalOf((ctx as unknown as { props?: unknown }).props);
+        createAuditSink({
+          deployment: (env as { DEPLOYMENT_NAME?: string }).DEPLOYMENT_NAME ?? "unknown",
+          waitUntil: ctx.waitUntil.bind(ctx),
+        })({
+          method: request.method,
+          path: new URL(request.url).pathname,
+          decision: "deny",
+          reason: "session-principal-mismatch",
+          ...(principal ? { principalId: principal } : {}),
+        });
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }),
+          { status: 404, headers: { "content-type": "application/json" } },
+        );
+      }
+    },
+  };
+}
+
 /** Returns a constructor suitable for use as a Durable Object class.
  *  The returned class extends `McpAgent` and is parameterised by `provider`. */
 export function createProviderMcpAgent<
@@ -521,8 +713,9 @@ export function createProviderMcpAgent<
      * re-applied, and after eviction they replace the stored ones — so without
      * this check a different valid user presenting someone else's session id
      * would run as the first user (F-16). Refuse before partyserver sees the
-     * props. The thrown error surfaces as a 5xx at the edge; agents 0.17.1
-     * offers no cleaner hook. `props === undefined` (internal bootstrap
+     * props. agents 0.17.1 offers no cleaner hook than throwing;
+     * withSessionMismatchAs404 (on the /mcp apiHandler) turns the throw into
+     * the MCP "Session not found" 404. `props === undefined` (internal bootstrap
      * paths) and sessions with no stored binding yet (first request, or a
      * session that predates the binding) pass through.
      */
@@ -533,7 +726,7 @@ export function createProviderMcpAgent<
         );
         if (stored !== undefined && principalOf(provider, props) !== stored.principal) {
           throw new Error(
-            "mcp-session-principal-mismatch: this MCP session belongs to a different user",
+            `${SESSION_PRINCIPAL_MISMATCH}: this MCP session belongs to a different user`,
           );
         }
       }
@@ -558,6 +751,31 @@ export function createProviderMcpAgent<
         this.sessionPrincipal = stored.principal;
       }
       const limits = readExecutionLimits(this.env as unknown as Record<string, unknown>);
+      // E-1 (2026-11 review): staged files belong to the session principal.
+      // A session without one gets no staging at all (no __stagingHost, no
+      // register_file_handle) — fail closed; buildUpstreamArgs already
+      // refuses to mint a token for it. Truthy, as buildUpstreamArgs reads
+      // it: an empty-string principal is no principal (it would otherwise be
+      // one owner shared by every such session).
+      const sessionPrincipal = this.sessionPrincipal ? this.sessionPrincipal : null;
+      // Computed once: relies on F-16 — a running DO never re-applies props
+      // (setName refuses a different principal), so this matches the
+      // handler's per-request contextAccessor(this.props).
+      const auditContext =
+        this.props !== undefined ? provider.audit?.contextAccessor?.(this.props as P) : undefined;
+      // One sink for the lines this session writes outside the request
+      // handler: the staging capabilities and register tool (E-1) and the
+      // executor's denial-budget summary (B-2). The handler keeps its own
+      // emitAudit, which computes the same principal/context per request.
+      const sessionAudit = createAuditSink({
+        deployment: this.env.DEPLOYMENT_NAME,
+        ...(sessionPrincipal !== null ? { principalId: sessionPrincipal } : {}),
+        ...(auditContext !== undefined ? { context: auditContext } : {}),
+        waitUntil: this.ctx.waitUntil.bind(this.ctx),
+      });
+      const stagingBound = Boolean(
+        this.env.STAGING_D1 && this.env.STAGING_R2 && this.env.STAGING_UPLOAD_ORIGIN,
+      );
       const baseExecutor = new DynamicWorkerExecutor({
         loader: this.env.LOADER,
         timeout: 70_000,
@@ -592,8 +810,11 @@ export function createProviderMcpAgent<
       // local that shadows any executor-level provider of the same name — so
       // extending `codemode.*` itself requires the string patch applied by
       // patchCodemodeDocsAlias at CODEMODE_SANDBOX_ANCHOR (see both above).
-      // Capabilities that live under their own names (__stagingHost,
-      // __docsHost) need no patch at all; LLM code invokes them directly and
+      // codemode also emits each provider's own `prelude` (after its
+      // console.log/warn/error overrides, before the LLM code): __docsHost
+      // uses it to capture every other console method (C-2,
+      // sandbox-console.ts). Capabilities that live under their own names
+      // (__stagingHost, __docsHost) need no patch at all; LLM code invokes them directly and
       // base64-decodes `bytesBase64` itself.
       // Gate requires STAGING_UPLOAD_ORIGIN as well: putFile populates its
       // `fetch_url` return field from it. In every deployment that has D1+R2
@@ -629,15 +850,18 @@ export function createProviderMcpAgent<
       // execute run, so getFile/putFile/stageFromUpstreamJson hold the
       // transfer gate under that run's key and deadline signal (D8).
       const stagingProvider: ((run: RunContext) => HostProvider) | null =
-        this.env.STAGING_D1 && this.env.STAGING_R2 && this.env.STAGING_UPLOAD_ORIGIN
-          ? await (async () => {
+        stagingBound && sessionPrincipal !== null
+          ? await (async (owner: string) => {
               const { readStagingConfig } = await import("./config.js");
               const config = readStagingConfig(this.env as unknown as Record<string, unknown>);
+              // No audit sink on the store itself: the request handler's
+              // returnAs:"stage" path writes the store into its own line.
               const store: PutFileCapabilityDeps = {
                 STAGING_D1: this.env.STAGING_D1 as D1Database,
                 STAGING_R2: this.env.STAGING_R2 as R2Bucket,
                 config,
                 uploadOrigin: this.env.STAGING_UPLOAD_ORIGIN as string,
+                owner,
               };
               const transferGate = transferGateFor(config);
               stagedWiring = {
@@ -646,6 +870,7 @@ export function createProviderMcpAgent<
                   STAGING_D1: store.STAGING_D1,
                   STAGING_R2: store.STAGING_R2,
                   config,
+                  owner,
                 }),
                 transferGate,
                 limits: {
@@ -656,7 +881,11 @@ export function createProviderMcpAgent<
               // stageFromUpstreamJson holds the gate across its upstream
               // request, parse and store, so it gets an UNGATED putFile: a
               // second acquisition for the same run would wait on the first.
-              const ungatedPutFile = createPutFileCapability(store);
+              const ungatedPutFile = createPutFileCapability({
+                ...store,
+                audit: sessionAudit,
+                auditPath: "__stagingHost.stageFromUpstreamJson",
+              });
               return (run: RunContext) => {
                 const gateDeps = { transferGate, currentRun: () => run };
                 return buildStagingHostFns({
@@ -664,9 +893,16 @@ export function createProviderMcpAgent<
                     STAGING_D1: store.STAGING_D1,
                     STAGING_R2: store.STAGING_R2,
                     config,
+                    owner,
+                    audit: sessionAudit,
                     ...gateDeps,
                   }),
-                  putFile: createPutFileCapability({ ...store, ...gateDeps }),
+                  putFile: createPutFileCapability({
+                    ...store,
+                    audit: sessionAudit,
+                    auditPath: "__stagingHost.putFile",
+                    ...gateDeps,
+                  }),
                   stageFromUpstreamJson: createStageFromUpstreamJsonCapability({
                     putFile: ungatedPutFile,
                     ...gateDeps,
@@ -688,7 +924,7 @@ export function createProviderMcpAgent<
                   }),
                 });
               };
-            })()
+            })(sessionPrincipal)
           : null;
 
       const stagingEnabled = stagingProvider !== null;
@@ -723,6 +959,7 @@ export function createProviderMcpAgent<
         stagingProvider,
         docsProvider,
         limits,
+        audit: sessionAudit,
       });
       // Single source of truth for the per-request HandleArgs object. Both
       // call sites (codemode `request` closure for execute(), and the
@@ -776,6 +1013,10 @@ export function createProviderMcpAgent<
             : {}),
           ...(provider.readRateLimit ? { readRateLimit: provider.readRateLimit } : {}),
           ...(provider.elicitRenderers ? { elicitRenderers: provider.elicitRenderers } : {}),
+          ...(provider.standardQueryParams ? { standardQueryParams: provider.standardQueryParams } : {}),
+          ...(provider.untrustedFieldExtension
+            ? { untrustedFieldExtension: provider.untrustedFieldExtension }
+            : {}),
           ...(stagedWiring
             ? {
                 stagingStore: stagedWiring.store,
@@ -909,14 +1150,17 @@ export function createProviderMcpAgent<
         }),
       );
 
-      // Staging attachments — register the tool only when bindings are present.
-      if (this.env.STAGING_D1 && this.env.STAGING_R2 && this.env.STAGING_UPLOAD_ORIGIN) {
+      // Staging attachments — register the tool only when bindings are present
+      // and the session has a principal to own the reserved row (E-1).
+      if (stagingBound && sessionPrincipal !== null) {
         const { registerFileHandleTool } = await import("./staging/index.js");
         const { readStagingConfig } = await import("./config.js");
         const tool = registerFileHandleTool({
-          STAGING_D1: this.env.STAGING_D1,
+          STAGING_D1: this.env.STAGING_D1 as D1Database,
           config: readStagingConfig(this.env as unknown as Record<string, unknown>),
-          uploadOrigin: this.env.STAGING_UPLOAD_ORIGIN,
+          uploadOrigin: this.env.STAGING_UPLOAD_ORIGIN as string,
+          owner: sessionPrincipal,
+          audit: sessionAudit,
           // Compact body (spec D3): the provider-specific Step-3 snippet moves
           // to the docs tool's "attachments" section; attachmentHint still
           // feeds the docs builder above.

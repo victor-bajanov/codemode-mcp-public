@@ -8,6 +8,7 @@ import {
   markCorrupt,
   listExpired,
   deleteByHash,
+  countPublicFetch,
 } from "../repo";
 
 const TOKEN_HASH = new Uint8Array(32).fill(7);
@@ -18,6 +19,7 @@ describe("insertPending", () => {
   it("creates a row with state='pending'", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH,
       file_handle: HANDLE,
       content_type_hint: "image/png",
@@ -36,6 +38,7 @@ describe("insertPending", () => {
   it("rejects duplicate token_hash", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH,
       file_handle: HANDLE,
       content_type_hint: null,
@@ -45,6 +48,7 @@ describe("insertPending", () => {
       expires_at: 400,
     });
     await expect(insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH,
       file_handle: HANDLE,
       content_type_hint: null,
@@ -60,6 +64,7 @@ describe("atomicClaim", () => {
   it("succeeds once and only once when row is pending and not expired", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 400,
     });
@@ -80,6 +85,7 @@ describe("atomicClaim", () => {
   it("returns null when expired", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 200,
     });
@@ -104,6 +110,7 @@ describe("markCorrupt", () => {
   it("flips state to corrupt", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 400,
     });
@@ -158,10 +165,12 @@ describe("listExpired + deleteByHash", () => {
   it("lists rows with expires_at < cutoff and removes by hash", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 200,
     });
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH_2, file_handle: "fh_zz", content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 9999,
     });
@@ -179,6 +188,7 @@ describe("insertClaimed", () => {
     const d1 = new FakeD1();
     const iv = new Uint8Array(12).fill(9);
     await insertClaimed(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH,
       file_handle: HANDLE,
       r2_key: "stg/abcd",
@@ -211,12 +221,14 @@ describe("insertClaimed", () => {
     const d1 = new FakeD1();
     const iv = new Uint8Array(12);
     await insertClaimed(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv,
       content_type: "application/octet-stream", byte_len: 0, filename: null,
       created_at: 1, claimed_at: 1, expires_at: 3601, enc_version: 1,
     });
     await expect(
       insertClaimed(d1 as unknown as D1Database, {
+        owner: "user-A",
         token_hash: TOKEN_HASH, file_handle: "fh_zz", r2_key: "stg/b", iv,
         content_type: "application/octet-stream", byte_len: 0, filename: null,
         created_at: 2, claimed_at: 2, expires_at: 3602, enc_version: 1,
@@ -229,6 +241,7 @@ describe("enc_version (v2 at-rest format)", () => {
   it("insertClaimed writes enc_version and lookupByHash returns it", async () => {
     const d1 = new FakeD1();
     await insertClaimed(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv: new Uint8Array(8),
       content_type: "application/pdf", byte_len: 10, filename: null,
       created_at: 1, claimed_at: 1, expires_at: 3601, enc_version: 2,
@@ -240,6 +253,7 @@ describe("enc_version (v2 at-rest format)", () => {
   it("atomicClaim sets enc_version", async () => {
     const d1 = new FakeD1();
     await insertPending(d1 as unknown as D1Database, {
+      owner: "user-A",
       token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
       expected_byte_len: null, filename: null, created_at: 100, expires_at: 400,
     });
@@ -282,5 +296,105 @@ describe("enc_version (v2 at-rest format)", () => {
     expect(row!.created_at).toBe(5);
     expect(row!.expires_at).toBe(50);
     expect(row!.enc_version).toBe(1);
+  });
+});
+
+// E-1 (2026-11 review): every staged row carries the principal that created it, and the public
+// /staging/fetch download is counted (`countPublicFetch`, before any R2 read) against
+// STAGING_FETCH_MAX_USES (default 5).
+describe("owner and fetch_count (E-1)", () => {
+  it("FIXED (E-1): insertPending writes owner; fetch_count reads back 0", async () => {
+    const d1 = new FakeD1();
+    await insertPending(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
+      expected_byte_len: null, filename: null, created_at: 100, expires_at: 400, owner: "user-A",
+    });
+    const row = await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH);
+    expect(row!.owner).toBe("user-A");
+    expect(row!.fetch_count).toBe(0);
+  });
+
+  it("FIXED (E-1): insertClaimed writes owner", async () => {
+    const d1 = new FakeD1();
+    await insertClaimed(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv: new Uint8Array(8),
+      content_type: "x", byte_len: 1, filename: null,
+      created_at: 1, claimed_at: 1, expires_at: 3601, enc_version: 2, owner: "user-B",
+    });
+    const row = await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH);
+    expect(row!.owner).toBe("user-B");
+    expect(row!.fetch_count).toBe(0);
+  });
+
+  it("a row without the columns (pre-0003 shape) reads back owner null, fetch_count 0", async () => {
+    const fake: unknown = {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => ({
+            token_hash: new Uint8Array(32), file_handle: HANDLE, state: "claimed",
+            r2_key: "k", iv: new Uint8Array(12), content_type_hint: null,
+            content_type: "x", expected_byte_len: null, byte_len: 1, filename: null,
+            created_at: 1, claimed_at: 1, expires_at: 2, enc_version: 2,
+          }),
+        }),
+      }),
+    };
+    const row = await lookupByHash(fake as D1Database, TOKEN_HASH);
+    expect(row!.owner).toBeNull();
+    expect(row!.fetch_count).toBe(0);
+  });
+
+  async function claimedRow(d1: FakeD1, expires_at = 3601): Promise<void> {
+    await insertClaimed(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, r2_key: "stg/a", iv: new Uint8Array(8),
+      content_type: "x", byte_len: 1, filename: null,
+      created_at: 1, claimed_at: 1, expires_at, enc_version: 2, owner: "user-A",
+    });
+  }
+
+  it("FIXED (E-1): countPublicFetch is true up to maxUses times, then false; fetch_count records each", async () => {
+    const d1 = new FakeD1();
+    await claimedRow(d1);
+    for (let i = 1; i <= 5; i++) {
+      expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 5, 50 + i)).toBe(true);
+      expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.fetch_count).toBe(i);
+    }
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 5, 60)).toBe(false);
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.fetch_count).toBe(5);
+  });
+
+  it("countPublicFetch with maxUses 1 is true once, then false", async () => {
+    const d1 = new FakeD1();
+    await claimedRow(d1);
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 1, 50)).toBe(true);
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 1, 51)).toBe(false);
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.fetch_count).toBe(1);
+  });
+
+  it("concurrent countPublicFetch calls at limit N: exactly N win", async () => {
+    const d1 = new FakeD1();
+    await claimedRow(d1);
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 3, 50)),
+    );
+    expect(results.filter(Boolean)).toHaveLength(3);
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.fetch_count).toBe(3);
+  });
+
+  it("countPublicFetch is false on a pending row", async () => {
+    const d1 = new FakeD1();
+    await insertPending(d1 as unknown as D1Database, {
+      token_hash: TOKEN_HASH, file_handle: HANDLE, content_type_hint: null,
+      expected_byte_len: null, filename: null, created_at: 100, expires_at: 400, owner: "user-A",
+    });
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 5, 150)).toBe(false);
+    expect((await lookupByHash(d1 as unknown as D1Database, TOKEN_HASH))!.fetch_count).toBe(0);
+  });
+
+  it("countPublicFetch is false after expiry and on a missing row", async () => {
+    const d1 = new FakeD1();
+    await claimedRow(d1, 100);
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH, 5, 100)).toBe(false);
+    expect(await countPublicFetch(d1 as unknown as D1Database, TOKEN_HASH_2, 5, 10)).toBe(false);
   });
 });

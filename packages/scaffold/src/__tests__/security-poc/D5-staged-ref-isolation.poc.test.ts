@@ -73,7 +73,7 @@ function world() {
     return origPrepare(sql);
   };
   const D1 = d1 as unknown as D1Database;
-  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", now: () => NOW };
+  const deps = { STAGING_D1: D1, STAGING_R2: r2 as unknown as R2Bucket, config: CFG, uploadOrigin: "https://x.test", owner: "user-A", now: () => NOW };
   const opener = createStagedFileOpener(deps);
   const inspected: InspectRequest[] = [];
   const inspect = (req: InspectRequest) => {
@@ -130,6 +130,7 @@ function world() {
   const pending = async (): Promise<StagedRef> => {
     const ref = { file_handle: mintFileHandle(), token: mintToken() };
     await insertPending(D1, {
+      owner: "user-A",
       token_hash: await sha256Bearer(ref.token),
       file_handle: ref.file_handle,
       content_type_hint: null,
@@ -267,7 +268,7 @@ describe("D5 — I3 stageFromUpstreamJson drops composed and multipart", () => {
   it("REFUTED: `composed` and `multipart` in requestOpts never reach the upstream handler", async () => {
     const seen: Record<string, unknown>[] = [];
     const cap = createStageFromUpstreamJsonCapability({
-      putFile: async () => ({ ok: true, file_handle: "fh_x", token: "stg_x", fetch_url: "u", expires_at: 0, byte_length: 1 }),
+      putFile: async () => ({ ok: true, file_handle: "fh_x", token: "stg_x", fetch_url: "u", expires_at: 0, byte_length: 1, file_ref: "000000000000" }),
       upstreamRequest: async (ctx) => {
         seen.push(ctx as unknown as Record<string, unknown>);
         return { success: true, status: 200, result: { data: "aGk" } };

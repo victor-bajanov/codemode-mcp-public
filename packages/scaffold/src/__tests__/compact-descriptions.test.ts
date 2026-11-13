@@ -298,6 +298,7 @@ describe("registerFileHandleTool descriptionMode", () => {
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
+      owner: "u1",
     });
     expect(tool.description).toContain("USE THIS TO UPLOAD");
     expect(tool.description).not.toBe(buildCompactRegisterFileHandleDescription());
@@ -309,6 +310,7 @@ describe("registerFileHandleTool descriptionMode", () => {
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
+      owner: "u1",
       descriptionMode: "compact",
     });
     expect(tool.description).toBe(buildCompactRegisterFileHandleDescription());
@@ -320,6 +322,7 @@ describe("registerFileHandleTool descriptionMode", () => {
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
+      owner: "u1",
       attachmentHint: "PROVIDER SPECIFIC SNIPPET SHOULD NOT APPEAR",
       descriptionMode: "compact",
     });

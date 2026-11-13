@@ -20,9 +20,9 @@
     { "tag": "v1", "new_sqlite_classes": ["OpticalMCP"] },
     { "tag": "v2", "new_sqlite_classes": ["OpticalTokenBroker"] }
   ],
-  // Cron drives the OAuth inactive-client sweep (setupProvider's `scheduled`
-  // hook). Optical has no staging bindings, but the sweep runs whenever
-  // OAUTH_KV is bound.
+  // The `*/5` cron drives setupProvider's `scheduled` hook (the staging
+  // sweep). Optical has no staging bindings, so it is a no-op here. OAuth
+  // client records expire by KV TTL (SECURITY.md §7.13).
   "triggers": { "crons": ["*/5 * * * *"] },
   "vars": {
     "DEPLOYMENT_NAME": "optical",

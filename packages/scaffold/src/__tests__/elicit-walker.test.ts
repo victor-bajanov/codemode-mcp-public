@@ -44,8 +44,8 @@ describe("genericWalker", () => {
       operationId: "createItem",
       body: BODY_SIMPLE,
     });
-    expect(out.fields).toEqual({ name: "alpha", count: 7, active: true });
-    expect(out.message).toContain("createItem");
+    expect(out.facts).toEqual({ name: "alpha", count: 7, active: true });
+    expect(out.headline).toBe("Confirm operation: createItem");
   });
 
   it("skips fields whose values exceed 256 chars", () => {
@@ -54,8 +54,8 @@ describe("genericWalker", () => {
       operationId: "createItem",
       body: BODY_WITH_BLOB,
     });
-    expect(out.fields).toEqual({ name: "alpha" });
-    expect(out.fields.blob).toBeUndefined();
+    expect(out.facts).toEqual({ name: "alpha" });
+    expect(out.facts.blob).toBeUndefined();
   });
 
   it("skips fields whose values look base64 (>=200 chars of [A-Za-z0-9+/=_-])", () => {
@@ -64,7 +64,7 @@ describe("genericWalker", () => {
       operationId: "createItem",
       body: BODY_WITH_BASE64,
     });
-    expect(out.fields).toEqual({ name: "alpha" });
+    expect(out.facts).toEqual({ name: "alpha" });
   });
 
   it("skips object/array fields entirely", () => {
@@ -73,7 +73,7 @@ describe("genericWalker", () => {
       operationId: "createItem",
       body: { name: "alpha", nested: { foo: 1 } },
     });
-    expect(out.fields).toEqual({ name: "alpha" });
+    expect(out.facts).toEqual({ name: "alpha" });
   });
 
   it("merges inspectorSummary entries first (precedence over body fields)", () => {
@@ -83,9 +83,9 @@ describe("genericWalker", () => {
       body: { name: "alpha" },
       inspectorSummary: { recipients: "x@y.com", count: 3 },
     });
-    expect(out.fields.recipients).toBe("x@y.com");
-    expect(out.fields.count).toBe(3);
-    expect(out.fields.name).toBe("alpha");
+    expect(out.facts.recipients).toBe("x@y.com");
+    expect(out.facts.count).toBe(3);
+    expect(out.facts.name).toBe("alpha");
   });
 
   it("caps the field count at 5", () => {
@@ -97,25 +97,26 @@ describe("genericWalker", () => {
       body,
       inspectorSummary: { extra: "z" },
     });
-    expect(Object.keys(out.fields).length).toBeLessThanOrEqual(5);
-    expect(out.fields.extra).toBe("z"); // inspectorSummary wins
+    expect(Object.keys(out.facts).length).toBeLessThanOrEqual(5);
+    expect(out.facts.extra).toBe("z"); // inspectorSummary wins
   });
 
-  it("falls back to { confirm: true } when nothing usable found", () => {
+  it("returns no facts (never a confirm fact) when nothing usable is found", () => {
     const out = genericWalker({
       spec: SPEC,
       operationId: "createItem",
       body: { nested: { x: 1 } },
     });
-    expect(out.fields).toEqual({ confirm: true });
+    expect(out.facts).toEqual({});
+    expect(out.headline).toBe("Confirm operation: createItem");
   });
 
-  it("falls back to { confirm: true } when operationId is unknown", () => {
+  it("returns no facts when operationId is unknown", () => {
     const out = genericWalker({
       spec: SPEC,
       operationId: "unknownOp",
       body: { name: "x" },
     });
-    expect(out.fields).toEqual({ confirm: true });
+    expect(out.facts).toEqual({});
   });
 });

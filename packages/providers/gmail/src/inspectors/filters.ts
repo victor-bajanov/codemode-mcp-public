@@ -90,9 +90,12 @@ export function inspectFilterCreate(req: InspectRequest): InspectResult {
       decision: "elicit",
       category: "irreversible",
       reason: "filter-trash-or-spam",
+      // Not cut here: a silent cut let padding hide TRASH or the sender. The
+      // scaffold truncates each dialog value visibly (with "…"), and the
+      // renderer shows the effect and the criteria fields ahead of these.
       summary: {
-        criteria: JSON.stringify(body?.["criteria"] ?? {}).slice(0, 200),
-        action: JSON.stringify(body?.["action"] ?? {}).slice(0, 200),
+        criteria: JSON.stringify(body?.["criteria"] ?? {}),
+        action: JSON.stringify(body?.["action"] ?? {}),
       },
     };
   }
@@ -116,8 +119,8 @@ export function inspectFilterCreate(req: InspectRequest): InspectResult {
       category: "persistent_state",
       reason: "filter-skip-inbox",
       summary: {
-        criteria: JSON.stringify(body?.["criteria"] ?? {}).slice(0, 200),
-        action: JSON.stringify(body?.["action"] ?? {}).slice(0, 200),
+        criteria: JSON.stringify(body?.["criteria"] ?? {}),
+        action: JSON.stringify(body?.["action"] ?? {}),
       },
     };
   }

@@ -99,6 +99,7 @@ function world() {
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
     uploadOrigin: "https://x.test",
+    owner: "user-A",
     now: () => NOW,
   };
   let putAborted: unknown = null;

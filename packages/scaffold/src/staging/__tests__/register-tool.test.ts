@@ -3,7 +3,8 @@ import { z } from "zod";
 import { FakeD1 } from "./__fixtures__/fake-d1";
 import { registerFileHandleTool, REGISTER_TOOL_INPUT_SHAPE } from "../register-tool";
 import { lookupByHash } from "../repo";
-import { sha256Bearer } from "../crypto";
+import { fileRefOf, sha256Bearer } from "../crypto";
+import type { AuditSink } from "../../audit";
 import type { StagingConfig } from "../types";
 
 const CFG: StagingConfig = { uploadTtlSeconds: 300, fetchTtlSeconds: 3600, maxBytes: 50 * 1024 * 1024 };
@@ -12,6 +13,7 @@ describe("registerFileHandleTool", () => {
   it("returns token, file_handle, upload_url, and TTLs", async () => {
     const d1 = new FakeD1();
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://xero.example.com",
@@ -29,6 +31,7 @@ describe("registerFileHandleTool", () => {
   it("inserts a pending row keyed by SHA-256(token)", async () => {
     const d1 = new FakeD1();
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://xero.example.com",
@@ -48,6 +51,7 @@ describe("registerFileHandleTool", () => {
   it("each call mints a distinct token", async () => {
     const d1 = new FakeD1();
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: d1 as unknown as D1Database, config: CFG,
       uploadOrigin: "https://x.test", now: () => 1000,
     });
@@ -61,6 +65,7 @@ describe("registerFileHandleTool", () => {
 describe("registerFileHandleTool description — scope (issue #41)", () => {
   it("no longer claims to be the tool for ANY file/attachment workflow", () => {
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -73,6 +78,7 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
 
   it("scopes itself to the upload/send direction", () => {
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -82,6 +88,7 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
 
   it("routes the download/export direction to the execute tool's staging modes instead of itself", () => {
     const tool = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -93,6 +100,7 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
 
   it("keeps Steps 1-2 and the stepThree splice mechanism intact", () => {
     const withHint = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -104,6 +112,7 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
     expect(withHint.description).toContain("CUSTOM-STEP-THREE-MARKER");
 
     const withoutHint = registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -116,6 +125,7 @@ describe("registerFileHandleTool description — scope (issue #41)", () => {
 describe("registerFileHandleTool full description — staged transfer v2", () => {
   const tool = () =>
     registerFileHandleTool({
+      owner: "user-A",
       STAGING_D1: new FakeD1() as unknown as D1Database,
       config: CFG,
       uploadOrigin: "https://x.test",
@@ -167,5 +177,38 @@ describe("REGISTER_TOOL_INPUT_SHAPE — filename cap (adjudicated)", () => {
 
   it("documents the cap in the field description", () => {
     expect(REGISTER_TOOL_INPUT_SHAPE.filename.description).toMatch(/255/);
+  });
+});
+
+// E-1 (2026-11 review): the reserved row belongs to the session principal (pre-fix the row had
+// no owner, so the uploaded file was readable by any session holding the pair), and the
+// reservation is audited.
+describe("registerFileHandleTool — owner and audit (E-1)", () => {
+  it("FIXED (E-1): the pending row carries the session principal as owner", async () => {
+    const d1 = new FakeD1();
+    const tool = registerFileHandleTool({
+      owner: "user-A", STAGING_D1: d1 as unknown as D1Database, config: CFG, uploadOrigin: "https://w", now: () => 1000,
+    });
+    const out = await tool.handler({});
+    const row = await lookupByHash(d1 as unknown as D1Database, await sha256Bearer(out.token));
+    expect(row!.owner).toBe("user-A");
+    expect(row!.fetch_count).toBe(0);
+  });
+
+  it("FIXED (E-1): logs one staging.register line with fileRef and the expected length; never the handle or token", async () => {
+    const lines: Parameters<AuditSink>[0][] = [];
+    const tool = registerFileHandleTool({
+      owner: "user-A", STAGING_D1: new FakeD1() as unknown as D1Database, config: CFG, uploadOrigin: "https://w",
+      audit: (e) => { lines.push(e); },
+    });
+    const out = await tool.handler({ expected_byte_len: 42 });
+    expect(lines).toEqual([{
+      method: "TOOL", path: "register_file_handle", operationId: "staging.register", decision: "allow",
+      staging: { event: "register", fileRef: await fileRefOf(out.file_handle), byteLength: 42, status: 200 },
+    }]);
+    expect(JSON.stringify(lines)).not.toContain(out.file_handle);
+    expect(JSON.stringify(lines)).not.toContain(out.token);
+    await tool.handler({});
+    expect(lines[1]!.staging).toEqual({ event: "register", fileRef: expect.stringMatching(/^[0-9a-f]{12}$/), status: 200 });
   });
 });

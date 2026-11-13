@@ -45,17 +45,25 @@ function lines76(b64: string): string {
   return out;
 }
 
-const op = (operationId: string) => ({ operationId, responses: { "200": { description: "OK" } } });
+// `queryNames`: query parameters the operation declares (D-2: undeclared
+// names are refused by the handler).
+const op = (operationId: string, queryNames: readonly string[] = []) => ({
+  operationId,
+  ...(queryNames.length > 0
+    ? { parameters: queryNames.map((name) => ({ name, in: "query", schema: { type: "string" } })) }
+    : {}),
+  responses: { "200": { description: "OK" } },
+});
 const SPEC: OpenApiSpec = {
   openapi: "3.0.0",
   info: { title: "T", version: "1" },
   servers: [{ url: "https://api.example.com" }],
   paths: {
-    "/upload/send": { post: op("sendMedia") },
-    "/send": { post: op("sendJson") },
+    "/upload/send": { post: op("sendMedia", ["uploadType"]) },
+    "/send": { post: op("sendJson", ["uploadType"]) },
     "/attach/{name}": { put: op("attach") },
     "/drafts": { post: op("draftMedia") },
-    "/approve": { post: op("approveMedia") },
+    "/approve": { post: op("approveMedia", ["uploadType"]) },
     "/approve-plain": { post: op("approvePlain") },
     "/files": { post: op("files") },
     "/inspected-files": { post: op("inspectedFiles") },
@@ -106,6 +114,7 @@ function world(): World {
     STAGING_R2: r2 as unknown as R2Bucket,
     config: CFG,
     uploadOrigin: "https://x.test",
+    owner: "u1",
     now: () => NOW,
   };
   const opener = createStagedFileOpener({ ...stagingDeps });
@@ -324,7 +333,19 @@ describe("composed — phase order (D7, D10a)", () => {
     const ref = await w.stage(pattern(10));
     await expect(handleUpstreamRequest(w.args(gmailCtx(ref, "/send")))).rejects.toThrow(/staged/);
     expect(w.log).toEqual([]);
-    expect(w.audit().at(-1)).toMatchObject({ decision: "deny", reason: "staged-not-supported", operationId: "sendJson" });
+    expect(w.audit().at(-1)).toMatchObject({
+      decision: "deny",
+      reason: "staged-not-supported",
+      operationId: "sendJson",
+      queryKeys: ["uploadType"],
+    });
+  });
+
+  it("D-2: the composed send's final audit line carries queryKeys alongside the staged counters", async () => {
+    const w = world();
+    const ref = await w.stage(pattern(10));
+    await handleUpstreamRequest(w.args(gmailCtx(ref)));
+    expect(w.audit().at(-1)).toMatchObject({ decision: "allow", stagedCount: 1, queryKeys: ["uploadType"] });
   });
 
   it("an elicit op without acceptsStaged → staged-not-supported (multipart staged too)", async () => {
@@ -365,6 +386,41 @@ describe("composed — phase order (D7, D10a)", () => {
     expect(params.message).toMatch(/composed, 3 segments, 1 staged file, \d+ bytes/);
     expect(params.message).toContain("qfdp.exe (1000 bytes)");
     expect(params.message).not.toContain(ref.token);
+  });
+
+  it("FIXED (D-1): a staged filename carrying line/paragraph separators cannot forge dialog lines", async () => {
+    const w = world();
+    const evilName = `q${String.fromCodePoint(0x2028)}Approved by finance${String.fromCodePoint(0x85)}.pdf`;
+    const ref = await w.stage(pattern(10), "application/pdf", evilName);
+    await handleUpstreamRequest(w.args(gmailCtx(ref, "/approve")));
+    const { message } = w.elicitInput.mock.calls[0]![0] as { message: string };
+    expect(message).not.toMatch(/[\u0085\u2028\u2029]/);
+    const attachmentLines = message.split("\n").filter((l) => l.startsWith("Attachments: "));
+    expect(attachmentLines).toHaveLength(1);
+    expect(message.split("\n").some((l) => l.startsWith("Approved"))).toBe(false);
+  });
+
+  it("FIXED (D-1): a composed body with no staged segment on an approval-only op is denied before the dialog", async () => {
+    const w = world();
+    await expect(
+      handleUpstreamRequest(
+        w.args({
+          method: "POST",
+          path: "/approve",
+          query: { uploadType: "media" },
+          contentType: "message/rfc822",
+          composed: { segments: [{ text: HEAD }, { text: "aGVsbG8=\r\n" }, { text: TAIL }] },
+        }),
+      ),
+    ).rejects.toThrow(/requires approval but its body cannot be shown/);
+    expect(w.elicitInput).not.toHaveBeenCalled();
+    expect(w.sent).toHaveLength(0);
+    expect(w.audit().at(-1)).toMatchObject({
+      decision: "deny",
+      category: "malformed",
+      reason: "opaque-body-on-approval-op",
+      operationId: "approveMedia",
+    });
   });
 
   it("unresolvable refs → ToolError naming the segment, no inspector, no R2, no token in the message", async () => {
@@ -617,6 +673,7 @@ describe("composed — writer/fetch coupling (D3a)", () => {
         STAGING_D1: w.d1 as unknown as D1Database,
         STAGING_R2: w.r2 as unknown as R2Bucket,
         config: CFG,
+        owner: "u1",
         now: () => NOW,
       })(r);
       if (!opened.ok) return opened;
@@ -740,6 +797,7 @@ describe("returnAs: \"stage\" over block sources", () => {
       STAGING_D1: w.d1 as unknown as D1Database,
       STAGING_R2: w.r2 as unknown as R2Bucket,
       config: CFG,
+      owner: "u1",
       now: () => NOW,
     })({ file_handle: res.result.file_handle as string, token: res.result.token as string });
     expect(opened.ok).toBe(true);
@@ -937,7 +995,7 @@ describe("writer failure reason surfaces", () => {
     a.openStaged = async (): Promise<OpenStagedResult> => ({
       ok: true,
       file: {
-        meta: { byteLength: 3 * BLOCK_BYTES, contentType: "application/pdf", filename: null },
+        meta: { byteLength: 3 * BLOCK_BYTES, contentType: "application/pdf", filename: null, fileRef: "000000000000" },
         readBlocks: async (onBlock) => {
           await onBlock(new Uint8Array(BLOCK_BYTES), 0);
           throw new StagedFileReadError(410, "stored file is corrupt");
@@ -1113,7 +1171,7 @@ describe("upstream closes the connection mid-body", () => {
     a.openStaged = async (): Promise<OpenStagedResult> => ({
       ok: true,
       file: {
-        meta: { byteLength: SIZE, contentType: "application/pdf", filename: null },
+        meta: { byteLength: SIZE, contentType: "application/pdf", filename: null, fileRef: "000000000000" },
         readBlocks: async (onBlock) => {
           try {
             await onBlock(new Uint8Array(BLOCK_BYTES), 0);
@@ -1222,7 +1280,7 @@ describe("upstream closes the connection mid-body", () => {
     });
     let outcome: string | undefined;
     const file: OpenStagedFile = {
-      meta: { byteLength: SIZE, contentType: "application/pdf", filename: null },
+      meta: { byteLength: SIZE, contentType: "application/pdf", filename: null, fileRef: "000000000000" },
       readBlocks: async (onBlock) => {
         try {
           for (let i = 0; i < 3; i++) await onBlock(new Uint8Array(BLOCK_BYTES), i);

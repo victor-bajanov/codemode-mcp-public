@@ -11,7 +11,7 @@
 //
 // Error messages never contain a token, a handle or file content.
 
-import { GCM_TAG_BYTES, type StagingConfig, type StagingRow } from "./types";
+import { DEFAULT_FETCH_MAX_USES, GCM_TAG_BYTES, type StagingConfig, type StagingRow } from "./types";
 import type { PutFileCapabilityDeps, PutFileResult } from "./putfile-capability";
 import {
   BLOCK_BYTES,
@@ -23,8 +23,8 @@ import {
   encryptBlock,
 } from "./block-format";
 import { decodeBase64Into, decodedLength, type Base64Alphabet } from "./codec";
-import { deriveV2Key, sha256Bearer } from "./crypto";
-import { insertClaimed, lookupByHash, markCorrupt } from "./repo";
+import { deriveV2Key, fileRefOf, sha256Bearer } from "./crypto";
+import { countPublicFetch, insertClaimed, lookupByHash, markCorrupt } from "./repo";
 import { createFixedLengthSink } from "./sinks";
 import { tryAcquireUnknownLengthSlot } from "./unknown-length-slot";
 import {
@@ -37,7 +37,13 @@ import {
 } from "./tokens";
 
 export interface StagedRef { file_handle: string; token: string }
-export interface StagedFileMeta { byteLength: number; contentType: string; filename: string | null }
+export interface StagedFileMeta {
+  byteLength: number;
+  contentType: string;
+  filename: string | null;
+  /** Audit correlation id (`fileRefOf(file_handle)`); never the handle or token (E-1). */
+  fileRef: string;
+}
 export interface OpenStagedFile {
   meta: StagedFileMeta;
   readBlocks(onBlock: (plain: Uint8Array, index: number) => Promise<void>): Promise<void>;
@@ -50,6 +56,8 @@ export interface StagedFileOpenerDeps {
   STAGING_D1: D1Database;
   STAGING_R2: R2Bucket;
   config: StagingConfig;
+  /** E-1: the caller's principal; a row owned by anyone else (or by no one) is refused. */
+  owner: string;
   now?: () => number;
 }
 
@@ -406,6 +414,8 @@ export async function stageFromBlocks(
   filename: string | null,
 ): Promise<PutFileResult> {
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
+  // E-1: every stored row has a real owner; refuse before any work.
+  if (!deps.owner) return { ok: false, status: 403, message: "staging requires an authenticated principal" };
   if (src.byteLength !== null && src.byteLength > deps.config.maxBytes) {
     return { ok: false, status: 413, message: "payload too large" };
   }
@@ -458,6 +468,7 @@ export async function stageFromBlocks(
       claimed_at: created_at,
       expires_at,
       enc_version: ENC_VERSION_V2,
+      owner: deps.owner,
     });
   } catch {
     await deleteQuietly(deps.STAGING_R2, r2_key);
@@ -471,6 +482,7 @@ export async function stageFromBlocks(
     fetch_url: `${origin}/staging/fetch/${file_handle}`,
     expires_at,
     byte_length: byteLen,
+    file_ref: await fileRefOf(file_handle),
   };
 }
 
@@ -524,28 +536,104 @@ const MSG_NOT_FOUND = "file not found or not yours";
 const MSG_CORRUPT = "stored file is corrupt";
 const MSG_LEGACY = "stored in a legacy format; re-stage the file";
 
+/**
+ * In-MCP open (`getFile`, `composed` / `multipart[].staged`): the row must belong to
+ * `deps.owner`. A row owned by someone else, or by no one (pre-0003), is the same 403 as a
+ * wrong token, checked before state and expiry, so there is no ownership oracle (E-1).
+ */
 export async function openStagedFile(deps: StagedFileOpenerDeps, ref: StagedRef): Promise<OpenStagedInternalResult> {
+  const { result } = await openRow(deps, ref, {
+    // An empty principal is no owner: two sessions whose principal is "" never share a file.
+    owns: (row) => !!row.owner && row.owner === deps.owner,
+  });
+  return result;
+}
+
+export type PublicOpenResult = OpenStagedInternalResult & {
+  /** The row's owner, when the reference resolved to a row with one (for the audit line). */
+  owner?: string;
+  /** `fileRefOf(file_handle)`, when the reference resolved to a row. */
+  fileRef?: string;
+};
+
+/**
+ * Public `/staging/fetch` open (E-1): no MCP principal is at hand, so any owned row is
+ * readable by its bearer up to `config.fetchMaxUses` times (STAGING_FETCH_MAX_USES, default 5):
+ * after the row checks, `countPublicFetch` counts the download before any R2 read; past the
+ * limit the call is 410. A download that fails after counting still counts. Rows without an
+ * owner are refused (403).
+ */
+export async function openForPublicDownload(
+  deps: Omit<StagedFileOpenerDeps, "owner">,
+  ref: StagedRef,
+): Promise<PublicOpenResult> {
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
-  if (!isPlausibleStagedRef(ref)) return { ok: false, status: 400, message: "malformed file reference" };
+  const { row, result } = await openRow(deps, ref, {
+    owns: (r) => !!r.owner,
+    beforeRead: async (token_hash) => {
+      try {
+        const maxUses = deps.config.fetchMaxUses ?? DEFAULT_FETCH_MAX_USES;
+        return (await countPublicFetch(deps.STAGING_D1, token_hash, maxUses, now()))
+          ? null
+          : { ok: false, status: 410, message: "already downloaded" };
+      } catch {
+        return { ok: false, status: 500, message: "staging lookup failed" };
+      }
+    },
+  });
+  if (!row) return result;
+  return {
+    ...result,
+    ...(row.owner ? { owner: row.owner } : {}),
+    fileRef: result.ok ? result.file.meta.fileRef : await fileRefOf(row.file_handle),
+  };
+}
+
+type OpenRefusal = Extract<OpenStagedInternalResult, { ok: false }>;
+
+/**
+ * Row checks + decrypting open shared by the in-MCP and public readers. `row` is set once the
+ * reference resolved (token found and handle matched), whatever the outcome after that.
+ */
+async function openRow(
+  deps: Omit<StagedFileOpenerDeps, "owner">,
+  ref: StagedRef,
+  policy: {
+    owns: (row: StagingRow) => boolean;
+    /** Runs after every row check, before any R2 read; a refusal ends the open. */
+    beforeRead?: (token_hash: Uint8Array) => Promise<OpenRefusal | null>;
+  },
+): Promise<{ row: StagingRow | null; result: OpenStagedInternalResult }> {
+  const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
+  const refuse = (row: StagingRow | null, status: OpenRefusal["status"], message: string) => ({
+    row,
+    result: { ok: false as const, status, message },
+  });
+  if (!isPlausibleStagedRef(ref)) return refuse(null, 400, "malformed file reference");
   let token_hash: Uint8Array;
   let row: StagingRow | null;
   try {
     token_hash = await sha256Bearer(ref.token);
     row = await lookupByHash(deps.STAGING_D1, token_hash);
   } catch {
-    return { ok: false, status: 500, message: "staging lookup failed" };
+    return refuse(null, 500, "staging lookup failed");
   }
   if (!row || !timingSafeEqualStrings(row.file_handle, ref.file_handle)) {
-    return { ok: false, status: 403, message: MSG_NOT_FOUND };
+    return refuse(null, 403, MSG_NOT_FOUND);
   }
-  if (row.state === "pending") return { ok: false, status: 409, message: "upload incomplete" };
-  if (row.state === "corrupt") return { ok: false, status: 410, message: MSG_CORRUPT };
-  if (row.expires_at <= now()) return { ok: false, status: 410, message: "expired" };
+  if (!policy.owns(row)) return refuse(row, 403, MSG_NOT_FOUND);
+  if (row.state === "pending") return refuse(row, 409, "upload incomplete");
+  if (row.state === "corrupt") return refuse(row, 410, MSG_CORRUPT);
+  if (row.expires_at <= now()) return refuse(row, 410, "expired");
   // Only the v2 blockwise format is readable. enc_version 1 (the retired
   // one-shot format, also every pre-0002 row) is refused before any R2 read.
-  if (row.enc_version !== ENC_VERSION_V2) return { ok: false, status: 410, message: MSG_LEGACY };
+  if (row.enc_version !== ENC_VERSION_V2) return refuse(row, 410, MSG_LEGACY);
   if (!row.r2_key || !row.iv || row.byte_len === null) {
-    return { ok: false, status: 500, message: "staging row incomplete" };
+    return refuse(row, 500, "staging row incomplete");
+  }
+  if (policy.beforeRead) {
+    const refused = await policy.beforeRead(token_hash);
+    if (refused) return { row, result: refused };
   }
   const byteLen = row.byte_len;
   const r2Key = row.r2_key;
@@ -586,6 +674,7 @@ export async function openStagedFile(deps: StagedFileOpenerDeps, ref: StagedRef)
       byteLength: byteLen,
       contentType: row.content_type ?? "application/octet-stream",
       filename: row.filename,
+      fileRef: await fileRefOf(row.file_handle),
     },
     begin,
     async readBlocks(onBlock) {
@@ -653,7 +742,7 @@ export async function openStagedFile(deps: StagedFileOpenerDeps, ref: StagedRef)
       }
     },
   };
-  return { ok: true, file };
+  return { row, result: { ok: true, file } };
 }
 
 export function createStagedFileOpener(deps: StagedFileOpenerDeps): (ref: StagedRef) => Promise<OpenStagedResult> {

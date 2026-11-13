@@ -7,11 +7,14 @@
 
 import {
   DEFAULT_COMPOSE_MAX_BYTES,
+  DEFAULT_FETCH_MAX_USES,
   DEFAULT_GETFILE_MAX_BYTES,
   DEFAULT_MAX_CONCURRENT_TRANSFERS,
   DEFAULT_TRANSFER_TIMEOUT_MS,
   type StagingConfig,
 } from "./staging/types";
+import type { HardeningConfig } from "./oauth-hardening";
+import { MCP_REFRESH_TOKEN_TTL_SECONDS } from "./oauth-provider-options";
 
 export function allowPiiInLogs(env: { ALLOW_PII_IN_LOGS?: string }): boolean {
   return env.ALLOW_PII_IN_LOGS === "true";
@@ -99,6 +102,7 @@ export function readStagingConfig(env: Record<string, unknown>): StagingConfig {
       DEFAULT_MAX_CONCURRENT_TRANSFERS,
     ),
     transferTimeoutMs: parsePositiveIntVar(env, "STAGING_TRANSFER_TIMEOUT_MS", DEFAULT_TRANSFER_TIMEOUT_MS),
+    fetchMaxUses: parsePositiveIntVar(env, "STAGING_FETCH_MAX_USES", DEFAULT_FETCH_MAX_USES),
   };
 }
 
@@ -142,27 +146,42 @@ const DEFAULT_OAUTH_REGISTER_RATE_LIMIT = 1;
 const DEFAULT_OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS = 300;
 const DEFAULT_OAUTH_TOKEN_RATE_LIMIT = 20;
 const DEFAULT_OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS = 60;
+// The browser legs (A-3, 2026-11 review), public since Cloudflare Access was
+// removed. One sign-in is one GET + one POST /authorize and one /callback, so
+// 30 / 300 s allows 15 sign-ins per five minutes from one address. /callback
+// is the tighter bucket because each one costs an upstream token request
+// signed with the deployment's client secret.
+const DEFAULT_OAUTH_AUTHORIZE_RATE_LIMIT = 30;
+const DEFAULT_OAUTH_AUTHORIZE_RATE_LIMIT_WINDOW_SECONDS = 300;
+const DEFAULT_OAUTH_CALLBACK_RATE_LIMIT = 10;
+const DEFAULT_OAUTH_CALLBACK_RATE_LIMIT_WINDOW_SECONDS = 300;
 
 export interface OAuthRateLimitConfig {
   limit: number;
   windowSeconds: number;
 }
 
-/** Per-endpoint rate-limit knobs for the two hardened OAuth endpoints. */
+/** Per-endpoint rate-limit knobs for the four hardened OAuth endpoints. */
 export interface OAuthRateLimits {
   register: OAuthRateLimitConfig;
   token: OAuthRateLimitConfig;
+  authorize: OAuthRateLimitConfig;
+  callback: OAuthRateLimitConfig;
 }
 
 /**
- * Read the rate-limit knobs applied to the two library-owned OAuth endpoints,
- * configured independently so the aggressive DCR clamp does not throttle normal
- * token exchange:
+ * Read the rate-limit knobs applied to the OAuth endpoints, each configured
+ * independently so the aggressive DCR clamp does not throttle normal token
+ * exchange or the browser legs:
  *
  *   POST /register — `OAUTH_REGISTER_RATE_LIMIT` requests per
  *     `OAUTH_REGISTER_RATE_LIMIT_WINDOW_SECONDS` per client IP (default 1/300s).
  *   POST /token    — `OAUTH_TOKEN_RATE_LIMIT` requests per
  *     `OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS` per client IP (default 20/60s).
+ *   GET/HEAD/POST /authorize — `OAUTH_AUTHORIZE_RATE_LIMIT` requests per
+ *     `OAUTH_AUTHORIZE_RATE_LIMIT_WINDOW_SECONDS` per client IP (default 30/300s).
+ *   GET/HEAD /callback — `OAUTH_CALLBACK_RATE_LIMIT` requests per
+ *     `OAUTH_CALLBACK_RATE_LIMIT_WINDOW_SECONDS` per client IP (default 10/300s).
  *
  * Each var is optional; unset falls back to the default above.
  */
@@ -184,24 +203,68 @@ export function readOAuthRateLimitConfig(env: Record<string, unknown>): OAuthRat
         DEFAULT_OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS,
       ),
     },
+    authorize: {
+      limit: parsePositiveIntVar(env, "OAUTH_AUTHORIZE_RATE_LIMIT", DEFAULT_OAUTH_AUTHORIZE_RATE_LIMIT),
+      windowSeconds: parsePositiveIntVar(
+        env,
+        "OAUTH_AUTHORIZE_RATE_LIMIT_WINDOW_SECONDS",
+        DEFAULT_OAUTH_AUTHORIZE_RATE_LIMIT_WINDOW_SECONDS,
+      ),
+    },
+    callback: {
+      limit: parsePositiveIntVar(env, "OAUTH_CALLBACK_RATE_LIMIT", DEFAULT_OAUTH_CALLBACK_RATE_LIMIT),
+      windowSeconds: parsePositiveIntVar(
+        env,
+        "OAUTH_CALLBACK_RATE_LIMIT_WINDOW_SECONDS",
+        DEFAULT_OAUTH_CALLBACK_RATE_LIMIT_WINDOW_SECONDS,
+      ),
+    },
   };
 }
 
-// --- OAuth inactive-client sweep ---
+// --- OAuth client-record lifetime ---
 
-// A dynamically-registered client that never completed an authorization (no
-// `grant:*`) and has aged past this threshold is reaped by the scheduled sweep.
-// 30 days by default — comfortably longer than any real authorization flow, so
-// only abandoned/attacker registrations are collected.
+// The library's `client:<id>` record carries a KV TTL that the hardening
+// wrapper sets (A-5, 2026-11 review; there is no sweep). A registration that
+// is never used expires after this long; a successful `/token` call renews
+// the record to the grant's lifetime plus this long again. 30 days by default.
 const DEFAULT_OAUTH_CLIENT_TTL_SECONDS = 30 * 24 * 60 * 60; // 2_592_000
+// Workers KV refuses an expirationTtl under 60 s; a smaller value would make
+// every TTL renewal throw (caught and logged), so it is raised to 60.
+const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
 
 /**
- * Read the inactive-client TTL (seconds) governing the OAuth client sweep.
- * `OAUTH_CLIENT_TTL_SECONDS`, default 30 days. An ungranted `client:*` older
- * than this is eligible for reaping (see `oauth-client-sweep.ts`).
+ * Read `OAUTH_CLIENT_TTL_SECONDS` (default 30 days): how long an unused
+ * registration lives, and the grace a client keeps after its grant's
+ * lifetime; values under 60 are raised to 60 (KV's minimum TTL). See
+ * {@link readOAuthHardeningConfig}.
  */
 export function readOAuthClientTtlSeconds(env: Record<string, unknown>): number {
-  return parsePositiveIntVar(env, "OAUTH_CLIENT_TTL_SECONDS", DEFAULT_OAUTH_CLIENT_TTL_SECONDS);
+  return Math.max(
+    KV_MIN_EXPIRATION_TTL_SECONDS,
+    parsePositiveIntVar(env, "OAUTH_CLIENT_TTL_SECONDS", DEFAULT_OAUTH_CLIENT_TTL_SECONDS),
+  );
+}
+
+/**
+ * The full configuration `enforceOAuthHardening` runs with: the four rate
+ * limits ({@link readOAuthRateLimitConfig}) and the client-record TTLs —
+ * `registeredSeconds` (set on a successful `/register`) is
+ * `OAUTH_CLIENT_TTL_SECONDS`; `activeSeconds` (set on every successful
+ * `/token`) is the grant lifetime (`MCP_REFRESH_TOKEN_TTL_SECONDS`, 90 days)
+ * plus `OAUTH_CLIENT_TTL_SECONDS`, 120 days by default. A grant's last refresh
+ * is at most 90 days after authorisation, so a client in use is never
+ * forgotten while its grant lives, and keeps 30 days to re-authorise after.
+ */
+export function readOAuthHardeningConfig(env: Record<string, unknown>): HardeningConfig {
+  const ttl = readOAuthClientTtlSeconds(env);
+  return {
+    ...readOAuthRateLimitConfig(env),
+    clientTtl: {
+      registeredSeconds: ttl,
+      activeSeconds: MCP_REFRESH_TOKEN_TTL_SECONDS + ttl,
+    },
+  };
 }
 
 // --- Per-deployment backend endpoint overrides ---

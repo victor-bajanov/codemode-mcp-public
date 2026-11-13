@@ -1,4 +1,4 @@
-import type { OpenApiSpec } from "@local/spec-loaders-google-discovery";
+import type { OpenApiOperation, OpenApiSpec } from "@local/spec-loaders-google-discovery";
 import type {
   Decision,
   ElicitRenderer,
@@ -13,7 +13,7 @@ import { hasUnsafePathSegment, matchOperation } from "./path-matcher";
 import { truncateForReturn } from "./truncate";
 import { auditLog, redactAuditEntry, type AuditEntry } from "./audit";
 import { mostRestrictive } from "./restrict";
-import { runElicitation, ToolError } from "./elicit";
+import { MAX_DIALOG_QUERY_PAIRS, runElicitation, ToolError } from "./elicit";
 import { deepFreeze } from "./freeze";
 import { allowPiiInLogs, debugLog } from "./config";
 import { buildUpstreamUrl } from "./build-upstream-url";
@@ -57,6 +57,21 @@ import {
 } from "./staging/staged-file";
 import type { PutFileCapabilityDeps } from "./staging/putfile-capability";
 import { DEFAULT_COMPOSE_MAX_BYTES, DEFAULT_TRANSFER_TIMEOUT_MS } from "./staging/types";
+import { auditQueryKeys, checkQuery } from "./query-policy";
+import { createUpstreamLookup, UpstreamLookupError } from "./upstream-lookup";
+import { canonicalJsonContentType, JSON_ESSENCE_RE, parseMediaType } from "./content-type-policy";
+import { collectUntrustedPointers, fenceUntrusted, untrustedPointersForStatus } from "./untrusted-fence";
+
+const DECISIONS: ReadonlySet<unknown> = new Set<Decision>(["allow", "elicit", "deny"]);
+
+/** A hook result the handler can act on: an object with a known decision
+ *  and, when present, an object `summary`. Anything else is a deny. */
+function isInspectResult(r: unknown): r is InspectResult {
+  if (r === null || typeof r !== "object") return false;
+  const { decision, summary } = r as { decision?: unknown; summary?: unknown };
+  if (!DECISIONS.has(decision)) return false;
+  return summary === undefined || (summary !== null && typeof summary === "object" && !Array.isArray(summary));
+}
 
 export interface MultipartPart {
   /** Form-data field name (required). */
@@ -142,12 +157,16 @@ export const INSPECT_JSON_MAX_BYTES = 50 * 1024 * 1024;
 // `x-json` or a `+json` suffix, under any top-level type: `application/json`,
 // `application/vnd.api+json`, `text/json`, `application/x-json`. Upstreams are
 // lenient about which of these they parse as JSON, so all of them are judged
-// as JSON (F-7).
-const JSON_CONTENT_TYPE_RE = /^[\w.+-]+\/(?:[\w.+-]+\+)?(?:x-)?json$/i;
+// as JSON (F-7). The rule (`JSON_ESSENCE_RE`) is shared with the D-3
+// content-type policy so both judge "is this JSON" identically.
 
 /** Leading and trailing HTTP whitespace (space, tab, CR, LF), which fetch's
  *  `Headers` strips from a header value before it goes on the wire. */
 const HTTP_WHITESPACE_EDGES = /^[\t\n\r ]+|[\t\n\r ]+$/g;
+
+/** Strict UTF-8 for raw JSON bodies (see `deriveInspectRequest`). A
+ *  non-streaming `decode` keeps no state, so one instance is reused. */
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** The content-type as it will appear on the wire: HTTP whitespace trimmed,
  *  as `Headers` does, so the inspector judges the value that is sent (F-7). */
@@ -160,7 +179,7 @@ export function normaliseContentType(contentType: string | undefined): string | 
 export function isJsonContentType(contentType: string | undefined): boolean {
   if (contentType === undefined) return false;
   const essence = (normaliseContentType(contentType) ?? "").split(";")[0]!.replace(HTTP_WHITESPACE_EDGES, "");
-  return JSON_CONTENT_TYPE_RE.test(essence);
+  return JSON_ESSENCE_RE.test(essence);
 }
 
 /** The single effective outbound payload, resolved from the legacy channel
@@ -262,8 +281,8 @@ export interface DerivedInspect {
    *  them as the JSON the upstream may still read leniently). */
   unparseableJson?: boolean;
   /** Payload to send instead of the effective one. Set when raw JSON-typed
-   *  bytes parsed: the inspector judges `JSON.parse(bytes)` (last duplicate
-   *  key wins, BOM stripped), so the bytes sent must be
+   *  bytes parsed: the inspector judges `JSON.parse(bytes)` (strict UTF-8, no
+   *  BOM; last duplicate key wins), so the bytes sent must be
    *  `JSON.stringify(parsed)`, never the original bytes (F-7). */
   sendAs?: EffectiveBody;
 }
@@ -323,7 +342,12 @@ export function deriveInspectRequest(
           return { req: base, oversize: true };
         }
         try {
-          const parsed: unknown = JSON.parse(new TextDecoder().decode(eff.bytes));
+          // Strict UTF-8 (RFC 8259 §8.1): a BOM is kept (so JSON.parse
+          // refuses it) and an invalid sequence throws, instead of being
+          // stripped or replaced with U+FFFD, so the parsed value is exactly
+          // what a UTF-8 reader upstream would see (D-3).
+          const text = STRICT_UTF8.decode(eff.bytes);
+          const parsed: unknown = JSON.parse(text);
           return {
             req: { ...base, body: parsed, contentType: eff.contentType },
             sendAs: { kind: "json", body: parsed, contentType: eff.contentType },
@@ -356,6 +380,14 @@ function filenameFromContentDisposition(header: string | null): string | null {
 const MULTIPART_HEADER_INJECTION = /[\r\n\0]/;
 const MULTIPART_OPTIONAL_STRING_FIELDS = ["filename", "contentType", "value", "bodyBase64"] as const;
 const MULTIPART_HEADER_FIELDS = ["name", "filename", "contentType"] as const;
+
+/** True when `atob` (WHATWG forgiving-base64) would decode `s`: ASCII
+ *  whitespace ignored, `=` padding optional, alphabet A–Z a–z 0–9 + /. */
+export function isDecodableBase64(s: string): boolean {
+  let t = s.replace(/[\t\n\f\r ]/g, "");
+  if (t.length % 4 === 0) t = t.replace(/={1,2}$/, "");
+  return t.length % 4 !== 1 && /^[A-Za-z0-9+/]*$/.test(t);
+}
 
 /** Why a multipart part list is refused, as an audit reason plus a message
  *  naming the part and field (never echoing the value), or `null` when every
@@ -402,6 +434,18 @@ function multipartPartsProblem(
           message: `multipart part ${i}: \`${field}\` must be a string when present`,
         };
       }
+    }
+    if (part.staged === undefined && part.value !== undefined && part.bodyBase64 !== undefined) {
+      return {
+        reason: "multipart-part-malformed",
+        message: `multipart part ${i}: \`value\` and \`bodyBase64\` are mutually exclusive`,
+      };
+    }
+    if (typeof part.bodyBase64 === "string" && !isDecodableBase64(part.bodyBase64)) {
+      return {
+        reason: "multipart-part-malformed",
+        message: `multipart part ${i}: \`bodyBase64\` must be valid base64`,
+      };
     }
     for (const field of MULTIPART_HEADER_FIELDS) {
       const v = part[field];
@@ -518,6 +562,14 @@ export interface HandleArgs<P extends Record<string, unknown>> {
   /** Per-category elicit renderers from provider config. Optional;
    *  scaffold falls back to genericWalker when no renderer resolves. */
   elicitRenderers?: Partial<Record<string, ElicitRenderer>>;
+
+  /** `ApiProvider.standardQueryParams`: query names accepted on every
+   *  operation besides the ones it declares (D-2). */
+  standardQueryParams?: readonly string[];
+
+  /** `ApiProvider.untrustedFieldExtension`: response-schema extension key
+   *  whose flagged strings are fenced before they are returned (F2-8). */
+  untrustedFieldExtension?: string;
 
   /** Narrow env shape; populated by `mcp-agent-factory` from `this.env`.
    *  Kept structural (not `ProviderEnv`) so tests can build minimal envs. */
@@ -658,9 +710,12 @@ function emitAudit<P extends Record<string, unknown>>(
 // never enters the sandbox; content-type has dedicated fields (`contentType`,
 // `multipart` — which owns its boundary header); and the method-override
 // family would let an allowed operation impersonate a different, unreviewed
-// verb upstream (Google APIs honour X-HTTP-Method-Override). Rejection is a
-// loud ToolError: the silently-dropped-header behaviour this feature replaces
-// produced wrong upstream bytes with no error anywhere.
+// verb upstream (Google APIs honour X-HTTP-Method-Override). The credential /
+// project-attribution set (wave-1 W4 note: the header twin of the refused
+// `key` query parameter) would add authority even on a plain-allow operation.
+// Exact names only: `Idempotency-Key` and the like stay allowed. Rejection is
+// a loud, audited ToolError: the silently-dropped-header behaviour this
+// feature replaces produced wrong upstream bytes with no error anywhere.
 const DISALLOWED_CTX_HEADERS = new Set([
   "authorization",
   "proxy-authorization",
@@ -673,30 +728,110 @@ const DISALLOWED_CTX_HEADERS = new Set([
   "x-http-method-override",
   "x-http-method",
   "x-method-override",
+  "x-goog-api-key",
+  "x-goog-user-project",
+  "x-goog-authuser",
+  "x-goog-iam-authorization-token",
+  "x-goog-iam-authority-selector",
+  "x-api-key",
+  "api-key",
+  "x-auth-token",
 ]);
 
-function assertAllowedCtxHeaders(headers: Record<string, string> | undefined): void {
-  if (!headers) return;
+/** At most this many sandbox-supplied headers per request (D-6). */
+const MAX_CTX_HEADERS = 32;
+/** At most this many characters per header name (D-6). */
+const MAX_CTX_HEADER_NAME = 256;
+/** At most this many characters per header value (D-6). */
+const MAX_CTX_HEADER_VALUE = 4096;
+/** RFC 7230 `token`: the only names `fetch`'s Headers accepts. */
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** CR, LF, NUL, or anything outside a ByteString (Headers throws on those). */
+const BAD_HEADER_VALUE_RE = /[\r\n\0\u0100-\uffff]/;
+
+/** Why sandbox-supplied `headers` are refused (an audit reason and the
+ *  caller-facing message), or undefined when they may be sent. Pure; the
+ *  message never echoes an invalid name or any value. */
+export function headerProblem(headers: unknown): { reason: string; message: string } | undefined {
+  if (headers === undefined || headers === null) return undefined;
+  if (typeof headers !== "object" || Array.isArray(headers)) {
+    return {
+      reason: "invalid-header-value",
+      message: "codemode.request `headers` must be an object of header names to string values",
+    };
+  }
+  const entries = Object.entries(headers as Record<string, unknown>);
+  if (entries.length > MAX_CTX_HEADERS) {
+    return {
+      reason: "too-many-headers",
+      message: `codemode.request \`headers\` may carry at most ${MAX_CTX_HEADERS} headers`,
+    };
+  }
   const seen = new Set<string>();
-  for (const name of Object.keys(headers)) {
+  for (const [name, value] of entries) {
+    if (name.length > MAX_CTX_HEADER_NAME || !HEADER_NAME_RE.test(name)) {
+      return {
+        reason: "invalid-header-name",
+        message:
+          "codemode.request `headers` has a name that is not a valid HTTP header name (letters, digits and !#$%&'*+.^_`|~- only)",
+      };
+    }
     const lower = name.toLowerCase();
+    if (lower === "content-type") {
+      return {
+        reason: "content-type-header",
+        message:
+          'headers may not set content-type — use the `contentType` option (or `multipart`, which generates its own)',
+      };
+    }
     if (DISALLOWED_CTX_HEADERS.has(lower)) {
-      throw new ToolError(
-        lower === "content-type"
-          ? 'headers may not set content-type — use the `contentType` option (or `multipart`, which generates its own)'
-          : `Header "${name}" cannot be set from sandbox code`,
-      );
+      return { reason: "forbidden-header", message: `Header "${name}" cannot be set from sandbox code` };
     }
     // Two casings of one name would BOTH survive the plain-object spread and
     // fetch's Headers would comma-combine their values ("application/json,
     // application/octet-stream") — corrupted content negotiation with no error.
     if (seen.has(lower)) {
-      throw new ToolError(
-        `Header "${name}" appears more than once (names differing only by case are the same header)`,
-      );
+      return {
+        reason: "duplicate-header",
+        message: `Header "${name}" appears more than once (names differing only by case are the same header)`,
+      };
     }
     seen.add(lower);
+    if (typeof value !== "string" || value.length > MAX_CTX_HEADER_VALUE || BAD_HEADER_VALUE_RE.test(value)) {
+      return {
+        reason: "invalid-header-value",
+        message: `Header "${name}" needs a string value of at most ${MAX_CTX_HEADER_VALUE} characters with no CR, LF, NUL or characters above U+00FF`,
+      };
+    }
   }
+  return undefined;
+}
+
+/** Longest `method` / `path` (code points) the handler will match (B-2). */
+const MAX_REQUEST_METHOD = 32;
+const MAX_REQUEST_PATH = 4096;
+
+/** True when `s` has more than `max` code points (no copy for short strings). */
+function exceedsCodePoints(s: string, max: number): boolean {
+  if (s.length <= max) return false;
+  let n = 0;
+  for (const _ of s) {
+    if (++n > max) return true;
+  }
+  return false;
+}
+
+/** The fixed audit `reason` of a failed dispatch or transfer (E-4). Only the
+ *  fixed prefixes of `compose/transfer.ts`'s ToolErrors are read; no message
+ *  text reaches the log. */
+export function failureReason(err: unknown): string {
+  if (!(err instanceof ToolError)) return "upstream-request-failed";
+  const m = err.message;
+  if (m.startsWith("staged transfer aborted")) return "transfer-aborted";
+  if (m.startsWith("staged transfer timed out")) return "transfer-timeout";
+  if (m.startsWith("staged transfer failed: upstream closed the connection")) return "upstream-closed";
+  if (m.startsWith("staged transfer failed:")) return "staged-read-failed";
+  return "upstream-request-failed";
 }
 
 export async function handleUpstreamRequest<P extends Record<string, unknown>>(
@@ -718,19 +853,44 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     });
     throw new ToolError("codemode.request needs string `method` and `path`");
   }
+  const { method: entryMethod, path: entryPath } = args.ctx;
+  /** Audit an entry-validation deny (category `malformed`; no operation is
+   *  resolved yet) and throw `message`. */
+  function denyAtEntry(reason: string, message: string): never {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: entryMethod,
+      path: entryPath,
+      decision: "deny",
+      category: "malformed",
+      reason,
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(message);
+  }
+  if (
+    exceedsCodePoints(args.ctx.method, MAX_REQUEST_METHOD) ||
+    exceedsCodePoints(args.ctx.path, MAX_REQUEST_PATH)
+  ) {
+    // B-2: a 300 KB path never reaches the matcher; the sink caps the line.
+    denyAtEntry("oversize-method-or-path", "codemode.request method or path is too long");
+  }
   if (args.ctx.contentType !== undefined && typeof args.ctx.contentType !== "string") {
     // A non-string content-type would be stringified into the header while
     // the JSON check below read something else (F-7).
-    emitAudit(args, {
-      deployment: args.deploymentName,
-      method: args.ctx.method,
-      path: args.ctx.path,
-      decision: "deny",
-      category: "malformed",
-      reason: "invalid-content-type",
-      ts: new Date().toISOString(),
-    });
-    throw new ToolError("codemode.request `contentType` must be a string when present");
+    denyAtEntry("invalid-content-type", "codemode.request `contentType` must be a string when present");
+  }
+  if (args.ctx.contentType !== undefined && parseMediaType(args.ctx.contentType) === undefined) {
+    // C-4 / D-3: only a syntactically valid media type can be carried, so no
+    // prose, newline or control character can reach a header or a dialog.
+    denyAtEntry(
+      "invalid-content-type",
+      "codemode.request `contentType` must be a media type such as application/json (parameters allowed; at most 100 characters)",
+    );
+  }
+  if (typeof args.ctx.bodyBase64 === "string" && !isDecodableBase64(args.ctx.bodyBase64)) {
+    // `atob` would throw a raw DOMException later, unaudited (W4 note).
+    denyAtEntry("invalid-body-base64", "codemode.request `bodyBase64` must be valid base64");
   }
   if (
     containsBinaryValue(args.ctx.body) ||
@@ -738,56 +898,28 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     containsBinaryValue(args.ctx.multipart) ||
     containsBinaryValue(args.ctx.composed)
   ) {
-    emitAudit(args, {
-      deployment: args.deploymentName,
-      method: args.ctx.method,
-      path: args.ctx.path,
-      decision: "deny",
-      category: "malformed",
-      reason: "binary-value-in-request",
-      ts: new Date().toISOString(),
-    });
-    throw new ToolError(
+    denyAtEntry(
+      "binary-value-in-request",
       "Binary values (Uint8Array/ArrayBuffer) are not accepted in body, query or multipart; send bytes with bodyBase64 or multipart[].bodyBase64",
     );
   }
   if (Array.isArray(args.ctx.multipart)) {
     const problem = multipartPartsProblem(args.ctx.multipart);
-    if (problem) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: args.ctx.method,
-        path: args.ctx.path,
-        decision: "deny",
-        category: "malformed",
-        reason: problem.reason,
-        ts: new Date().toISOString(),
-      });
-      throw new ToolError(problem.message);
-    }
+    if (problem) denyAtEntry(problem.reason, problem.message);
   }
   // `composed` is validated (shape, text rules, exclusivity with every other
   // body channel) on every operation, before any storage access.
   let composedSegments: Segment[] | undefined;
   if (args.ctx.composed !== undefined) {
     const v = validateComposed(args.ctx);
-    if (!v.ok) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: args.ctx.method,
-        path: args.ctx.path,
-        decision: "deny",
-        category: "malformed",
-        reason: v.reason,
-        ts: new Date().toISOString(),
-      });
-      throw new ToolError(v.message);
-    }
+    if (!v.ok) denyAtEntry(v.reason, v.message);
     composedSegments = v.segments;
   }
   // Validate before any token mint / elicitation round: a doomed request must
-  // not cost the user an approval dialog first.
-  assertAllowedCtxHeaders(args.ctx.headers);
+  // not cost the user an approval dialog first. Audited by reason only: header
+  // names and values are sandbox-controlled and never logged (D-6).
+  const hp = headerProblem(args.ctx.headers);
+  if (hp) denyAtEntry(hp.reason, hp.message);
   const ctx = {
     ...args.ctx,
     ...(args.ctx.body !== undefined ? { body: deepFreeze(args.ctx.body) } : {}),
@@ -835,6 +967,33 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     throw new ToolError(`No operation found for ${ctx.method} ${ctx.path}`);
   }
   const op = match.op;
+  // D-2: the query names are judged against the matched operation; the
+  // sorted names (never values) ride on every audit line from here on.
+  const queryCheck = checkQuery(op, spec, ctx.query, args.standardQueryParams);
+  // Bounded (32 names × 64 code points, plus the true count): the key set is
+  // sandbox-controlled. The policy and the dialog check use the full set.
+  const queryAudit: Pick<AuditEntry, "queryKeys" | "queryKeyCount"> = auditQueryKeys(queryCheck.keys);
+
+  /** Audit a deny (category `malformed` unless given) and throw `message`
+   *  (default: the generic surface-review denial). */
+  const denyMalformed = (
+    why: string,
+    message = `Operation ${op.operationId} is denied by surface review`,
+    auditCategory: string | undefined = "malformed",
+  ): never => {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "deny",
+      ...(auditCategory ? { category: auditCategory } : {}),
+      reason: why,
+      ...queryAudit,
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(message);
+  };
 
   const review = surfaceReview[op.operationId];
   if (!review) {
@@ -845,6 +1004,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       operationId: op.operationId,
       decision: "deny",
       reason: "not-in-surface-review",
+      ...queryAudit,
       ts: new Date().toISOString(),
     });
     throw new ToolError(`Operation ${op.operationId} not in surface review`);
@@ -858,9 +1018,28 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       operationId: op.operationId,
       decision: "deny",
       ...(review.category ? { category: review.category } : {}),
+      ...queryAudit,
       ts: new Date().toISOString(),
     });
     throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
+  }
+
+  // D-2: refuse a query name the operation does not declare (or a forbidden
+  // one, or a non-primitive value) before the URL is built, so it never
+  // reaches inspection, approval, token mint or the wire.
+  if (!queryCheck.ok) {
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "deny",
+      category: queryCheck.category,
+      reason: queryCheck.reason,
+      ...queryAudit,
+      ts: new Date().toISOString(),
+    });
+    throw new ToolError(queryCheck.message);
   }
 
   // Build the outbound URL from the template-derived wire path BEFORE
@@ -872,22 +1051,23 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   } catch (err) {
     // M3 / F-1: defence-in-depth on URL origin and path. Tag mismatch deny
     // audits with category "url_safety" so they're greppable in production logs.
-    if (
+    // Any other failure (e.g. an unparsable base URL) is audited too, by a
+    // fixed reason — its message is not logged (W4 note).
+    const mismatch =
       err instanceof ToolError &&
       (err.message.startsWith("upstream-url-origin-mismatch") ||
-        err.message.startsWith("upstream-url-path-mismatch"))
-    ) {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: ctx.method,
-        path: ctx.path,
-        operationId: op.operationId,
-        decision: "deny",
-        category: "url_safety",
-        reason: err.message,
-        ts: new Date().toISOString(),
-      });
-    }
+        err.message.startsWith("upstream-url-path-mismatch"));
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "deny",
+      category: "url_safety",
+      reason: mismatch ? (err as ToolError).message : "upstream-url-build-failed",
+      ...queryAudit,
+      ts: new Date().toISOString(),
+    });
     throw err;
   }
   // Re-resolve the operation from what the upstream will actually receive and
@@ -903,6 +1083,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       decision: "deny",
       category: "url_safety",
       reason: "operation-mismatch-after-url-build",
+      ...queryAudit,
       ts: new Date().toISOString(),
     });
     throw new ToolError(
@@ -922,7 +1103,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     Object.keys(ctx.headers).length > 0 &&
     (review.inspect !== undefined || review.decision === "elicit")
   ) {
-    throw new ToolError(
+    denyMalformed(
+      "headers-on-gated-op",
       `Operation ${op.operationId} is subject to inspection/approval — ` +
         "sandbox-supplied `headers` are not allowed on it; remove `headers` from this codemode.request call",
     );
@@ -937,7 +1119,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   const stagedParts = Array.isArray(ctx.multipart) && ctx.multipart.some((p) => p.staged !== undefined);
   let stagedEff: Extract<EffectiveBody, { kind: "composed" }> | undefined;
   if (composedSegments !== undefined || stagedParts) {
-    const auditDeny = (reason: string, cat?: string): void =>
+    const auditDeny = (reason: string, cat?: string, staging?: AuditEntry["staging"]): void =>
       emitAudit(args, {
         deployment: args.deploymentName,
         method: ctx.method,
@@ -946,6 +1128,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
         decision: "deny",
         ...(cat ? { category: cat } : {}),
         reason,
+        ...queryAudit,
+        ...(staging ? { staging } : {}),
         ts: new Date().toISOString(),
       });
     // Staged multipart parts are a new channel with no legacy precedence: a
@@ -962,7 +1146,10 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       );
     }
     if (!args.openStaged) {
-      throw new ToolError("staged files are not available: server staging bindings are not configured");
+      return denyMalformed(
+        "staging-not-configured",
+        "staged files are not available: server staging bindings are not configured",
+      );
     }
     const refs: Array<{ ref: StagedRef; where: string }> = [];
     if (composedSegments !== undefined) {
@@ -976,9 +1163,16 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     }
     const files: OpenStagedFile[] = [];
     for (const { ref, where } of refs) {
-      const r = await args.openStaged(ref);
+      let r: OpenStagedResult;
+      try {
+        r = await args.openStaged(ref);
+      } catch (err) {
+        // A storage outage ends the request too: on record, then rethrown.
+        auditDeny("staged-ref-unresolved", undefined, { event: "attach", status: 500 });
+        throw err;
+      }
       if (!r.ok) {
-        auditDeny("staged-ref-unresolved");
+        auditDeny("staged-ref-unresolved", undefined, { event: "attach", status: r.status });
         throw new ToolError(stagedRefFailure(where, r));
       }
       files.push(r.file);
@@ -1043,6 +1237,19 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // reuse it for marshalling below — so the bytes inspected and the bytes sent
   // are one and the same. Can throw ToolError (rawBody + non-string body); that
   // propagation is correct, mirroring the other deny paths.
+  if (
+    stagedEff === undefined &&
+    !Array.isArray(nctx.multipart) &&
+    typeof nctx.bodyBase64 !== "string" &&
+    nctx.rawBody &&
+    nctx.body !== undefined &&
+    nctx.body !== null &&
+    typeof nctx.body !== "string"
+  ) {
+    // The one throw of `resolveEffective`, audited here (W4 note); the
+    // function keeps it for direct callers.
+    denyMalformed("raw-body-not-string", "rawBody requires a string body; send binary via bodyBase64 or multipart");
+  }
   const eff: EffectiveBody = stagedEff ?? resolveEffective(nctx);
   // What is actually marshalled: `eff`, except on gated raw JSON, where it is
   // the canonical re-serialisation of what was inspected and approved (F-7).
@@ -1052,7 +1259,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // Gated operations (inspected, or needing approval) must be judged on the
   // payload that is sent. Plain "allow" operations grant the caller the
   // operation wholesale, so they keep the legacy channel precedence.
-  const gated = review.inspect !== undefined || review.decision === "elicit";
+  const gated =
+    review.inspect !== undefined || review.decision === "elicit" || review.inspectUpstream !== undefined;
   let inspectResult: InspectResult | undefined;
   // What the approval dialog renders: the parsed JSON payload that is sent,
   // or nothing when the payload cannot be shown (see `opaquePayload`).
@@ -1061,19 +1269,6 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // interpreted (raw non-JSON bytes or multipart, no inspector).
   let opaquePayload: string | undefined;
   if (gated) {
-    const denyMalformed = (why: string): never => {
-      emitAudit(args, {
-        deployment: args.deploymentName,
-        method: ctx.method,
-        path: ctx.path,
-        operationId: op.operationId,
-        decision: "deny",
-        category: "malformed",
-        reason: why,
-        ts: new Date().toISOString(),
-      });
-      throw new ToolError(`Operation ${op.operationId} is denied by surface review`);
-    };
     // One-channel guard: a legitimate caller uses exactly one body channel.
     // Supplying two is the decoy primitive (inspect or show one, send
     // another) → deny, on approval-only operations as well as inspected ones.
@@ -1082,13 +1277,42 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     if (derived.oversize) denyMalformed("oversize-json-body");
     if (derived.unparseableJson) denyMalformed("unparseable-json-body");
     sendEff = derived.sendAs ?? eff;
+    // F1-2b: inspectors see the decoded target (a copy, frozen with the rest).
+    let inspectReq: InspectRequest = { ...derived.req, pathParams: { ...match.params } };
     if (sendEff.kind === "json") {
+      // D-3: a JSON payload on a gated operation goes out as exactly
+      // `application/json` (`charset=utf-8` accepted and dropped); any other
+      // label could make the upstream re-read the judged bytes as something
+      // else. Checked before the inspector, which then sees the final label.
+      const canonical =
+        canonicalJsonContentType(sendEff.contentType) ??
+        denyMalformed(
+          "json-body-non-json-content-type",
+          `Operation ${op.operationId} sends its \`body\` as JSON; on this operation the content type must be application/json (omit \`contentType\`)`,
+        );
+      sendEff = { ...sendEff, contentType: canonical };
+      inspectReq = { ...inspectReq, contentType: canonical };
       renderBody = sendEff.body;
     } else if (sendEff.kind === "none") {
       renderBody = undefined;
     } else {
       renderBody = undefined;
       if (!review.inspect) {
+        // Approval-only operation (D-1): raw bytes or inline multipart parts
+        // cannot be shown, so the user could only approve blind — deny before
+        // any dialog. A host-assembled (`composed`) body stays approvable only
+        // when it attaches staged files, which the dialog's Attachments line
+        // lists; a composed body of inline segments alone is as blind as raw.
+        if (
+          sendEff.kind === "raw" ||
+          sendEff.kind === "multipart" ||
+          (sendEff.kind === "composed" && sendEff.metas.length === 0)
+        ) {
+          denyMalformed(
+            "opaque-body-on-approval-op",
+            `Operation ${op.operationId} requires approval but its body cannot be shown; send it as JSON (object \`body\`) or omit it`,
+          );
+        }
         opaquePayload = describeOpaque(nctx, sendEff);
       }
     }
@@ -1097,11 +1321,85 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       // matching the deepFreeze protection previously applied to ctx.body.
       // env rides along un-frozen (it is the live worker env, bindings included)
       // so inspectors can resolve per-deployment policy vars.
-      inspectResult = review.inspect(deepFreeze(derived.req), args.env);
+      // Frozen in place: a paired `inspectUpstream` below gets the same object.
+      // A throwing inspector (e.g. a malformed operator allow-list var, whose
+      // message quotes the config text) is a fail-closed deny with an audit
+      // line; its text is never forwarded to the caller.
+      try {
+        inspectResult = review.inspect(deepFreeze(inspectReq), args.env);
+      } catch {
+        return denyMalformed(
+          "inspector-threw",
+          `Operation ${op.operationId} is denied: its request check failed`,
+        );
+      }
+      // A non-InspectResult (e.g. `{}`, or a Promise from an async inspect)
+      // must never merge as allow.
+      if (!isInspectResult(inspectResult)) {
+        return denyMalformed(
+          "inspector-invalid-result",
+          `Operation ${op.operationId} is denied: its request check failed`,
+        );
+      }
       decision = mostRestrictive(decision, inspectResult.decision);
       if (inspectResult.category) category = inspectResult.category;
       if (inspectResult.reason) reason = inspectResult.reason;
       if (inspectResult.message) denyMessage = inspectResult.message;
+    }
+    // A hook must be paired with `inspect` (the provider battery checks it);
+    // an unpaired one is a misconfiguration and is refused, never skipped.
+    if (review.inspectUpstream !== undefined && review.inspect === undefined) {
+      denyMalformed("upstream-inspector-without-inspect");
+    }
+    if (review.inspectUpstream !== undefined && decision !== "deny") {
+      // F1-2b: the async hook may read plain-allow GETs (minting the token
+      // before the decision). It never runs on a body it cannot read: an
+      // opaque or host-assembled payload is denied instead (fail closed).
+      if (sendEff.kind !== "json" && sendEff.kind !== "none") {
+        denyMalformed(
+          "opaque-body-on-upstream-inspected-op",
+          `Operation ${op.operationId} checks upstream state before sending and takes a JSON \`body\` only`,
+        );
+      }
+      const session = createUpstreamLookup(args, handleUpstreamRequest);
+      let r: InspectResult | undefined;
+      let failure: unknown;
+      try {
+        // Already deep-frozen for `inspect` (a hook without one was denied above).
+        r = await review.inspectUpstream(inspectReq, session.lookup, args.env);
+      } catch (err) {
+        failure = err;
+      } finally {
+        session.close();
+      }
+      // A lookup the hook fired without awaiting still counts: wait for it.
+      await session.settled();
+      if (failure !== undefined || session.failed() || !isInspectResult(r)) {
+        // Only the session's own fixed refusals are named: any other text
+        // (nested request, hook) may carry lookup paths or upstream content.
+        const detail = failure instanceof UpstreamLookupError ? `: ${failure.message}` : "";
+        return denyMalformed(
+          "upstream-inspect-failed",
+          `Operation ${op.operationId} is denied: its check of the stored upstream state failed${detail}`,
+          category ?? "malformed",
+        );
+      }
+      const merged = mostRestrictive(decision, r.decision);
+      // The hook's labels apply when its decision is the one that stands; a
+      // hook `allow` never relabels a sync `elicit`.
+      if (merged === r.decision) {
+        if (r.category) category = r.category;
+        if (r.reason) reason = r.reason;
+        if (r.message) denyMessage = r.message;
+      }
+      decision = merged;
+      const summary = { ...inspectResult?.summary, ...r.summary };
+      inspectResult = {
+        ...inspectResult,
+        ...r,
+        decision,
+        ...(Object.keys(summary).length > 0 ? { summary } : {}),
+      };
     }
   }
 
@@ -1114,6 +1412,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       decision: "deny",
       ...(category ? { category } : {}),
       ...(reason ? { reason } : {}),
+      ...queryAudit,
       ts: new Date().toISOString(),
     });
     // Prefer the inspector's specific explanation (e.g. "only DRAFT or SUBMITTED
@@ -1134,11 +1433,22 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       },
       { containsPii: false },
     );
+    // The dialog shows every query pair (none may hide behind a count), so a
+    // query too long to show is refused before any dialog.
+    // `queryCheck.keys` are exactly the defined query names (see `checkQuery`).
+    const queryPairCount = queryCheck.keys.length;
+    if (queryPairCount > MAX_DIALOG_QUERY_PAIRS) {
+      denyMalformed(
+        "too-many-query-params-for-dialog",
+        `Operation ${op.operationId} requires approval but its query has ${queryPairCount} parameters; at most ${MAX_DIALOG_QUERY_PAIRS} can be shown in the approval dialog`,
+      );
+    }
     await runElicitation({
       spec: args.spec,
       operationId: op.operationId,
       method: ctx.method,
       path: ctx.path,
+      pathParams: match.params,
       body: renderBody,
       ...(opaquePayload !== undefined ? { opaquePayload } : {}),
       env: args.env,
@@ -1149,6 +1459,7 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       ...(inspectResult?.summary ? { inspectorSummary: inspectResult.summary } : {}),
       ...(stagedEff ? { attachments: attachmentsLine(stagedEff.metas) } : {}),
       entry: review,
+      ...(queryAudit.queryKeys ? { queryKeys: queryAudit.queryKeys } : {}),
       ...(args.elicitRenderers ? { elicitRenderers: args.elicitRenderers } : {}),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       server: args.server as any,
@@ -1162,6 +1473,8 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
           elicitationOutcome: e.elicitationOutcome,
           ...(e.category ? { category: e.category } : {}),
           ...(e.reason ? { reason: e.reason } : {}),
+          ...(e.queryKeys ? { queryKeys: e.queryKeys } : {}),
+          ...(e.queryKeys && queryAudit.queryKeyCount !== undefined ? { queryKeyCount: queryAudit.queryKeyCount } : {}),
           ...(e.elicitFields ? { elicitFields: e.elicitFields } : {}),
           ts: new Date().toISOString(),
         }),
@@ -1171,12 +1484,37 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
 
   const userId = args.oauth.userIdAccessor(args.props);
   if (!userId) {
-    throw new ToolError("Cannot mint access token: principal has no userId");
+    return denyMalformed("no-principal", "Cannot mint access token: principal has no userId", undefined);
   }
-  const accessToken = await args.oauth.broker.getOrRefreshAccessToken({
-    userId,
-    refreshToken: args.oauth.refreshTokenAccessor(args.props),
-  });
+  /** The request was allowed but did not complete: a line with a fixed
+   *  `reason` (never the error text), written once per request (E-4). */
+  let outcomeWritten = false;
+  const auditFailed = (why: string, extra: Partial<AuditEntry> = {}): void => {
+    if (outcomeWritten) return;
+    outcomeWritten = true;
+    emitAudit(args, {
+      deployment: args.deploymentName,
+      method: ctx.method,
+      path: ctx.path,
+      operationId: op.operationId,
+      decision: "allow",
+      outcome: "failed",
+      reason: why,
+      ...queryAudit,
+      ...extra,
+      ts: new Date().toISOString(),
+    });
+  };
+  let accessToken: string;
+  try {
+    accessToken = await args.oauth.broker.getOrRefreshAccessToken({
+      userId,
+      refreshToken: args.oauth.refreshTokenAccessor(args.props),
+    });
+  } catch (err) {
+    auditFailed("token-mint-failed");
+    throw err;
+  }
 
   // ctx.headers first (validated at entry), so the scaffold-controlled set
   // below always wins on collision — sandbox code can extend, never override.
@@ -1201,7 +1539,14 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   }
 
   if (args.requestHeaders) {
-    for (const [name, value] of Object.entries(args.requestHeaders(args.props))) {
+    let provided: Record<string, string>;
+    try {
+      provided = args.requestHeaders(args.props);
+    } catch (err) {
+      auditFailed("request-headers-failed");
+      throw err;
+    }
+    for (const [name, value] of Object.entries(provided)) {
       setHeader(name, value);
     }
   }
@@ -1221,11 +1566,29 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   // that slot through `gateLease`, held until it has stored the file.
   const viaLease = ctx.bypassTruncate === true && args.gateLease !== undefined;
   const fileSized = sendEff.kind === "composed" || ctx.returnAs === "stage" || ctx.bypassTruncate === true;
-  if (viaLease) await args.gateLease!.acquire();
-  const release =
-    fileSized && !viaLease && args.transferGate
-      ? await args.transferGate.acquire(args.runKey ?? {}, args.signal ?? NEVER_ABORTED)
-      : undefined;
+  // The counters of a host-assembled send known before dispatch; they ride on
+  // the dispatch line, a failure line and the final line alike.
+  const composedAudit: Pick<AuditEntry, "stagedCount" | "stagedBytes" | "assembledBytes" | "stagedRefs"> =
+    sendEff.kind === "composed"
+      ? {
+          stagedCount: sendEff.metas.length,
+          stagedBytes: sendEff.metas.reduce((n, m) => n + m.byteLength, 0),
+          assembledBytes: sendEff.length,
+          stagedRefs: sendEff.metas.map((m) => m.fileRef),
+        }
+      : {};
+  let release: (() => void) | undefined;
+  try {
+    if (viaLease) await args.gateLease!.acquire();
+    release =
+      fileSized && !viaLease && args.transferGate
+        ? await args.transferGate.acquire(args.runKey ?? {}, args.signal ?? NEVER_ABORTED)
+        : undefined;
+  } catch (err) {
+    // A refused or aborted slot ends an allowed, minted request (E-4).
+    auditFailed("transfer-gate-failed", composedAudit);
+    throw err;
+  }
   const timeoutMs = args.stagingLimits?.transferTimeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS;
   // One controller per file-sized transfer (D3a), alive until the response
   // has been handled: it bounds the send, the response read and a staged
@@ -1233,11 +1596,31 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
   const transfer: TransferController | undefined = fileSized
     ? transferController(args.signal, timeoutMs)
     : undefined;
+  const outcome: Outcome = {
+    written: () => outcomeWritten,
+    markWritten: () => {
+      outcomeWritten = true;
+    },
+    failed: auditFailed,
+  };
   try {
     let upstreamRes: Response;
     let stagedAudit: StagedAudit = {};
     if (sendEff.kind === "composed") {
       if (!platformSuppliesContentLength()) setHeader("Content-Length", String(sendEff.length));
+      // E-4: the body can reach the upstream and the client vanish before
+      // any answer, so the send is on record before its first byte goes out.
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId: op.operationId,
+        decision: "allow",
+        phase: "dispatch",
+        ...queryAudit,
+        ...composedAudit,
+        ts: new Date().toISOString(),
+      });
       const sent = await sendAssembled(
         urlString,
         fetchOptions,
@@ -1248,11 +1631,12 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
       // An upstream may answer (even 2xx) after reading only part of the
       // body; the audit line records how much it accepted.
       stagedAudit = {
-        stagedCount: sendEff.metas.length,
-        stagedBytes: sendEff.metas.reduce((n, m) => n + m.byteLength, 0),
-        assembledBytes: sendEff.length,
+        stagedCount: composedAudit.stagedCount!,
+        stagedBytes: composedAudit.stagedBytes!,
+        assembledBytes: composedAudit.assembledBytes!,
         bodyBytesSent: sent.bodyBytesSent,
         bodyComplete: sent.bodyComplete,
+        stagedRefs: composedAudit.stagedRefs!,
       };
     } else if (transfer) {
       if (transfer.signal.aborted) throw transferFailure(transfer, undefined);
@@ -1261,9 +1645,13 @@ export async function handleUpstreamRequest<P extends Record<string, unknown>>(
     } else {
       upstreamRes = await fetch(urlString, fetchOptions);
     }
-    return await finishUpstream(args, ctx, op.operationId, upstreamRes, stagedAudit, transfer);
+    return await finishUpstream(args, ctx, op, upstreamRes, { ...queryAudit, ...stagedAudit }, transfer, outcome);
   } catch (err) {
-    throw transfer ? transferFailure(transfer, err) : err;
+    const failure = transfer ? transferFailure(transfer, err) : err;
+    // Every allowed request that ends here without its final line gets one
+    // (E-4): a rejected fetch, a failed or aborted transfer.
+    auditFailed(failureReason(failure), composedAudit);
+    throw failure;
   } finally {
     transfer?.dispose();
     release?.();
@@ -1293,19 +1681,34 @@ function describeOpaque(ctx: UpstreamCtx, eff: EffectiveBody): string | undefine
 /** The audit counters of a host-assembled send (empty for any other request). */
 type StagedAudit = Pick<
   AuditEntry,
-  "stagedCount" | "stagedBytes" | "assembledBytes" | "bodyBytesSent" | "bodyComplete"
+  "stagedCount" | "stagedBytes" | "assembledBytes" | "bodyBytesSent" | "bodyComplete" | "stagedRefs"
 >;
+
+/** The request's single closing line (E-4): `finishUpstream` marks it
+ *  written with its ordinary allow line, or writes an `outcome: "failed"`
+ *  line itself; the dispatch `catch` writes one only when neither happened. */
+interface Outcome {
+  written(): boolean;
+  markWritten(): void;
+  failed(reason: string, extra?: Partial<AuditEntry>): void;
+}
+
+/** Extra fields for the final audit line: the query names plus the counters
+ *  of a host-assembled send. */
+type FinalAudit = Pick<AuditEntry, "queryKeys" | "queryKeyCount"> & StagedAudit;
 
 /** Everything after the upstream answered: rate-limit telemetry, redirect
  *  refusal, staged download, and the response envelope. */
 async function finishUpstream<P extends Record<string, unknown>>(
   args: HandleArgs<P>,
   ctx: UpstreamCtx,
-  operationId: string,
+  op: OpenApiOperation,
   upstreamRes: Response,
-  stagedAudit: StagedAudit,
+  finalAudit: FinalAudit,
   transfer: TransferController | undefined,
+  outcome: Outcome,
 ): Promise<unknown> {
+  const operationId = op.operationId;
   // Rate-limit headers are read off EVERY response (2xx included) so the caller
   // sees its remaining budget before it runs out, not only once throttled. A
   // provider reader is best-effort telemetry: if it throws, the upstream result
@@ -1328,6 +1731,7 @@ async function finishUpstream<P extends Record<string, unknown>>(
   // `Location` is not echoed: it is upstream-controlled and may carry tokens.
   if (upstreamRes.status >= 300 && upstreamRes.status < 400 && upstreamRes.status !== 304) {
     cancelQuietly(upstreamRes);
+    outcome.markWritten();
     emitAudit(args, {
       deployment: args.deploymentName,
       method: ctx.method,
@@ -1335,7 +1739,7 @@ async function finishUpstream<P extends Record<string, unknown>>(
       operationId,
       decision: "allow",
       upstreamStatus: upstreamRes.status,
-      ...stagedAudit,
+      ...finalAudit,
       ts: new Date().toISOString(),
     });
     return {
@@ -1356,8 +1760,25 @@ async function finishUpstream<P extends Record<string, unknown>>(
   // envelope (so the LLM can debug — error bodies are usually small JSON).
   if (ctx.returnAs === "stage" && upstreamRes.ok) {
     const store = args.stagingStore;
+    const stageLine = (staging?: AuditEntry["staging"]): void => {
+      outcome.markWritten();
+      emitAudit(args, {
+        deployment: args.deploymentName,
+        method: ctx.method,
+        path: ctx.path,
+        operationId,
+        decision: "allow",
+        upstreamStatus: upstreamRes.status,
+        ...(finalAudit.queryKeys ? { queryKeys: finalAudit.queryKeys } : {}),
+        ...(finalAudit.queryKeyCount !== undefined ? { queryKeyCount: finalAudit.queryKeyCount } : {}),
+        ...(staging ? { staging } : {}),
+        ts: new Date().toISOString(),
+      });
+    };
     if (!store) {
       cancelQuietly(upstreamRes);
+      // The upstream already answered: its line comes first (W4 note).
+      stageLine();
       throw new ToolError("returnAs:\"stage\" requires server staging bindings, which are not configured");
     }
     const upstreamContentType = upstreamRes.headers.get("content-type") ?? "application/octet-stream";
@@ -1371,7 +1792,16 @@ async function finishUpstream<P extends Record<string, unknown>>(
       const src = upstreamRes.body
         ? blockSourceFromStream(upstreamRes.body, declared, store.config.maxBytes)
         : blockSourceFromBytes(new Uint8Array(0));
-      staged = await stageFromBlocks(store, src, upstreamContentType, filename);
+      try {
+        staged = await stageFromBlocks(store, src, upstreamContentType, filename);
+      } catch (err) {
+        cancelQuietly(upstreamRes);
+        const failure = transfer ? transferFailure(transfer, err) : err;
+        outcome.failed(transfer?.signal.aborted ? failureReason(failure) : "stage-store-failed", {
+          upstreamStatus: upstreamRes.status,
+        });
+        throw failure;
+      }
       // The shared unknown-length slot's own message ("…or send
       // Content-Length") is for uploaders; a download caller can only retry.
       if (!staged.ok && staged.status === 503) {
@@ -1380,18 +1810,22 @@ async function finishUpstream<P extends Record<string, unknown>>(
       // A refused or failed store may never have touched the body (e.g. the
       // shared unknown-length slot is busy → 503): cancel it either way.
       if (!staged.ok) cancelQuietly(upstreamRes);
-      if (!staged.ok && transfer?.signal.aborted) throw transferFailure(transfer, undefined);
+      if (!staged.ok && transfer?.signal.aborted) {
+        const failure = transferFailure(transfer, undefined);
+        outcome.failed(failureReason(failure), {
+          upstreamStatus: upstreamRes.status,
+          staging: { event: "store", status: staged.status },
+        });
+        throw failure;
+      }
     }
 
-    emitAudit(args, {
-      deployment: args.deploymentName,
-      method: ctx.method,
-      path: ctx.path,
-      operationId,
-      decision: "allow",
-      upstreamStatus: upstreamRes.status,
-      ts: new Date().toISOString(),
-    });
+    // E-1: the store on record by its fileRef (never the handle or token).
+    stageLine(
+      staged.ok
+        ? { event: "store", fileRef: staged.file_ref, byteLength: staged.byte_length, status: 200 }
+        : { event: "store", status: staged.status },
+    );
 
     if (!staged.ok) {
       return {
@@ -1426,13 +1860,47 @@ async function finishUpstream<P extends Record<string, unknown>>(
   let parsed: unknown;
   let errorMessage = "";
   {
-    let responseText: string | undefined = await upstreamRes.text();
+    let responseText: string | undefined;
+    try {
+      responseText = await upstreamRes.text();
+    } catch (err) {
+      const failure = transfer ? transferFailure(transfer, err) : err;
+      outcome.failed(transfer?.signal.aborted ? failureReason(failure) : "response-read-failed", {
+        upstreamStatus: upstreamRes.status,
+        ...finalAudit,
+      });
+      throw err;
+    }
     if (!upstreamRes.ok) errorMessage = responseText.slice(0, 500);
     parsed = responseText;
     try { parsed = JSON.parse(responseText); } catch { /* leave as text */ }
     responseText = undefined;
   }
 
+  // F2-8: fence the strings the provider's spec flags as third-party text,
+  // for this status (or `default`), before truncation — on everything that
+  // returns to the model, including an error envelope (a non-2xx answer to a
+  // `returnAs: "stage"` request lands here too). The internal
+  // `bypassTruncate` path plucks a field to stage it and never returns it.
+  if (args.untrustedFieldExtension && ctx.bypassTruncate !== true) {
+    const pointers = untrustedPointersForStatus(
+      collectUntrustedPointers(op, args.untrustedFieldExtension, args.spec),
+      upstreamRes.status,
+    );
+    if (pointers.length > 0) {
+      const fenced = fenceUntrusted(parsed, pointers);
+      if (fenced !== parsed) {
+        parsed = fenced;
+        // The error message is a second copy of the body: rebuild it from
+        // the fenced value so it carries no unfenced flagged text.
+        if (!upstreamRes.ok) {
+          errorMessage = (typeof fenced === "string" ? fenced : JSON.stringify(fenced)).slice(0, 500);
+        }
+      }
+    }
+  }
+
+  outcome.markWritten();
   emitAudit(args, {
     deployment: args.deploymentName,
     method: ctx.method,
@@ -1441,7 +1909,7 @@ async function finishUpstream<P extends Record<string, unknown>>(
     decision: "allow",
     upstreamStatus: upstreamRes.status,
     ...rateLimitAudit,
-    ...stagedAudit,
+    ...finalAudit,
     ts: new Date().toISOString(),
   });
 

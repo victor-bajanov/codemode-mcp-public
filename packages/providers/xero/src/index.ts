@@ -31,7 +31,7 @@ const XERO_ATTACHMENT_HINT =
   "- `file_handle` and `token` are what register_file_handle returned. `fileName` is the name Xero should show for the attachment — normally the `filename` you passed to register_file_handle (it is URL-encoded into the path; Files API `Name` must match it).\n" +
   "- Xero refuses a request body of 10,240,000 bytes or more with 413 (attachments and Files alike), so check the file size before sending. A Files upload has about 1 KB less room, because the multipart framing counts toward the limit.\n" +
   "- Xero rejects some file extensions, such as .bin (Files returns 400; an invoice attachment fails with a generic 500), so keep the file's real extension.\n" +
-  "- Both operations are allowed by the Xero surface review (createInvoiceAttachmentByFileName, updateInvoiceAttachmentByFileName, xero.files.uploadFile).\n" +
+  "- Both operations are allowed by the Xero surface review (createInvoiceAttachmentByFileName, its credit-note twin createCreditNoteAttachmentByFileName, and xero.files.uploadFile). Replacing an existing attachment's bytes (the POST to the same path) is not available; upload the new version under a new file name.\n" +
   "- `composed` and `multipart` are mutually exclusive with `body`/`bodyBase64`/`rawBody`; never pass file bytes through `rawBody` — that path is for text/XML and corrupts binary.";
 
 // Provider-specific download guidance for the staging workflow (issue #41

@@ -1,28 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { buildRequestedSchema } from "../elicit";
+import { CONFIRM_SCHEMA } from "../elicit";
 
-describe("buildRequestedSchema", () => {
-  it("infers types from value types", () => {
-    expect(buildRequestedSchema({ a: "x", b: 1, c: true })).toEqual({
-      type: "object",
-      properties: {
-        a: { type: "string" },
-        b: { type: "number" },
-        c: { type: "boolean" },
-      },
-      required: ["a", "b", "c"],
-      additionalProperties: false,
-    });
+// D-1: the approval dialog asks one question only. Facts are shown in the
+// message, never requested as inputs (inputs were the bug: the user typed
+// the "count"), so the schema is a constant confirm-only form.
+describe("CONFIRM_SCHEMA", () => {
+  it("is the confirm-only closed schema (same bytes as the single-confirm dialog)", () => {
+    expect(JSON.stringify(CONFIRM_SCHEMA)).toBe(
+      '{"type":"object","properties":{"confirm":{"type":"boolean"}},"required":["confirm"],"additionalProperties":false}',
+    );
   });
 
-  it("returns a closed schema with all keys required", () => {
-    const s = buildRequestedSchema({ confirm: true });
-    expect(s.additionalProperties).toBe(false);
-    expect(s.required).toEqual(["confirm"]);
-  });
-
-  it("preserves key order in required[]", () => {
-    const s = buildRequestedSchema({ z: 1, a: 2, m: 3 });
-    expect(s.required).toEqual(["z", "a", "m"]);
+  it("is frozen so no caller can widen it", () => {
+    expect(Object.isFrozen(CONFIRM_SCHEMA)).toBe(true);
+    expect(Object.isFrozen(CONFIRM_SCHEMA.properties)).toBe(true);
+    expect(Object.isFrozen(CONFIRM_SCHEMA.properties.confirm)).toBe(true);
+    expect(Object.isFrozen(CONFIRM_SCHEMA.required)).toBe(true);
   });
 });

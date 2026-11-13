@@ -5,6 +5,8 @@
 //   - INSERT INTO staging (...)
 //   - UPDATE staging SET state='claimed', ... WHERE token_hash=? AND state='pending' AND expires_at>? RETURNING ...
 //   - UPDATE staging SET state='corrupt' WHERE token_hash=?
+//   - UPDATE staging SET fetch_count=fetch_count+1 WHERE token_hash=? AND state='claimed' AND fetch_count<? AND expires_at>? RETURNING file_handle
+//     (check-and-increment runs synchronously inside one exec(), so concurrent callers are atomic like D1)
 //   - SELECT ... FROM staging WHERE token_hash=?
 //   - SELECT token_hash, r2_key FROM staging WHERE expires_at < ?
 //   - DELETE FROM staging WHERE token_hash=?
@@ -44,6 +46,8 @@ export class FakeD1 {
       claimed_at: stored.claimed_at,
       expires_at: stored.expires_at,
       enc_version: stored.enc_version,
+      owner: stored.owner,
+      fetch_count: stored.fetch_count,
     };
   }
 }
@@ -128,6 +132,8 @@ class FakeD1Statement {
         claimed_at: get<number | null>("claimed_at", null),
         expires_at: record.expires_at as number,
         enc_version: get<StagingRow["enc_version"]>("enc_version", 1),
+        owner: get<string | null>("owner", null),
+        fetch_count: get<number>("fetch_count", 0),
       });
       return { rows: [], written: 1, read: 0 };
     }
@@ -153,6 +159,18 @@ class FakeD1Statement {
       row.claimed_at = set.claimed_at as number;
       row.expires_at = set.expires_at as number;
       if (set.enc_version !== undefined) row.enc_version = set.enc_version as StagingRow["enc_version"];
+      return { rows: [{ file_handle: row.file_handle }], written: 1, read: 1 };
+    }
+    if (sql.startsWith("UPDATE staging SET fetch_count=")) {
+      if (sql !== "UPDATE staging SET fetch_count=fetch_count+1 WHERE token_hash=? AND state='claimed' AND fetch_count<? AND expires_at>? RETURNING file_handle") {
+        throw new Error(`FakeD1: unparseable fetch-count UPDATE: ${sql}`);
+      }
+      const [token_hash, maxUses, now] = this.args as [Uint8Array, number, number];
+      const row = this.db.rows.get(hex(token_hash));
+      if (!row || row.state !== "claimed" || !(row.fetch_count < maxUses) || row.expires_at <= now) {
+        return { rows: [], written: 0, read: 0 };
+      }
+      row.fetch_count += 1;
       return { rows: [{ file_handle: row.file_handle }], written: 1, read: 1 };
     }
     if (sql.startsWith("UPDATE staging SET state='corrupt'") || sql.startsWith("UPDATE staging SET state = 'corrupt'")) {

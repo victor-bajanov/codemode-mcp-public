@@ -10,6 +10,21 @@ export {
 } from "./request-handler.js";
 export { mostRestrictive } from "./restrict";
 export {
+  createUpstreamLookup,
+  MAX_UPSTREAM_LOOKUPS,
+  UpstreamLookupError,
+  type UpstreamLookupSession,
+} from "./upstream-lookup.js";
+export type { UpstreamLookup, UpstreamLookupResult } from "@local/shared";
+export { encodeLookupPath } from "@local/shared";
+export {
+  collectUntrustedPointers,
+  fenceUntrusted,
+  UNTRUSTED_OPEN,
+  UNTRUSTED_CLOSE,
+  type Pointer,
+} from "./untrusted-fence.js";
+export {
   annotateSpecWithSurfaceReview,
   SURFACE_REVIEW_MARKER,
   SURFACE_REVIEW_SUMMARY_MARKER,
@@ -47,18 +62,28 @@ export {
   type TokenBrokerStub,
   type TokenBrokerArgs,
 } from "./token-broker.js";
-export { runElicitation, type RunElicitationArgs, ToolError } from "./elicit.js";
+export {
+  runElicitation,
+  type RunElicitationArgs,
+  ToolError,
+  cleanDialogText,
+  MAX_DIALOG_FACTS,
+  FACT_VALUE_MAX,
+} from "./elicit.js";
 export { allowPiiInLogs, debugElicit, debugLog, assertSecrets, type ScaffoldSecrets } from "./config.js";
 export * as staging from "./staging/index.js";
 export { readStagingConfig, resolveEndpoints, type ResolvedEndpoints } from "./config.js";
 export {
   readOAuthRateLimitConfig,
+  readOAuthHardeningConfig,
   type OAuthRateLimitConfig,
 } from "./config.js";
 export {
   enforceOAuthHardening,
   checkRateLimit,
+  readBodyCapped,
   withNoStore,
+  type HardeningConfig,
   type RateLimitStore,
   type RateLimitConfig,
 } from "./oauth-hardening.js";

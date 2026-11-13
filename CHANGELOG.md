@@ -2,6 +2,62 @@
 
 Curated notes for each public release. Newest first. (The auto-generated commit list for a release lives in that release's PR on the public mirror; this file is the readable summary.)
 
+## v1.3.0 — 2026-11-13
+
+**Second defensive security review, remediated.** A review on 2026-11-10 looked at the approval dialogs, the Gmail and Xero write gates, staged-file ownership, the audit trail and the public OAuth endpoints. Every finding below is closed with unit tests, and the published attack suite (`security-poc/`) asserts each control against its original payload. Accepted residuals are documented in `packages/scaffold/SECURITY.md` §7. Some of these changes refuse requests that used to succeed, and three need an upgrade step, so read **Upgrading** below before deploying.
+
+### Approval dialogs and the request path
+
+**The dialog shows the request that will be sent.** An approval dialog now names the resolved method and path, every query pair and the facts the provider read, with dialog text sanitised and quoted. Only `{ confirm: true }` approves. On approval-only operations an opaque body is denied, and a client that cannot show a dialog (no elicitation) is denied rather than allowed. Query parameter names are checked against the operation's declared parameters and a deny-list (Xero parameter `$ref`s are inlined so the check sees them), and the audit line records the query keys. Gated JSON bodies are sent only as `application/json`, must be strict UTF-8, and the content type must parse as a media type.
+
+**Sandbox limits.** A run is stopped after `EXECUTE_MAX_DENIED_CALLS` (default 32) denied calls, and in-flight calls per run are capped; the host deadline now wakes calls still queued. Code the sandbox cannot parse is refused before it is loaded, and the sandbox console can no longer print lines that pass for host audit lines.
+
+**MCP sessions.** A request whose user differs from the user its MCP session was started for is still refused, but now with the MCP "Session not found" 404 (JSON-RPC `-32001`) instead of a 5xx. The client starts a fresh session under its own user instead of retrying the refused one; this happened after a re-sign-in that returned a different upstream user id. The refusal writes an audit deny line (`session-principal-mismatch`).
+
+### Gmail and Calendar
+
+**Sends judge `raw` and nothing else.** `messages.send`, `drafts.send` and `messages.import` each accept a closed set of keys, so a decoy `payload` or wrapper beside `raw` is denied instead of being left for Gmail to ignore. `drafts.send` must carry the message in `message.raw`; sending a stored draft by `id` alone stays denied. `messages.import` denies a repeated `From`, `To`, `Subject` or `Date` header, and its dialog shows the headers from the same parse that judged the message.
+
+**Calendar writes need an allow-list.** Event writes (`insert`, `update`, `patch`, `import`, `move`) are allowed only on calendars listed in the new `CALENDAR_WRITE_ALLOWLIST` var. It is fail closed: unset or blank denies every event write, and `primary` must be listed explicitly. `update` and `patch` read the stored event first and are denied unless the user organised it; the one exception is an RSVP that changes only the user's own `responseStatus`. Stored guests off the outbound allowlist raise an approval. An out-of-office or focus-time `declineMessage` is denied, `events.move` needs both calendars on the list, and `events.quickAdd` is denied outright. An inspector that throws, for example on a malformed allow-list var, is denied with fixed text that does not quote the config.
+
+### Xero
+
+**Contact edits that move money ask first.** Edits that touch `BankAccountDetails`, `BatchPayments`, `EmailAddress`, `ContactStatus`, `TaxNumber` or `ContactPersons`, or that change `Name` or `XeroNetworkKey`, raise an approval that shows old → new values read from Xero. Creating a contact stays allowed.
+
+**Posted documents.** Every invoice and credit-note item must state its `Status`, the id in the body must match the id in the path, and the stored document is read (by id or number) before the write is judged. Repeating-invoice templates are draft-only and their send flags are denied. The attachment inspector is now wired up (`IncludeOnline` is denied), and the update-attachment-by-filename POSTs are removed from the surface.
+
+### Optical
+
+**Spec re-vendored (50 → 53 operations).** New `listActAs` (`GET /v1/act-as`, delegated access), plus `findMeetingTime` and `bookMeetingTime` (`POST /v1/meeting-find`, `/v1/meeting-find/book`), all allowed. The spec also adds the `Optical-On-Behalf-Of` header and the act-as wording across `/v1`. Fields Optical tags `x-optical-untrusted` are now fenced before they reach the model.
+
+### Staged files and the audit trail
+
+**Staged files belong to the user who staged them.** Reading, attaching, `getFile` and composed sends by any other user are refused before storage is touched, and rows without an owner (staged by earlier releases) are refused. A file's public `fetch_url` now works at most `STAGING_FETCH_MAX_USES` times (default 5, minimum 1) within `STAGING_FETCH_TTL_SECONDS`; after that it returns 410. Use inside an MCP run by the owner is not counted.
+
+**One audit sink.** All audit lines go through one writer with field caps and escaped U+2028/U+2029. Staging lines carry a `fileRef`, never a handle, token or bearer. Every failure after token minting writes exactly one closing line, and the two public staging endpoints audit every request.
+
+### OAuth endpoints
+
+**Consent and callback.** The consent page always warns before naming the client. Claude redirect URIs must match exactly, and loopback redirect paths are pinned (a miss only warns). `client_name` is cleaned and capped at 64 characters. A refused `/callback` (missing or wrong browser cookie, bad state) deletes the pending sign-in without spending the upstream code.
+
+**Rate limits and body caps.** `/authorize` and `/callback` now have per-IP rate limits (HEAD included), with paths classified after decoding, so a malformed escape gets a 400. Body caps (`/register` 1 MiB, forms 16 KiB) are enforced before the OAuth library reads the body.
+
+**Client records expire.** The five-minute client sweep is gone. A registered client record expires after 30 days (`OAUTH_CLIENT_TTL_SECONDS`), and every real code exchange or refresh extends it to 120 days. A connector unused for 120 days has to be removed and re-added in the MCP client.
+
+### Release pipeline
+
+The generated changelog now lists only commits that touch shipped paths, and `promote.sh` checks commit subjects against the leak patterns before staging a release.
+
+### Upgrading
+
+Run these scripts, each with `--dry-run` first. They take `--env-only=<name>`, and the TTL script also takes `--app=<dir> --wrangler-env=<env>` for deployments it does not list.
+
+1. **Gmail:** set `CALENDAR_WRITE_ALLOWLIST` in every vars block of `apps/gmail/wrangler.jsonc`, at least `primary`, then run `scripts/upgrade/2026-11-10-calendar-write-allowlist.sh`. Deploying without the var denies every Calendar event write.
+2. **Gmail and Xero:** run `scripts/upgrade/2026-11-11-staging-owner.sh`. It applies migration `0003_owner.sql` to the staging D1 database before deploying; the new code on an unmigrated database fails every store with 500. Files staged before the upgrade are refused until they expire (at most an hour by default); stage them again.
+3. **Every deployment:** run `scripts/upgrade/2026-11-11-oauth-client-ttl.sh`. It deploys, then gives client records written by earlier releases the 120-day TTL and deletes the old sweep's `clientreg:` keys. Re-running it is safe.
+
+New optional vars: `STAGING_FETCH_MAX_USES` and `EXECUTE_MAX_DENIED_CALLS`.
+
 ## v1.2.2 — 2026-10-28
 
 ### Optical provider

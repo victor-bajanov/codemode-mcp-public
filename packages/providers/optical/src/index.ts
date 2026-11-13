@@ -57,9 +57,21 @@ export const opticalProvider: ApiProvider<OpticalProps> = {
   compactHint: opticalCompactHint,
   surfaceReview,
   elicitRenderers: opticalElicitRenderers,
+  // The spec flags third-party text (booker names, notes, poll answers, …)
+  // with this extension; the scaffold fences those strings before they are
+  // returned to the model (F2-8).
+  untrustedFieldExtension: "x-optical-untrusted",
   apiBaseUrl: "https://scheduler.example.com",
   tokenRotation: "rotating",
   audit: {
+    // The scaffold's "principal" is the authenticated OAuth subject, which in
+    // Optical's delegated-access vocabulary is the ACTOR (the caller), not the
+    // owner. Optical's API says owner/actor; its internal "principal"/"delegate"
+    // words never appear on the wire. A call that acts for an owner names them
+    // in the Optical-On-Behalf-Of request header, which sandbox code sets
+    // through ctx.headers on allow ops (the scaffold refuses sandbox headers on
+    // inspect/elicit ops, see request-handler.ts); it is not part of this audit
+    // id, and the session binding and token broker stay keyed on the actor.
     principalIdAccessor: (props) => props.userId,
   },
 };
